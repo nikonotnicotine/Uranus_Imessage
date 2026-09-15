@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      这一页和控制台（index.html）是**两个入口**，各自跑在自己的端口上：
+      控制台 8787，这一页 6873。分开是因为 IG 塞在控制台的 260px 侧栏右边时
+      只剩几百像素宽，电脑版那套 72px 图标栏 + 630px feed + 320px 右栏根本摆不下。
+
+      标签页的名字和图标都用 Instagram 自己的 —— 这一页要看着就是 IG，
+      不是「Uranus 里的一个分区」。图标是手画的 SVG，理由写在 public/instagram.svg 里。
+    -->
+    <link rel="icon" type="image/svg+xml" href="/instagram.svg" />
+    <link rel="apple-touch-icon" href="/instagram.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- 这一页**不引 Google Fonts**：IG 用的是系统无衬线栈（ig.css 里那条
+         font-family），Source Serif 4 和 Inter 一个字都用不上，引进来只是白等一次
+         网络往返。控制台那边照旧引。 -->
+    <title>Instagram</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/ig/main.jsx"></script>
+  </body>
+</html>

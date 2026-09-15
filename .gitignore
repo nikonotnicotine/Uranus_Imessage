@@ -1,0 +1,96 @@
+# ============================================================
+#  只提交「代码」和「出厂素材」。
+#
+#  这个仓库有意不追踪 client/dist/ 和 data/ —— 前者是构建产物，
+#  后者里全是这台机器上跑出来的东西（Photon 凭据、各家 API key、
+#  聊天记录）。clone 下来的人靠 assets/ 里的内置预设从零起步，
+#  服务启动时会自己把 data/ 整套建出来（server/src/datadir.js）。
+#
+#  加规则前先想一句：这条挡的是「本机生成物」还是「别人也需要的东西」。
+#  后者一旦被挡，clone 下来就跑不起来，而且是静默的。
+# ============================================================
+
+# ---------- 依赖 ----------
+node_modules/
+
+# 上面这条已经盖住 client/node_modules，单独列出来是为了说明：
+# npm workspaces 会把依赖提升到根目录，client/ 下那个只剩个空壳
+client/node_modules/
+
+# ---------- 构建产物 ----------
+client/dist/
+
+# 其它打包器 / 测试工具留下的缓存
+.vite/
+.cache/
+.parcel-cache/
+coverage/
+
+# ---------- 运行数据（最要紧的一段） ----------
+# 全部本地数据：配置、密钥、角色、世界书、对话存档
+data/
+
+# 开发沙箱的假数据（scripts/dev-sandbox.mjs 自己会造，删了重跑就有）
+.sandbox/
+
+# 兜底：不管 data/ 被挪到哪、被谁改名，只要里面出现这几个名字就不传。
+# 那个目录内的 `.gitignore`（内容是 `*`）比这几条更硬，两层一起挡
+data.config.json
+auth.json
+
+# ---------- 密钥 / 凭据 ----------
+# 项目现在不需要 .env（配置都在网页里点），但万一以后有人加了，
+# 或者是别的工具的约定，这些一律挡掉
+.env
+.env.*
+!.env.example
+
+# 证书和私钥
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# ---------- 密钥的备份 ----------
+# 迁移到 data/ 之前的老位置。老仓库里可能还躺着这几个
+config.json
+data.config.json
+sessions/
+
+# 上面那些文件的备份（*.pre-data.bak 也算）—— 里面同样有真 key 和 Photon 凭据
+*.bak
+*.pre-data.bak
+*.orig
+*.rej
+
+# ---------- 日志 ----------
+# 后端跑在后台时的日志（会带角色名、号码这些）
+.backend.log
+*.log
+npm-debug.log*
+
+# ---------- 临时目录 / 探针残留 ----------
+# **必须挡住** —— 这类目录里放过整份配置转储（provider 密钥、Photon
+# 凭据、搜索和图床的 key 全在一个文件里），以前没被忽略，
+# `git add .` 会直接把它们传上去
+.tmp-*/
+.tmp*
+.cp-probe*/
+tmp-*/
+*.tmp
+
+# ---------- 本机专属设置 ----------
+# 本机专属的 agent 配置：里面有绝对路径和你敲过的每条命令。
+# 只挡这一个文件，同目录的 launch.json 是要跟代码走的 ——
+# 它写的是一句 `npm run dev:sandbox`，换台机器照样有用
+.claude/settings.local.json
+
+# 编辑器的本机设置；.vscode/extensions.json 之类共享配置不受影响
+.vscode/settings.local.json
+*.code-workspace
+
+# ---------- 操作系统垃圾 ----------
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,422 @@
+/**
+ * 出网代理的离线验证。
+ *
+ * 这一层的坏法**特别难查**，所以验得细一点。代理配错了不会报错、不会崩，只会
+ * 让某几个功能安静地超时 —— 而用户看到的是「天气不好用了」「IG 发不出去了」，
+ * 压根联想不到是几天前在控制台勾错了一个框。所以这里盯的是那些「不报错但已经
+ * 错了」的情形。
+ *
+ * 分七块：
+ *
+ *  1. **地址校验**。`socks5://` 必须拦住 —— 机场最爱给这个，而 undici 的
+ *     ProxyAgent 压根不支持它。放过去的话所有出网会静默退回直连。
+ *  2. **脱敏**。代理串常是 `http://user:pass@host:port`，那就是一组凭据。
+ *     日志、界面、接口响应里都不许出现原文。
+ *  3. **类别清单**。九类，默认只勾 IG 和天气。这个默认值是用户实测定的
+ *     （Photon 直连通、IG 和天气不通），改动它要有新的实测依据。
+ *  4. **落盘位置**。地址进 data.config.json（跟密钥一起），勾选留在
+ *     config.json。而且**抹空时只抹地址、留勾选** —— 勾选丢了很难查。
+ *  5. **优先级**。界面填的 > URANUS_PROXY > HTTPS_PROXY 那几个 > 直连。
+ *  6. **proxyFor 的形状**。没配 / 没勾时必须返回 `{}`，因为所有调用点都是
+ *     无条件 `...(await proxyFor(...))` 展开的。返回 null 会让 fetch 炸。
+ *  7. **挂载覆盖面**。每一处出网的 fetch 要么挂了 proxyFor、要么在注释里
+ *     写明为什么不挂。漏一处的后果就是「勾了却不生效」。
+ *
+ * 全程用临时 URANUS_DATA_DIR，不碰真的 data/，也不联网。
+ */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "uranus-proxy-"));
+process.env.URANUS_DATA_DIR = TMP;
+
+// 这几个环境变量会被 proxy.js 读进去当兜底。测优先级那一节要自己控制它们，
+// 所以先全清干净 —— 开发机上真的设了 HTTPS_PROXY 的话，不清会把结果搅乱
+const ENV_VARS = ["URANUS_PROXY", "URANUS_IG_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+for (const k of ENV_VARS) delete process.env[k];
+
+let pass = 0;
+let fail = 0;
+function check(name, got, want) {
+  if (JSON.stringify(got) === JSON.stringify(want)) {
+    pass += 1;
+    console.log(`  ✓ ${name}`);
+    return;
+  }
+  fail += 1;
+  console.log(`  ✗ ${name}\n      得到 ${JSON.stringify(got)}\n      期望 ${JSON.stringify(want)}`);
+}
+function checkThat(name, cond, detail = "") {
+  if (cond) {
+    pass += 1;
+    console.log(`  ✓ ${name}`);
+  } else {
+    fail += 1;
+    console.log(`  ✗ ${name}${detail ? `  ${detail}` : ""}`);
+  }
+}
+
+const P = await import("../server/src/proxy.js");
+const C = await import("../server/src/config.js");
+
+const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
+
+/* ================= 1. 地址校验 ================= */
+{
+  console.log("\n1. 地址校验");
+
+  check("http:// 放行", P.checkProxyUrl("http://127.0.0.1:7890"), "");
+  check("https:// 放行", P.checkProxyUrl("https://gw.example:8080"), "");
+  check("带账号密码的放行", P.checkProxyUrl("http://bob:pw@gw.example:8080"), "");
+  check("空串放行（= 直连）", P.checkProxyUrl(""), "");
+
+  /*
+   * socks 是这一节的重点。机场客户端默认给的就是 socks5，用户会直接抄过来；
+   * 而 undici 的 ProxyAgent 只认 http/https —— 交给它不会抛错，会安静地
+   * 全部退回直连，然后用户以为配好了。
+   */
+  for (const bad of [
+    "socks://127.0.0.1:7891",
+    "socks4://127.0.0.1:7891",
+    "socks5://127.0.0.1:7891",
+    "socks5h://127.0.0.1:7891",
+    "SOCKS5://127.0.0.1:7891",
+  ]) {
+    const why = P.checkProxyUrl(bad);
+    checkThat(`拦住 ${bad}`, Boolean(why), `实际放过了`);
+    checkThat(`  ${bad} 的提示里指了出路`, /http/i.test(why) && /(Clash|v2rayN|混合|HTTP 端口)/.test(why), why);
+  }
+
+  checkThat("拦住没有协议的裸地址", Boolean(P.checkProxyUrl("127.0.0.1:7890")));
+  checkThat("拦住 ftp:// 这类别的协议", Boolean(P.checkProxyUrl("ftp://gw.example")));
+  checkThat("拦住整串乱码", Boolean(P.checkProxyUrl("这不是地址")));
+}
+
+/* ================= 2. 脱敏 ================= */
+{
+  console.log("\n2. 脱敏");
+
+  const masked = P.maskProxy("http://bob:hunter2@gw.example:8080");
+  checkThat("账号密码不出现在脱敏结果里", !masked.includes("bob") && !masked.includes("hunter2"), masked);
+  checkThat("脱敏结果保留主机和端口（还得能认出是哪个代理）", masked.includes("gw.example:8080"), masked);
+  checkThat("脱敏结果说明了「带账号密码」", /账号密码|已隐去/.test(masked), masked);
+
+  check("不带凭据的原样给出", P.maskProxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
+  check("空串给空串", P.maskProxy(""), "");
+
+  /*
+   * 这一条是踩过的坑：`new URL("socks5://a:1").origin` 返回的是字符串 "null"
+   * （socks 不是「特殊协议」，URL 规范里 origin 就是 null）。用 origin 拼的话
+   * 界面上会显示「代理已配：null」。所以 maskProxy 里是自己拼 protocol + host。
+   */
+  checkThat("socks 地址脱敏不出现 null", !/null/.test(P.maskProxy("socks5://127.0.0.1:7891")));
+  /*
+   * 注释里**是**提到 origin（就是在解释为什么不用它），所以先把注释全剥掉再查。
+   * 不剥的话这条断言永远失败，而失败的自检等于没有自检。
+   */
+  const noComments = src("server/src/proxy.js")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  checkThat("maskProxy 没真的用 u.origin", !/\.origin\b/.test(noComments));
+}
+
+/* ================= 3. 类别清单 ================= */
+{
+  console.log("\n3. 类别清单");
+
+  check("九类", P.PROXY_SCOPES.length, 9);
+  check(
+    "key 和顺序",
+    P.SCOPE_KEYS,
+    ["ig", "weather", "llm", "search", "tts", "cloud", "update", "music", "photon"]
+  );
+
+  const d = P.defaultScopes();
+  check("默认只勾 IG 和天气", Object.entries(d).filter(([, v]) => v).map(([k]) => k), ["ig", "weather"]);
+  checkThat("九类都有默认值（不能有 undefined）", P.SCOPE_KEYS.every((k) => typeof d[k] === "boolean"));
+
+  // 用户实测定的：Photon 直连就通，勾上反而可能连不上
+  check("Photon 默认不勾", d.photon, false);
+  // 中转站在国内直连本来就通，绕代理更慢、还可能被风控
+  check("模型 API 默认不勾", d.llm, false);
+
+  for (const s of P.PROXY_SCOPES) {
+    checkThat(`${s.key} 有中文名`, Boolean(s.label));
+    checkThat(`${s.key} 说了打哪些域名`, Boolean(s.domains));
+    checkThat(`${s.key} 有一句为什么`, Boolean(s.hint));
+  }
+
+  const status = P.proxyStatus();
+  check("给界面的清单也是九条", status.catalog.length, 9);
+  checkThat(
+    "给界面的清单不含地址原文字段",
+    status.catalog.every((c) => !("url" in c)),
+  );
+}
+
+/* ================= 4. 落盘位置 ================= */
+{
+  console.log("\n4. 落盘位置");
+
+  const cfg = C.loadConfig();
+  C.saveConfig({
+    ...cfg,
+    proxy: { url: "http://127.0.0.1:7890", scopes: { ig: true, weather: true, llm: false, music: true } },
+  });
+
+  const main = fs.readFileSync(path.join(TMP, "config.json"), "utf-8");
+  const sec = fs.readFileSync(path.join(TMP, "data.config.json"), "utf-8");
+
+  // 地址可能带账号密码，所以和 API 密钥同等对待：只进密钥文件
+  checkThat("地址不落进 config.json", !main.includes("7890"), "地址漏进了非密钥文件");
+  checkThat("地址落进 data.config.json", sec.includes("7890"));
+
+  /*
+   * 勾选**要**留在 config.json 里。抹空时只抹地址 —— 勾选丢了的后果很难查：
+   * 用户勾了天气走代理，重启后勾没了、天气又开始超时，而界面上看不出哪里变了。
+   */
+  const mainJson = JSON.parse(main);
+  check("勾选留在 config.json", mainJson.proxy?.scopes?.ig, true);
+  check("config.json 里地址是空的", mainJson.proxy?.url, "");
+  check("勾选也在 data.config.json 里（恢复时用）", JSON.parse(sec).proxyKeys?.scopes?.music, true);
+
+  // 读回来要合成一份完整的
+  const back = C.loadConfig();
+  check("读回来地址对", back.proxy.url, "http://127.0.0.1:7890");
+  check("读回来勾选对", back.proxy.scopes.music, true);
+
+  /*
+   * 不带密钥的搬家包恢复到新机器时，密钥文件里没有 proxyKeys —— 那时候
+   * **勾选要留下来**（用户特意配的），只是地址没了。所以 mergeSecrets 是
+   * 逐字段合并，不是整块替换。
+   */
+  const cfgSrc = src("server/src/config.js");
+  checkThat(
+    "mergeSecrets 是合并不是整块替换",
+    /merged\.proxy = \{[\s\S]{0,200}\.\.\.\(main\.proxy/.test(cfgSrc),
+  );
+  checkThat("抹空时留着 scopes", /proxy: \{ url: "", scopes: normalized\.proxy\.scopes \}/.test(cfgSrc));
+
+  // 生效判定
+  check("usesProxy ig", P.usesProxy("ig"), true);
+  check("usesProxy photon（没勾）", P.usesProxy("photon"), false);
+  check("usesProxy 不认识的类别", P.usesProxy("没这个"), false);
+
+  // 清空地址 = 全部改回直连，勾选不动
+  C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: { ig: true } } });
+  check("地址清空后 ig 也不走代理", P.usesProxy("ig"), false);
+  check("地址清空后 status.enabled 是 false", P.proxyStatus().enabled, false);
+}
+
+/* ============ 4b. 读设置不该顺手把 data/ 建出来 ============ */
+{
+  console.log("\n4b. 读设置不建目录");
+
+  /*
+   * 这条防的是「读一次代理设置 = 一次完整的配置初始化」。
+   *
+   * 代理是**出网前**要问的东西，而查更新（update.js）也要挂代理 —— 它以前是个
+   * 无依赖的小模块，只拿 GitHub 的公开接口。有一版 readProxyConfig 改成了
+   * `loadConfig()`，于是每查一次更新就把整个 data/ 目录树建出来、还顺手把两份
+   * 内置预设种进去。自检 test-update 里「查完不该多出任何文件」那条当场变红，
+   * 但那已经是很靠后的一环了 —— 所以在这儿也钉一条。
+   *
+   * 上面那一节的收尾刚把地址清空、勾选清空，所以此刻 TMP 里就那两个文件。
+   */
+  const existed = new Set(fs.readdirSync(TMP));
+  P.proxySettings();
+  P.proxyStatus();
+  await P.proxyFor("ig");
+  const after = fs.readdirSync(TMP).filter((n) => !existed.has(n));
+  check("问一遍代理设置，数据目录里不多出任何东西", after, []);
+}
+
+/* ================= 5. 优先级 ================= */
+{
+  console.log("\n5. 优先级");
+
+  C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: {} } });
+  check("什么都没有时是直连", P.proxySettings().url, "");
+  check("什么都没有时 from 是空的", P.proxySettings().from, "");
+
+  process.env.HTTPS_PROXY = "http://env-https:1";
+  check("退到 HTTPS_PROXY", P.proxySettings().url, "http://env-https:1");
+  check("说清读的是哪个变量", P.proxySettings().from, "HTTPS_PROXY");
+
+  process.env.URANUS_PROXY = "http://env-uranus:2";
+  check("URANUS_PROXY 比 HTTPS_PROXY 优先", P.proxySettings().url, "http://env-uranus:2");
+
+  // 界面上填的最优先 —— 那是用户刚刚做的动作，不该被环境变量盖掉
+  C.saveConfig({ ...C.loadConfig(), proxy: { url: "http://from-ui:3", scopes: { ig: true } } });
+  check("控制台填的最优先", P.proxySettings().url, "http://from-ui:3");
+  check("from 说是控制台", P.proxySettings().from, "控制台");
+
+  // 环境变量兜底时，勾选表还是配置里那份（环境变量只给地址）
+  checkThat("环境变量兜底时勾选照旧补齐", P.SCOPE_KEYS.every((k) => typeof P.proxySettings().scopes[k] === "boolean"));
+
+  for (const k of ENV_VARS) delete process.env[k];
+}
+
+/* ================= 6. proxyFor 的形状 ================= */
+{
+  console.log("\n6. proxyFor 的形状");
+
+  C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: { ig: true } } });
+
+  /*
+   * 所有调用点都是无条件展开的：
+   *   await fetch(url, { ...init, ...(await proxyFor("ig")) })
+   * 所以没配代理时必须返回 `{}` —— 返回 null / undefined 会让展开炸掉，
+   * 而那是在真的发消息那条路上炸。
+   */
+  check("没配代理时返回空对象", await P.proxyFor("ig"), {});
+  checkThat("空对象展开安全", Object.keys({ ...(await P.proxyFor("ig")) }).length === 0);
+
+  C.saveConfig({ ...C.loadConfig(), proxy: { url: "http://127.0.0.1:7890", scopes: { ig: true, photon: false } } });
+  check("没勾的类别也返回空对象", await P.proxyFor("photon"), {});
+  const got = await P.proxyFor("ig");
+  checkThat("勾了的类别给出 dispatcher", Boolean(got.dispatcher), JSON.stringify(Object.keys(got)));
+  checkThat("字段名是 dispatcher（undici 认这个）", Object.keys(got).join() === "dispatcher");
+
+  // agent 按地址缓存：同一个地址反复取不该每次新建
+  const again = await P.proxyFor("ig");
+  checkThat("同一地址复用同一个 agent", got.dispatcher === again.dispatcher);
+
+  /*
+   * **冷启动时并发取**：实机翻过车的就是这条。
+   *
+   * agentFor 里有个 `await import("undici")`，中间是一段空窗。原来缓存的是
+   * 「建好的 agent」，于是先到的那个请求刚记下地址就让出了线程，紧跟着的请求
+   * 看到地址对得上、拿到的却是还没填上的 null —— 那一半请求**悄悄直连出去了**，
+   * 不报错、日志里也看不出来。实测 music.js 两家并发查的时候，苹果那一路
+   * 就是这么漏出去的。
+   *
+   * 而并发出网到处都是：music.js 两家一起查、env.js 几个天气源一起打、
+   * IG 一轮好几个请求。所以这里必须从冷的状态一次要八个，一个都不许漏。
+   */
+  C.saveConfig({ ...C.loadConfig(), proxy: { url: "http://127.0.0.1:7891", scopes: { ig: true } } });
+  const burst = await Promise.all(Array.from({ length: 8 }, () => P.proxyFor("ig")));
+  check("冷启动并发 8 个，每个都拿到 dispatcher", burst.filter((g) => g.dispatcher).length, 8);
+  check("八个拿到的是同一个 agent", new Set(burst.map((g) => g.dispatcher)).size, 1);
+
+  C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: {} } });
+}
+
+/* ================= 7. 挂载覆盖面 ================= */
+{
+  console.log("\n7. 挂载覆盖面");
+
+  /*
+   * 每一处出网的 fetch 都得有交代。这一节是为了防「加了新功能忘了挂代理」——
+   * 那种漏法用户报上来只会是「勾了却没用」，从日志里看不出来。
+   *
+   * 每条给出：文件、这个文件里期望的 proxyFor 次数、以及不挂的那几处为什么。
+   */
+  const expect = [
+    ["server/src/ignet.js", 1], // igFetch，Meta 的 Graph API 全走它
+    ["server/src/env.js", 1], // fetchJson，天气和地名查询的唯一出网口
+    ["server/src/llm.js", 1], // requestJson
+    ["server/src/update.js", 1], // 查 GitHub 的 latest release
+    ["server/src/photon.js", 2], // 查已登记的用户 + 登记
+    ["server/src/websearch.js", 3], // DuckDuckGo / Tavily / Brave
+    ["server/src/music.js", 2], // iTunes / 网易云
+    ["server/src/igimage.js", 2], // Cloudinary 上传 + 删除
+    ["server/src/igreal.js", 1], // 把远端图片拉回本地
+    ["server/src/cloud/net.js", 1], // 两家云的所有请求都从这一个 call() 出去
+    ["server/src/media.js", 5], // TTS ×2（SoVITS 是本机，不挂）+ 生图 ×3
+  ];
+
+  for (const [file, n] of expect) {
+    const text = src(file);
+    const hits = (text.match(/proxyFor\(/g) ?? []).length;
+    // 减去文件头注释里提到的那些（只数真正的调用：`...(await proxyFor(`）
+    const calls = (text.match(/\.\.\.\(await proxyFor\(/g) ?? []).length;
+    checkThat(`${file} 挂了 ${n} 处`, calls === n, `实际 ${calls} 处（提到 proxyFor 共 ${hits} 次）`);
+  }
+
+  // 刻意不挂的两处，各自要在注释里写明为什么 —— 不然下一个人会以为是漏了
+  checkThat(
+    "SoVITS 那处写明了为什么不走代理（本机地址）",
+    /刻意不走代理/.test(src("server/src/media.js")),
+  );
+  checkThat(
+    "查岗截图那处写明了为什么不走代理（局域网）",
+    /不走代理/.test(src("server/src/spy.js")) && /局域网/.test(src("server/src/spy.js")),
+  );
+  checkThat("查岗没有对应的类别（清单里不该有它）", !P.SCOPE_KEYS.includes("spy"));
+
+  /*
+   * 全仓扫一遍：除了下面这张白名单，不该再有别的 `await fetch(` 没挂代理。
+   * 白名单里每一条都是上面已经交代过的。
+   */
+  const KNOWN = new Set([
+    "server/src/proxy.js", // 它自己（testProxy 打测试地址，那次是显式建 agent）
+    "server/src/spy.js", // 局域网截图，见上
+  ]);
+  const files = [];
+  (function walk(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.endsWith(".js")) files.push(full);
+    }
+  })(path.join(ROOT, "server/src"));
+
+  const missing = [];
+  for (const full of files) {
+    const rel = path.relative(ROOT, full).replace(/\\/g, "/");
+    if (KNOWN.has(rel)) continue;
+    const text = fs.readFileSync(full, "utf-8");
+    const fetches = (text.match(/await fetch\(/g) ?? []).length;
+    if (!fetches) continue;
+    const calls = (text.match(/\.\.\.\(await proxyFor\(/g) ?? []).length;
+    // media.js 有一处（SoVITS）故意不挂，所以是「至少挂了一处」而不是相等
+    if (calls === 0) missing.push(`${rel}（${fetches} 处 fetch，0 处代理）`);
+  }
+  checkThat("没有哪个文件出网却完全没挂代理", missing.length === 0, missing.join("；"));
+}
+
+/* ================= 8. 路由与界面 ================= */
+{
+  console.log("\n8. 路由与界面");
+
+  const idx = src("server/src/index.js");
+  checkThat("有 GET /api/proxy", /app\.get\("\/api\/proxy"/.test(idx));
+  checkThat("有 PUT /api/proxy", /app\.put\("\/api\/proxy"/.test(idx));
+  checkThat("有 POST /api/proxy/test", /app\.post\("\/api\/proxy\/test"/.test(idx));
+
+  /*
+   * 存代理**不能**走 PUT /api/config —— 那条存完会 syncBridges() 把所有
+   * iMessage 桥接重连一遍。为了勾一个「天气走代理」把正在聊的号踢下线，
+   * 代价太离谱。所以这三条路由里不该出现 syncBridges。
+   */
+  const putBlock = idx.slice(idx.indexOf('app.put("/api/proxy"'), idx.indexOf('app.put("/api/proxy"') + 1400);
+  checkThat("存代理不会重启桥接", !/syncBridges/.test(putBlock));
+  checkThat("存之前过一遍地址校验", /checkProxyUrl/.test(putBlock));
+  checkThat("勾选只认清单里那几个 key", /SCOPE_KEYS/.test(putBlock));
+
+  // 免登录清单不该被这三条路由撬开
+  checkThat(
+    "代理接口在登录门后面",
+    !/OPEN_PATHS[\s\S]{0,200}\/api\/proxy/.test(idx),
+  );
+
+  const ui = src("client/src/panels/proxy.jsx");
+  checkThat("界面照 catalog 渲染（不硬编码九类）", /catalog\.map/.test(ui));
+  checkThat("界面说了当场生效", /当场生效/.test(ui));
+  checkThat("界面提了 socks 用不了", /socks/.test(ui));
+  checkThat("界面给了 Clash / v2rayN 的默认端口", /7890/.test(ui) && /10809/.test(ui));
+  checkThat("界面不回显地址原文（只用 masked）", /status\.masked/.test(ui) && !/status\.url/.test(ui));
+
+  checkThat("侧栏锚点里有「代理」", /"代理"/.test(src("client/src/nav.js")));
+  checkThat("外壳挂上了 ProxyPanel", /<ProxyPanel \/>/.test(src("client/src/shell.jsx")));
+}
+
+fs.rmSync(TMP, { recursive: true, force: true });
+
+console.log(`\n${fail === 0 ? "全部通过" : "有失败"}：${pass} 通过 / ${fail} 失败\n`);
+process.exit(fail === 0 ? 0 : 1);

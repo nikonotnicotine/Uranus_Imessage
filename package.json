@@ -1,0 +1,14 @@
+{
+  "name": "uranus-imessage",
+  "private": true,
+  "version": "0.2.0",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev:sandbox": "node scripts/dev-sandbox.mjs",
+    "build": "npm --workspace client run build",
+    "start": "node server/src/index.js"
+  }
+}

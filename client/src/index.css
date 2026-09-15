@@ -1,0 +1,201 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * 单色显影：页面存在于纯白，层级全靠排版和 1px 线。
+ *
+ * 只有一套主题（深色模式已删除）—— 这套色板是按纯白底挑的，
+ * 反过来推一版深色需要另挑八个灰阶，不是把变量取反那么简单。
+ *
+ * 值存的是 RGB 三个通道、不是 #hex：Tailwind 要往颜色里塞透明度
+ * （`hover:bg-ink/[0.08]` 这种）时会拼成 `rgb(var(--ink) / 0.08)`，
+ * 而 `rgb(#18181b / 0.08)` 是非法的 —— 整条工具类会静默失效、
+ * 悬停态直接没有。所以这里必须是裸通道值。
+ * 想查某个色号，把三个数按十进制转回十六进制即可。
+ */
+:root {
+  /* 单色骨架 */
+  --paper: 255 255 255; /* #ffffff 页面 */
+  --paper-raise: 255 255 255; /* 表面不靠底色区分，只靠 1px 边框 */
+  --sunken: 244 244 245; /* #f4f4f5 侧边栏悬停 / 激活、代码块底 */
+  --ink: 24 24 27; /* #18181b 标题、强调、CTA、链接 */
+  --ink-soft: 97 97 97; /* #616161 正文 */
+  --ink-faint: 120 120 120; /* #787878 小标签、眉标 */
+  --ink-meta: 168 168 168; /* #a8a8a8 列表右侧的数字元数据 */
+  --line: 216 216 216; /* #d8d8d8 唯一的边框色 */
+  /* 主按钮：#18181b 底 + #fafafa 字，悬停把底色提亮约 8% */
+  --ink-hover: 47 47 51; /* #2f2f33 */
+  --paper-invert: 250 250 250; /* #fafafa */
+
+  /*
+   * 状态色：单色规则的唯一豁免。
+   *
+   * 这四个值承载的是真信息（保存失败、城市查不到、Host 填错、号码离线），
+   * 用竖线和眉标代替色相的话，扫视时错误就不再跳出来了。
+   * 色号是按纯白底重挑的 —— 旧的 #2e9e6b / #e05b5b 配 #f7f4ee 暖纸张时正好，
+   * 挪到纯白上会发灰发粉，读起来像装饰而不像信号。
+   */
+  --good: 15 123 79; /* #0f7b4f */
+  --good-soft: 236 253 243; /* #ecfdf3 */
+  --warn: 207 58 44; /* #cf3a2c */
+  --warn-soft: 254 243 242; /* #fef3f2 */
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  /* 正文是 #616161，标题才用 #18181b —— 所以默认色是 soft 那一档 */
+  @apply bg-paper text-ink-soft antialiased;
+  /* 中文回落系统字体，负字距会把它挤坏，所以只在 H1 上单独给 */
+  letter-spacing: 0;
+
+  /*
+   * 壁纸铺在最底层。两个变量由 wallpaper.jsx 写到 <html> 上，
+   * 没设过时回落成 none —— 也就是原样的纯白底，这套样式对没开壁纸的人是死的。
+   * fixed 是为了让壁纸跟着视口不跟着内容滚（三层布局各自滚，图跟着滚会晕）。
+   */
+  background-image: var(--wallpaper-image, none);
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+}
+
+/*
+ * 壁纸和内容之间的白色遮罩。
+ *
+ * 全站是纯白底 + #d8d8d8 的 1px 线，直接把图铺上去正文就没法读了。
+ * 压一层可调透明度的 --paper，浓度交给用户自己拧。
+ * veil = 1 时它就是一块纯白，和没有壁纸时逐像素一致。
+ */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: rgb(var(--paper) / var(--wallpaper-veil, 1));
+}
+
+/* 内容要浮在遮罩上面，否则整个界面会被那层白盖住 */
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+/*
+ * 全站统一的 focus-visible。
+ *
+ * 硬规则要求每个互动元素都有可见焦点态，包括侧边栏列表项。
+ * 在这里给一次，比在几十个组件里各写一遍 focus-visible: 类可靠 ——
+ * 新加的按钮不会漏。用 outline 而不是 ring，因为 outline 不参与布局、
+ * 不会把紧贴边缘的元素挤动。
+ */
+:focus-visible {
+  outline: 2px solid rgb(var(--ink));
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+/* 鼠标点击不该留下焦点框（键盘导航才要） */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+::selection {
+  background: rgb(var(--ink));
+  color: #fafafa;
+}
+
+/* range 滑块：轨道 1px 线，滑块一个实心方块 */
+input[type="range"] {
+  @apply h-6 w-full cursor-pointer appearance-none bg-transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  @apply h-px bg-line;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  @apply mt-[-5px] h-2.5 w-2.5 bg-ink;
+}
+input[type="range"]::-moz-range-track {
+  @apply h-px bg-line;
+}
+input[type="range"]::-moz-range-thumb {
+  @apply h-2.5 w-2.5 rounded-none border-0 bg-ink;
+}
+
+/* 滚动条整个隐藏（无障碍与性能那条）。滚动本身照旧，只是不画那根槽 */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+::-webkit-scrollbar {
+  display: none;
+}
+
+/*
+ * 唯一的入场动画：opacity + 8px translateY，350ms ease-out，只跑一次。
+ *
+ * 类名由 Reveal 组件加在元素上（见 ui.jsx）。用 CSS 而不是 JS 里写 style，
+ * 是为了让 prefers-reduced-motion 那条媒体查询能一次覆盖掉全部动画 ——
+ * 内联 style 的优先级会盖过媒体查询。
+ */
+.reveal {
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 350ms ease-out, transform 350ms ease-out;
+  transition-delay: var(--reveal-delay, 0ms);
+}
+.reveal-in {
+  opacity: 1;
+  transform: none;
+}
+
+/* 链接悬停 = 下划线滑动（不是整条一起浮现） */
+.link-slide {
+  position: relative;
+  text-decoration: none;
+}
+.link-slide::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: -2px;
+  height: 1px;
+  width: 100%;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 150ms ease-out;
+}
+.link-slide:hover::after,
+.link-slide:focus-visible::after {
+  transform: scaleX(1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /*
+   * 把所有非必要动画一次关掉。.reveal 得显式回到终态 ——
+   * 单纯去掉 transition 会让它永远停在 opacity: 0 上，内容直接消失。
+   */
+  .reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+  .link-slide::after {
+    transition: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

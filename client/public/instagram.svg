@@ -1,0 +1,39 @@
+<!--
+  Instagram 的图标，手画的 SVG。
+
+  官方那个 PNG 不能直接下下来放进仓库（商标资产，而且这台机器也下不了外网），
+  所以按它的构图重画一遍：圆角方块 + 白描边的内方框 + 中间的圆 + 右上角那个点，
+  底色是官方那条从左下角发散出去的径向渐变（黄 → 橙红 → 洋红 → 蓝）。
+
+  为什么是 SVG 而不是跟 favicon.ico 一样走 scripts/make-favicon.mjs：
+  那个脚本是拿 zlib 手工解 PNG 再缩放的，没有画矢量的能力（仓库里没有任何
+  图像库，见 package.json）。而这个图形本来就是几个圆和方角，矢量画最省事，
+  Chrome / Edge / Firefox 从 2021 年起都认 <link rel="icon" href="*.svg">。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <!-- 渐变的圆心在左下角外面一点（cx/cy 都超出 0..1），这样黄色只在左下角
+         露一小块、蓝色压在右上角 —— 官方图标就是这个走向 -->
+    <radialGradient id="ig" cx="0.26" cy="1.06" r="1.15">
+      <stop offset="0" stop-color="#fdf497" />
+      <stop offset="0.08" stop-color="#fdf497" />
+      <stop offset="0.36" stop-color="#fd5949" />
+      <stop offset="0.58" stop-color="#d6249f" />
+      <stop offset="1" stop-color="#285aeb" />
+    </radialGradient>
+  </defs>
+
+  <rect width="64" height="64" rx="16" fill="url(#ig)" />
+  <rect
+    x="14.5"
+    y="14.5"
+    width="35"
+    height="35"
+    rx="10.5"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="4"
+  />
+  <circle cx="32" cy="32" r="9" fill="none" stroke="#ffffff" stroke-width="4" />
+  <circle cx="43.6" cy="20.4" r="2.9" fill="#ffffff" />
+</svg>

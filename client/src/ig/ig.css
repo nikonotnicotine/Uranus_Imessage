@@ -1,0 +1,1552 @@
+/*
+ * Instagram 的样式孤岛。
+ *
+ * ── 为什么要孤岛 ──
+ *
+ * 控制台那套设计语言是**单色、无投影、衬线标题、1px 边框**（见 index.css 文件头）。
+ * IG 是另一套：无衬线、方框圆角、渐变圆环、灰底分隔。两套语言不能互相漏 ——
+ * 漏过去的结果是控制台看着像社交 App、IG 看着像后台表格，两边都不成立。
+ *
+ * 隔离手段有三条，都在这个文件里：
+ *
+ *  1. **所有变量重新起名**（`--ig-*`），不复用 `--ink` / `--line` / `--paper`。
+ *     复用的话改一个控制台的灰阶会顺手改掉 IG 的边框色。
+ *  2. **所有选择器都在 `.ig` 下面**。这个文件里不写任何裸标签选择器
+ *     （没有 `button { }` 这种），不动 `:root`，不动 tailwind.config.js。
+ *  3. **局部 reset**：IG 里的按钮/输入框要脱掉 Tailwind base 那层预设
+ *     （字体、边框、padding），但只在 `.ig` 里脱。
+ *
+ * ── 为什么不用 Tailwind 工具类写 IG ──
+ *
+ * 用了也行，但 IG 的尺寸是**一堆具体数字**（头像 32/56/77/150px、feed 630px、
+ * 圆环 2px 渐变边、九宫格 3px 间隙），这些数字在 Tailwind 里全是 `w-[77px]`
+ * 这种任意值，读起来不比 CSS 好，而且渐变圆环和 `-webkit-line-clamp` 那些
+ * 本来就要写原生 CSS。所以布局用类名写在这儿，只在 JSX 里挂类。
+ *
+ * 手机版和电脑版是**同一批组件**（IG 自己也是这么干的），差别全靠 `.ig-mobile`
+ * / `.ig-desktop` 这两个根类切 —— 不是两套 CSS，也不是媒体查询：用户可以手动
+ * 切换版式（不只是跟着窗口宽度），所以必须是类名而不是 `@media`。
+ */
+
+.ig {
+  /* ── 色板 ──
+   * IG 的浅色主题。这几个值取自 2026-09 的网页版：白底、#262626 正文、
+   * #737373 次要文字、#dbdbdb 分隔线、#0095f6 蓝。
+   * 存的是 hex 而不是 RGB 通道 —— 这个文件不经过 Tailwind 的 alpha 拼接
+   * （见 index.css 文件头那条），直接写 hex 更好认。 */
+  --ig-bg: #ffffff;
+  --ig-bg-soft: #fafafa;
+  --ig-text: #262626;
+  --ig-text-soft: #737373;
+  --ig-line: #dbdbdb;
+  --ig-line-soft: #efefef;
+  --ig-blue: #0095f6;
+  --ig-blue-hover: #1877f2;
+  --ig-red: #ed4956;
+  /* 快拍圆环那条渐变，IG 的品牌色 */
+  --ig-ring: linear-gradient(45deg, #f09433, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888);
+
+  /* ── 尺寸 ──
+   * feed 630px、右栏 320px 是网页版的实际值；手机版 feed 撑满。 */
+  --ig-feed-w: 630px;
+  --ig-rail-w: 72px;
+  --ig-rail-w-open: 244px;
+  --ig-aside-w: 320px;
+
+  /* IG 用的是系统无衬线栈（它自己的字体叫 Instagram Sans，不公开），
+     这里退到各平台的默认无衬线 —— 和控制台的 Source Serif 4 彻底分开 */
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 14px;
+  line-height: 18px;
+  color: var(--ig-text);
+  background: var(--ig-bg);
+  /* 主内容区是 flex 子项，得能收缩 */
+  min-height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── 局部 reset ──
+ * Tailwind base 给 button/input 设了 `font: inherit` 和 `border: 0`，
+ * 那是按控制台的排版调的。这里重设成 IG 要的样子，**只在 .ig 里生效**。
+ *
+ * `.ig` 裹在 :where() 里是必须的，不是洁癖：写成 `.ig button` 的话它是
+ * (0,1,1)，比下面那些单类的组件规则 (0,1,0) 还高，于是 `background: none`
+ * 和 `color: inherit` 会把 .ig-btn 的蓝底、.ig-cell-del 的黑圆底白图标
+ * 一起吃掉 —— 按钮全变成透明底黑字。:where() 不计权重，这条就退到
+ * (0,0,1)，作用域还在，组件想改自己的底色字色就改得动。 */
+:where(.ig) button,
+:where(.ig) input,
+:where(.ig) textarea,
+:where(.ig) select {
+  font: inherit;
+  color: inherit;
+}
+
+:where(.ig) button {
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.ig a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.ig img {
+  display: block;
+  max-width: 100%;
+}
+
+/* ── 通用件 ── */
+
+/** 头像。尺寸靠 --size 传，圆的。 */
+.ig-av {
+  width: var(--size, 32px);
+  height: var(--size, 32px);
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--ig-line-soft);
+  flex: none;
+}
+
+/**
+ * 没有头像时的兜底：取名字首字显示。
+ * IG 上是灰色小人剪影，但这里能拿到名字，首字更有信息量。
+ */
+.ig-av-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  color: var(--ig-text-soft);
+  /* 字号跟着头像大小走 */
+  font-size: calc(var(--size, 32px) * 0.42);
+  user-select: none;
+}
+
+/**
+ * 快拍圆环：渐变边 + 白色内圈。
+ *
+ * 做法是外层 padding 2px 铺渐变、中间垫一层 2px 白、里面才是头像 ——
+ * IG 就是这个三层结构。用 border-image 做不出内圈那道白。
+ */
+.ig-ring {
+  padding: 2px;
+  border-radius: 50%;
+  background: var(--ig-ring);
+  flex: none;
+  display: block;
+}
+
+/** 全看过了的圈是灰的（IG 的规则）。 */
+.ig-ring[data-seen="true"] {
+  background: var(--ig-line);
+}
+
+.ig-ring > * {
+  border: 2px solid var(--ig-bg);
+  border-radius: 50%;
+  display: block;
+}
+
+/** 蓝勾。 */
+.ig-check {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  color: var(--ig-blue);
+}
+
+/** 主按钮（关注、发布）。 */
+.ig-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 16px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  background: var(--ig-blue);
+  color: #fff;
+  transition: background-color 120ms ease;
+}
+
+.ig-btn:hover {
+  background: var(--ig-blue-hover);
+}
+
+/** 次按钮（编辑主页、分享主页）—— 灰底黑字。 */
+.ig-btn-soft {
+  background: #efefef;
+  color: var(--ig-text);
+}
+
+.ig-btn-soft:hover {
+  background: #dbdbdb;
+}
+
+.ig-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/** 图标按钮：40px 触控区（手机上够手指点），图标本身小。 */
+.ig-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  color: var(--ig-text);
+  transition: opacity 120ms ease;
+  /* 不许被 flex 压扁。这几个按钮基本都待在 flex 行里（顶栏、帖子操作栏），
+     默认的 flex-shrink:1 会在挤的时候把它们缩到图标那么大 —— 40px 的触控区
+     悄悄变成 24px，看着还没坏。宁可让旁边的字标先让位 */
+  flex: none;
+}
+
+.ig-icon-btn:hover {
+  opacity: 0.55;
+}
+
+.ig-icon-btn[data-active="true"] {
+  color: var(--ig-red);
+}
+
+/* ── 布局：电脑版 ── */
+
+.ig-desktop {
+  display: flex;
+  min-height: 100%;
+}
+
+/** 左边那条 72px 图标栏，可展开成 244px 带文字。 */
+.ig-rail {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  width: var(--ig-rail-w);
+  height: 100vh;
+  flex: none;
+  border-right: 1px solid var(--ig-line);
+  padding: 8px 12px 20px;
+  display: flex;
+  flex-direction: column;
+  background: var(--ig-bg);
+  transition: width 160ms ease;
+}
+
+.ig-rail[data-open="true"] {
+  width: var(--ig-rail-w-open);
+}
+
+.ig-rail-logo {
+  height: 73px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  font-family: "Segoe Script", "Brush Script MT", cursive;
+  font-size: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ig-rail-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 4px;
+  white-space: nowrap;
+  transition: background-color 120ms ease;
+  width: 100%;
+}
+
+.ig-rail-item:hover {
+  background: var(--ig-line-soft);
+}
+
+/** 当前分区：浅灰底 + 粗体（截图里就是这样）。 */
+.ig-rail-item[data-active="true"] {
+  font-weight: 700;
+}
+
+/** 收起状态下藏掉文字，但保留在 DOM 里（展开时不用重排）。 */
+.ig-rail[data-open="false"] .ig-rail-label {
+  display: none;
+}
+
+/** 不能点的占位项（Reels、消息、搜索…）：灰掉、不给手型。 */
+.ig-rail-item[data-stub="true"] {
+  color: var(--ig-text-soft);
+  cursor: default;
+}
+
+.ig-rail-item[data-stub="true"]:hover {
+  background: none;
+}
+
+/** 中间那列 feed。 */
+.ig-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+  gap: 64px;
+  padding: 30px 20px 60px;
+}
+
+.ig-col {
+  width: var(--ig-feed-w);
+  max-width: 100%;
+  flex: none;
+}
+
+/** 右边那列（账号 + 为你推荐）。窄屏藏掉 —— IG 也是这么做的。 */
+.ig-aside {
+  width: var(--ig-aside-w);
+  flex: none;
+  padding-top: 12px;
+}
+
+@media (max-width: 1260px) {
+  .ig-aside {
+    display: none;
+  }
+}
+
+/* ── 布局：手机版 ── */
+
+.ig-mobile {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  /* 底栏那颗胶囊现在是在流里的（见 .ig-tabbar），它自己那 54px 就是内容和
+     底边之间的间隔，这里只再补一点余量 */
+  padding-bottom: 16px;
+}
+
+/**
+ * 顶栏：左上角 `+`、中间 logo、右上角爱心。
+ *
+ * 这是**新版 IG**（2026-09）的排布 —— 经典版的 `+` 在底栏中间。
+ * 用户给的截图是新版，照新版做。
+ */
+.ig-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 56px;
+  padding: 0 8px;
+  background: var(--ig-bg);
+  border-bottom: 1px solid var(--ig-line-soft);
+}
+
+.ig-wordmark {
+  font-family: "Segoe Script", "Brush Script MT", cursive;
+  font-size: 26px;
+  line-height: 1;
+  /* 视觉居中：脚本字体的基线偏下 */
+  padding-bottom: 4px;
+  /* 顶栏挤不下的时候先让字标截断，别去压两边按钮的触控区
+     （.ig-icon-btn 那条 flex:none 是配套的） */
+  min-width: 0;
+  overflow: hidden;
+}
+
+/**
+ * 版式切换（手机版 / 电脑版）。这是**控制台的东西**，不是 IG 的部件 ——
+ * IG 自己没有这个按钮，所以它只能挤在别人的边角上。
+ *
+ * 电脑版竖着排：它待在 72px 的图标栏底部，去掉 12px 的左右 padding 只剩
+ * 48px，两个 40px 按钮横着放绝对放不下。
+ * 手机版只有一个按钮（见 instagram.jsx 里的注释）。
+ */
+.ig-viewtoggle {
+  display: flex;
+  gap: 4px;
+}
+
+.ig-desktop .ig-viewtoggle {
+  flex-direction: column;
+  /* 和上面那排导航图标对成一条竖线。不能用 center —— 图标栏鼠标移上去会从
+     72px 展开到 244px，居中的话这两颗按钮会跟着往右滑将近 90px，而导航项是
+     width:100% 左对齐的，不动。所以靠左，再补 4px：
+       导航项  12(栏 padding) + 12(项 padding) + 24 的图标 → 图标中心在 +36
+       这里    12(栏 padding) +  4          + 40 的圆(20 的图标) → 也在 +36
+     另外别再在外面套一层 padding：栏已经 padding 过一次，套了就只剩 23px，
+     按钮（flex:none）会直接顶出栏外。 */
+  align-items: flex-start;
+  padding-left: 4px;
+}
+
+/** 爱心上那个红点。 */
+.ig-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--ig-red);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+}
+
+/**
+ * 底栏：悬浮胶囊（新版 IG）。
+ *
+ * 用 `sticky` 而不是 `fixed`：这块界面是**控制台里的一格**，左边还占着
+ * 60px 的导航条，而 `fixed` 认的是视口 —— `left: 50%` 会按整个窗口居中，
+ * 胶囊就偏出面板左边界、半个身子压在导航条上（375px 宽时实测偏 30px）。
+ * sticky 认的是滚动容器，胶囊就还在面板里，也不用把导航条的宽度写死在
+ * 这个文件里。
+ *
+ * 两条一起才管住长短两种页面：
+ *   `margin-top: auto`  内容不够一屏时（动态页就两条），列 flex 的剩余
+ *                       空间全给它，胶囊被推到底；内容溢出时它自动是 0。
+ *   `bottom: 16px`      内容溢出时由 sticky 把它贴在滚动视口底上。
+ */
+.ig-tabbar {
+  position: sticky;
+  bottom: 16px;
+  align-self: center;
+  margin-top: auto;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--ig-bg);
+  border: 1px solid var(--ig-line);
+  /* 唯一一处投影 —— 悬浮胶囊不投影就贴在内容上分不开。
+     控制台那套明令无投影，这就是两套语言必须隔开的实例 */
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.12);
+}
+
+.ig-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 40px;
+  border-radius: 999px;
+  color: var(--ig-text);
+}
+
+.ig-tab[data-stub="true"] {
+  color: #c7c7c7;
+  cursor: default;
+}
+
+.ig-tab[data-active="true"] {
+  background: var(--ig-line-soft);
+}
+
+/* ── 快拍条 ── */
+
+.ig-rings {
+  display: flex;
+  gap: 16px;
+  padding: 12px 16px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--ig-line-soft);
+  /* 滚动条在这条上很难看，藏掉（横滑靠手势/滚轮） */
+  scrollbar-width: none;
+}
+
+.ig-rings::-webkit-scrollbar {
+  display: none;
+}
+
+.ig-rings-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 72px;
+  flex: none;
+}
+
+.ig-rings-name {
+  font-size: 12px;
+  line-height: 14px;
+  color: var(--ig-text);
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/** 「你的快拍」那个加号角标。 */
+.ig-rings-add {
+  position: absolute;
+  right: 0;
+  bottom: 14px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--ig-blue);
+  border: 2px solid var(--ig-bg);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ── feed 里的一条帖子 ── */
+
+.ig-post {
+  margin-bottom: 16px;
+}
+
+/* 电脑版每条帖子之间有分隔线，手机版没有（贴着排） */
+.ig-desktop .ig-post {
+  border-bottom: 1px solid var(--ig-line-soft);
+  padding-bottom: 16px;
+  margin-bottom: 24px;
+}
+
+.ig-post-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+}
+
+.ig-desktop .ig-post-head {
+  padding: 8px 4px;
+}
+
+.ig-post-name {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ig-post-time {
+  color: var(--ig-text-soft);
+}
+
+.ig-post-time::before {
+  content: "·";
+  margin: 0 4px;
+}
+
+/**
+ * 图片区。
+ *
+ * IG 的帖子图是 1:1 到 4:5 之间，超出的会被裁。这里用 `aspect-ratio: 1`
+ * + `object-fit: cover` —— 九宫格里必须是正方形，feed 里保持一致更好认。
+ */
+.ig-post-media {
+  position: relative;
+  aspect-ratio: 1;
+  background: var(--ig-bg-soft);
+  overflow: hidden;
+}
+
+.ig-desktop .ig-post-media {
+  border-radius: 4px;
+  border: 1px solid var(--ig-line-soft);
+}
+
+.ig-post-media img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/**
+ * 关掉生图时的「文字图」：把描述当画面显示在图框里。
+ *
+ * 用户明确要的这条 —— 没开生图也得看得见「这条帖子是什么画面」，
+ * 不然帖子就是一个空框。
+ */
+.ig-post-text-img {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  text-align: center;
+  background: var(--ig-bg-soft);
+  color: var(--ig-text-soft);
+  font-size: 15px;
+  line-height: 22px;
+  /* 和真图区分开：虚线边 */
+  border: 1px dashed var(--ig-line);
+}
+
+/** 轮播的圆点指示器。 */
+.ig-dots {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 4px;
+}
+
+.ig-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 0.6);
+}
+
+.ig-dots i[data-on="true"] {
+  background: #fff;
+}
+
+/** 轮播左右箭头（电脑版才有）。 */
+.ig-carousel-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 0.85);
+  color: var(--ig-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ig-carousel-nav[data-side="left"] {
+  left: 8px;
+}
+
+.ig-carousel-nav[data-side="right"] {
+  right: 8px;
+}
+
+/** 四个动作图标 + 右边收藏。 */
+.ig-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+}
+
+.ig-desktop .ig-actions {
+  padding: 6px 0;
+}
+
+.ig-actions-spacer {
+  flex: 1;
+}
+
+.ig-post-body {
+  padding: 0 16px 8px;
+}
+
+.ig-desktop .ig-post-body {
+  padding: 0 4px 8px;
+}
+
+.ig-likes {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+/** 配文：折叠成两行，点「更多」展开。 */
+.ig-caption {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.ig-caption[data-open="true"] {
+  display: block;
+  -webkit-line-clamp: unset;
+}
+
+.ig-caption-name {
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.ig-more {
+  color: var(--ig-text-soft);
+}
+
+.ig-meta {
+  color: var(--ig-text-soft);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+/* ── 评论 ── */
+
+.ig-comments {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ig-comment {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  word-break: break-word;
+}
+
+/** 回复往里缩一层（IG 的评论只有两层）。 */
+.ig-comment[data-reply="true"] {
+  padding-left: 36px;
+}
+
+.ig-comment-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.ig-comment-name {
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.ig-comment-meta {
+  display: flex;
+  gap: 12px;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--ig-text-soft);
+}
+
+/** 评论输入框。 */
+.ig-compose {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--ig-line-soft);
+}
+
+.ig-desktop .ig-compose {
+  padding: 12px 4px 0;
+}
+
+.ig-compose input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: none;
+  font-size: 14px;
+}
+
+.ig-compose input::placeholder {
+  color: var(--ig-text-soft);
+}
+
+.ig-compose-send {
+  color: var(--ig-blue);
+  font-weight: 600;
+}
+
+.ig-compose-send:disabled {
+  color: #b2dffc;
+  cursor: default;
+}
+
+/* ── 主页 ── */
+
+.ig-profile {
+  max-width: 935px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+.ig-mobile .ig-profile {
+  padding: 0;
+  /* 上面那条 `margin: 0 auto` 是电脑版 935px 容器居中用的，手机版必须收回来：
+     手机版根节点是竖向 flex，**交叉轴上的 auto 外边距会顶掉默认的 stretch**，
+     于是整页缩成内容宽（315 的面板里实测只占 275.8），左右各空 20px，
+     九宫格跟着从 103px 一格缩到 89.9px。手机版的主页本来就该通栏。 */
+  margin: 0;
+}
+
+/** 电脑版：150px 头像在左，信息在右。 */
+.ig-desktop .ig-profile-head {
+  display: flex;
+  gap: 80px;
+  padding: 30px 0 44px;
+}
+
+.ig-desktop .ig-profile-av {
+  --size: 150px;
+  flex: none;
+}
+
+/** 手机版：小头像 + 三个计数并排（截图里是这样）。 */
+.ig-mobile .ig-profile-head {
+  padding: 16px;
+}
+
+.ig-mobile .ig-profile-top {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+
+.ig-mobile .ig-profile-av {
+  --size: 86px;
+}
+
+.ig-counts {
+  display: flex;
+  gap: 40px;
+}
+
+.ig-mobile .ig-counts {
+  flex: 1;
+  gap: 0;
+  justify-content: space-around;
+}
+
+.ig-count {
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+}
+
+/* 手机版是上下两行居中，电脑版是「数字 + 文字」同一行 */
+.ig-mobile .ig-count {
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+.ig-count b {
+  font-weight: 600;
+}
+
+.ig-count span {
+  color: var(--ig-text);
+}
+
+.ig-mobile .ig-count span {
+  font-size: 13px;
+  color: var(--ig-text);
+}
+
+.ig-profile-name {
+  font-weight: 600;
+  margin-top: 12px;
+}
+
+.ig-bio {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ig-link {
+  color: #00376b;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.ig-profile-btns {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ig-desktop .ig-profile-btns {
+  margin-bottom: 20px;
+}
+
+.ig-mobile .ig-profile-btns {
+  padding: 0 16px 16px;
+}
+
+.ig-mobile .ig-profile-btns .ig-btn {
+  flex: 1;
+}
+
+/* ── 精选快拍 ── */
+
+.ig-highlights {
+  display: flex;
+  gap: 32px;
+  padding: 20px 0;
+}
+
+/**
+ * 手机版**不可滑动**（用户明确要求），最多三个 —— 所以不加 overflow-x。
+ * 三个 77px 的圈加间距在最窄的手机上也放得下，不会溢出。
+ */
+.ig-mobile .ig-highlights {
+  padding: 16px;
+  gap: 20px;
+  overflow: hidden;
+}
+
+.ig-highlight {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 77px;
+  flex: none;
+}
+
+.ig-highlight-cover {
+  --size: 77px;
+  border: 1px solid var(--ig-line);
+  padding: 3px;
+  border-radius: 50%;
+}
+
+.ig-mobile .ig-highlight-cover {
+  --size: 64px;
+}
+
+.ig-highlight-title {
+  font-size: 12px;
+  font-weight: 600;
+  max-width: 77px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/** 「+ 新建」那个空心圈。 */
+.ig-highlight-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--ig-line);
+  border-radius: 50%;
+  color: var(--ig-text);
+}
+
+/* ── 九宫格 ── */
+
+.ig-tabs {
+  display: flex;
+  justify-content: center;
+  gap: 60px;
+  border-top: 1px solid var(--ig-line);
+}
+
+.ig-mobile .ig-tabs {
+  gap: 0;
+}
+
+.ig-tab-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ig-text-soft);
+  border-top: 1px solid transparent;
+  margin-top: -1px;
+}
+
+.ig-mobile .ig-tab-item {
+  flex: 1;
+  justify-content: center;
+  padding: 10px 0;
+}
+
+.ig-tab-item[data-active="true"] {
+  color: var(--ig-text);
+  border-top-color: var(--ig-text);
+}
+
+/**
+ * 「编辑角色帖子」那条横条。
+ *
+ * 这不是 IG 有的东西 —— 它是这套控制台加的编辑入口，所以刻意长得朴素
+ * （sunken 底、一句说明、两个按钮），和上面那排仿真的分区标签分得开。
+ */
+.ig-managebar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  background: var(--ig-bg-soft);
+  border-bottom: 1px solid var(--ig-line);
+  color: var(--ig-text-soft);
+  font-size: 13px;
+}
+
+.ig-managebar > span {
+  flex: 1;
+  min-width: 160px;
+}
+
+/** 电脑版 5 列、手机版 3 列（用户给的截图就是这个比例）。 */
+.ig-grid {
+  display: grid;
+  gap: 4px;
+  padding: 4px 0 40px;
+}
+
+.ig-desktop .ig-grid {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+.ig-mobile .ig-grid {
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3px;
+  padding: 3px 0 24px;
+}
+
+.ig-cell {
+  position: relative;
+  aspect-ratio: 1;
+  background: var(--ig-bg-soft);
+  overflow: hidden;
+}
+
+/**
+ * 格子里那个「点开」按钮铺满整格。
+ *
+ * 格子从 button 改成 div 是因为管理态要在里面再放一个删除按钮 ——
+ * button 套 button 是非法 HTML，点击目标也会打架。
+ */
+.ig-cell-open {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.ig-cell img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/**
+ * 管理态每格右上角的删除。
+ *
+ * 白底图上的浅色图标看不见，所以给一层半透明黑圆底 —— 这不是投影，
+ * 是控件自己的底色（硬规则禁的是用投影造层次）。
+ */
+.ig-cell-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 0.55);
+  color: #fff;
+  transition: background 120ms ease;
+}
+
+.ig-cell-del:hover {
+  background: var(--ig-red);
+}
+
+/** 没有图的帖子在九宫格里显示配文片段。 */
+.ig-cell-text {
+  width: 100%;
+  height: 100%;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--ig-text-soft);
+  display: -webkit-box;
+  -webkit-line-clamp: 6;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+/** 悬停时显示点赞/评论数（电脑版）。 */
+.ig-cell-hover {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  background: rgb(0 0 0 / 0.35);
+  color: #fff;
+  font-weight: 600;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.ig-cell:hover .ig-cell-hover {
+  opacity: 1;
+}
+
+.ig-mobile .ig-cell-hover {
+  display: none;
+}
+
+/** 多图角标。 */
+.ig-cell-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  color: #fff;
+  /* 白图上白图标看不见，加一点投影 —— 局限在这一个角标上 */
+  filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.4));
+}
+
+/* ── 空状态 ── */
+
+.ig-empty {
+  padding: 60px 20px;
+  text-align: center;
+  color: var(--ig-text-soft);
+}
+
+.ig-empty b {
+  display: block;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--ig-text);
+  margin-bottom: 8px;
+}
+
+/* ── 快拍播放器 ──
+ *
+ * 手机版：整屏黑底、图片信箱式居中。
+ * 电脑版：深灰底、中间一张 9:16 卡片、两侧箭头。
+ * 两版共用这一套类，靠 .ig-story[data-view] 切。
+ */
+
+.ig-story {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+.ig-story[data-view="desktop"] {
+  background: #1a1a1a;
+}
+
+/** 卡片：手机撑满，电脑限成 9:16。 */
+.ig-story-card {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+}
+
+.ig-story[data-view="desktop"] .ig-story-card {
+  width: min(440px, 90vw);
+  height: min(782px, 90vh);
+  aspect-ratio: 9 / 16;
+  border-radius: 8px;
+}
+
+.ig-story-media {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ig-story-media img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/** 顶部进度条：一段一条，看过的填满、当前的动画填充。 */
+.ig-story-bars {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  right: 8px;
+  z-index: 3;
+  display: flex;
+  gap: 4px;
+}
+
+.ig-story-bars i {
+  flex: 1;
+  height: 2px;
+  border-radius: 2px;
+  background: rgb(255 255 255 / 0.35);
+  overflow: hidden;
+}
+
+.ig-story-bars i em {
+  display: block;
+  height: 100%;
+  width: var(--fill, 0%);
+  background: #fff;
+  transition: width 120ms linear;
+}
+
+/** 顶部那一行：头像 + 账号 + 时间，右边三点和 ×。 */
+.ig-story-top {
+  position: absolute;
+  top: 18px;
+  left: 12px;
+  right: 12px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #fff;
+}
+
+.ig-story-top .ig-av {
+  border: 1px solid rgb(255 255 255 / 0.4);
+}
+
+.ig-story-who {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.ig-story-age {
+  color: rgb(255 255 255 / 0.7);
+  font-size: 13px;
+}
+
+/** 配文：压在图片下半部，带一层渐变保证可读。 */
+.ig-story-caption {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 76px;
+  z-index: 2;
+  padding: 40px 20px 12px;
+  color: #fff;
+  font-size: 16px;
+  line-height: 22px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: linear-gradient(to top, rgb(0 0 0 / 0.55), transparent);
+}
+
+/** 底栏：发消息 + 爱心 + 纸飞机（别人的快拍）。 */
+.ig-story-foot {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 16px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ig-story-foot input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 16px;
+  border-radius: 22px;
+  border: 1px solid rgb(255 255 255 / 0.5);
+  background: none;
+  color: #fff;
+  outline: none;
+}
+
+.ig-story-foot input::placeholder {
+  color: rgb(255 255 255 / 0.7);
+}
+
+.ig-story-foot .ig-icon-btn {
+  color: #fff;
+}
+
+/** 自己的快拍底栏：动态 / 精选 / 提及 / 发送 / 更多。 */
+.ig-story-own {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  padding: 10px 4px 16px;
+  background: linear-gradient(to top, rgb(0 0 0 / 0.6), transparent);
+}
+
+.ig-story-own button {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  color: #fff;
+  font-size: 11px;
+}
+
+/** 左右翻页箭头（电脑版）。 */
+.ig-story-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 4;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 0.9);
+  color: #262626;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ig-story-arrow[data-side="left"] {
+  left: max(16px, calc(50% - min(440px, 90vw) / 2 - 60px));
+}
+
+.ig-story-arrow[data-side="right"] {
+  right: max(16px, calc(50% - min(440px, 90vw) / 2 - 60px));
+}
+
+/** 电脑版左上角的 Instagram 字标 + 右上角大 ×。 */
+.ig-story-brand {
+  position: fixed;
+  top: 20px;
+  left: 24px;
+  z-index: 5;
+  color: #fff;
+  font-family: "Segoe Script", "Brush Script MT", cursive;
+  font-size: 24px;
+}
+
+.ig-story-close {
+  position: fixed;
+  top: 16px;
+  right: 20px;
+  z-index: 5;
+  color: #fff;
+}
+
+/** 收到的回复气泡（自己的快拍上飘着那个）。 */
+.ig-story-reply {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 96px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 20px;
+  background: rgb(0 0 0 / 0.45);
+  color: #fff;
+  font-size: 13px;
+  backdrop-filter: blur(6px);
+}
+
+/* ── 弹层（编辑主页、发帖、三点菜单） ──
+ *
+ * 这几个是**功能性界面**，不是 IG 的仿真部分 —— 但它们开在 IG 里，
+ * 用控制台那套衬线大标题会突兀。所以做成 IG 风格的朴素弹层。
+ */
+
+.ig-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgb(0 0 0 / 0.65);
+}
+
+.ig-modal-box {
+  width: 100%;
+  max-width: 500px;
+  max-height: 88vh;
+  overflow-y: auto;
+  background: var(--ig-bg);
+  border-radius: 12px;
+}
+
+.ig-modal-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--ig-line);
+  background: var(--ig-bg);
+  font-weight: 600;
+}
+
+.ig-modal-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/**
+ * 内容自带边距时去掉这一层内边距（九宫格点进来的那条帖子）。
+ * 顺手把圆角切掉 —— 帖子贴到 box 边上了，box 的圆角得咬住它。
+ */
+.ig-modal-body[data-flush="true"] {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
+}
+
+/** 弹层里的帖子不要再画一条外框线，box 自己就是框。 */
+.ig-modal-body[data-flush="true"] .ig-post {
+  border: none;
+  margin: 0;
+}
+
+.ig-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ig-field > span {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ig-text-soft);
+}
+
+.ig-field input,
+.ig-field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--ig-line);
+  border-radius: 8px;
+  background: var(--ig-bg-soft);
+  outline: none;
+  font-size: 14px;
+  resize: vertical;
+}
+
+.ig-field input:focus,
+.ig-field textarea:focus {
+  border-color: var(--ig-text-soft);
+}
+
+.ig-field small {
+  font-size: 11px;
+  color: var(--ig-text-soft);
+  line-height: 15px;
+}
+
+.ig-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--ig-line);
+}
+
+/** 三点菜单：居中一列按钮，破坏性的那条标红（IG 就是这么做的）。 */
+.ig-sheet {
+  width: 100%;
+  max-width: 400px;
+  background: var(--ig-bg);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.ig-sheet button {
+  width: 100%;
+  padding: 14px;
+  border-bottom: 1px solid var(--ig-line-soft);
+  text-align: center;
+  font-size: 14px;
+}
+
+.ig-sheet button:last-child {
+  border-bottom: none;
+}
+
+.ig-sheet button[data-danger="true"] {
+  color: var(--ig-red);
+  font-weight: 600;
+}
+
+/** 图片候选格（发帖时挑图）。 */
+.ig-picks {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.ig-pick {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--ig-line);
+  background: var(--ig-bg-soft);
+}
+
+.ig-pick img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ig-pick-del {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 0.6);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
