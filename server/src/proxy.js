@@ -382,10 +382,32 @@ export async function proxyFor(scope) {
  */
 export function whyNetwork(e, scope, timeoutMs) {
   const name = String(e?.name ?? "");
-  const code = String(e?.cause?.code ?? e?.code ?? "");
   const msg = String(e?.message ?? e);
   const viaProxy = usesProxy(scope);
   const via = viaProxy ? `代理 ${maskProxy(proxySettings().url)}` : "";
+
+  /**
+   * 真实原因有时埋得比 `e.cause` 更深。
+   *
+   * Happy Eyeballs（Node 20 起默认开）在 IPv6 和 IPv4 都连不上时会抛一个
+   * `AggregateError`，`code` 挂在外层、**里面每一条才带具体原因**；代理隧道
+   * 里出的 TLS/HTTP 错也会再包一层。只读 `e.cause.code` 的话这些全都读不到，
+   * 于是掉进最后那个兜底、把 undici 的 `fetch failed` 原样吐出去。
+   */
+  const codes = [];
+  const seen = new Set();
+  const walk = (err, depth = 0) => {
+    if (!err || depth > 4 || seen.has(err)) return;
+    seen.add(err);
+    const c = String(err?.code ?? "").trim();
+    if (c) codes.push(c);
+    for (const sub of err?.errors ?? []) walk(sub, depth + 1);
+    walk(err?.cause, depth + 1);
+  };
+  walk(e?.cause);
+  walk(e);
+
+  const code = codes.find((c) => c !== "UND_ERR_CONNECT_TIMEOUT") ?? codes[0] ?? "";
 
   if (name === "TimeoutError" || code === "UND_ERR_HEADERS_TIMEOUT" || /timeout/i.test(msg)) {
     const secs = timeoutMs ? `（${Math.round(timeoutMs / 1000)} 秒）` : "";
@@ -405,7 +427,21 @@ export function whyNetwork(e, scope, timeoutMs) {
   if (code === "CERT_HAS_EXPIRED" || /certificate/i.test(msg)) {
     return viaProxy ? `证书校验失败 —— ${via} 在中间做了 TLS 拦截？` : "证书校验失败";
   }
-  return msg;
+  if (/^UND_ERR_|^ECONN|^EPIPE$|^ETIMEDOUT$/.test(code)) {
+    const hint = viaProxy
+      ? `${via} 那边连不上`
+      : "这一类没走代理 —— 在国内连不上，去控制台的「代理」那节勾上并填地址";
+    return `连不上目标（${code}）—— ${hint}`;
+  }
+
+  // 兜底也得带点信息：`fetch failed` 这一句等于什么都没说，而这几种错误
+  // 恰恰是最常见的几种，多带一两个词能省掉一轮排查
+  if (/fetch failed|socket|other side closed/i.test(msg)) {
+    return viaProxy
+      ? `连接失败 —— 检查 ${via} 是不是还开着`
+      : "连接失败 —— 目标在国内连不上，去控制台「代理」那节勾上并填地址";
+  }
+  return codes.length ? `${msg}（${codes.join("、")}）` : msg;
 }
 
 /* ================= 测试连通 ================= */

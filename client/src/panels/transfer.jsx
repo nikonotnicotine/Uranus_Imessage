@@ -17,8 +17,13 @@ import { Button, Card } from "../ui.jsx";
  *
  * 导入回来的那份只进草稿，用户点底下的保存才落盘 —— 所以看一眼不喜欢，
  * 点撤销就当没发生过。
+ *
+ * `onImport` 返回对象时按「多出一件」说话（`已导入「xxx」`）；返回字符串时
+ * 原样当提示 —— 正则规则那边就不是多一件，是往现有预设里补几条，说不出
+ * 「一件」的名字。`busyText` 同理：正则那栏在预设自己的正则折叠里，标题
+ * 不叫「导出 / 导入这份预设」。
  */
-export function TransferCard({ what, onExport, onImport, onDone }) {
+export function TransferCard({ what, onExport, onImport, onDone, title, desc, busyText }) {
   const fileRef = useRef(null);
   const [busy, setBusy] = useState(""); // "" | export | import
   const [note, setNote] = useState(null); // { ok, text }
@@ -53,7 +58,14 @@ export function TransferCard({ what, onExport, onImport, onDone }) {
     setBusy("import");
     try {
       const made = await onImport(bundle);
-      setNote({ ok: true, text: `已导入「${made.name}」。还没落盘 —— 点下面的保存才写进去` });
+      // 字符串 = 自己写好了提示（正则那栏用），对象 = 「多出一件」
+      setNote({
+        ok: true,
+        text:
+          typeof made === "string"
+            ? made
+            : `已导入「${made.name}」。还没落盘 —— 点下面的保存才写进去`,
+      });
       onDone?.(made);
     } catch (e) {
       setNote({ ok: false, text: String(e?.message ?? e) });
@@ -64,15 +76,19 @@ export function TransferCard({ what, onExport, onImport, onDone }) {
 
   return (
     <Card
-      title={`导出 / 导入${what}`}
-      desc={`存成一个 JSON 文件带走，或者把别处的${what}导进来`}
+      title={title ?? `导出 / 导入${what}`}
+      desc={desc ?? `存成一个 JSON 文件带走，或者把别处的${what}导进来`}
     >
       <div className="grid grid-cols-1 gap-4">
-        <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">
-          导出的是<span className="text-ink-soft">你现在看见的这份</span>，包括还没保存的改动。
-          导入是<span className="text-ink-soft">新增一份</span>，现有的都不动；重名会自动加
-          「（导入）」，改名随你。
-        </p>
+        {busyText ? (
+          <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">{busyText}</p>
+        ) : (
+          <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">
+            导出的是<span className="text-ink-soft">你现在看见的这份</span>，包括还没保存的改动。
+            导入是<span className="text-ink-soft">新增一份</span>，现有的都不动；重名会自动加
+            「（导入）」，改名随你。
+          </p>
+        )}
 
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" onClick={runExport} disabled={Boolean(busy)}>

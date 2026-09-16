@@ -80,6 +80,19 @@ export const SECRET_PATH = path.join(DATA_DIR, "data.config.json");
  *    一份几百行的配置里翻。
  */
 export const AUTH_PATH = path.join(DATA_DIR, "auth.json");
+
+/**
+ * 定时维护的**进度**：上次真重启 / 清真缓存 / 真备份各是什么时候。
+ *
+ * 单独一个文件，理由是它**必须活过进程本身** —— 重启一次就把计时重置的话，
+ * 「每 3 天备份一次」在每天重启的服务上永远不会触发（用户原话：「每次重启
+ * 又重新计时了」）。所以它不能待在内存里，而 config.json 又不行：那份每次
+ * 保存设置都整份重写、而且会顺带重启所有桥接，往里塞一个每分钟都可能变的
+ * 时间戳等于让「改设置」和「记进度」互相踩。
+ *
+ * 也不进 data.config.json：那是密钥文件，和这个语义毫无关系。
+ */
+export const MAINTENANCE_PATH = path.join(DATA_DIR, "maintenance.json");
 export const CHARACTERS_DIR = path.join(DATA_DIR, "characters");
 export const WORLDS_DIR = path.join(DATA_DIR, "worlds");
 export const USER_DIR = path.join(DATA_DIR, "user");

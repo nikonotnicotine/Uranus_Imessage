@@ -335,13 +335,37 @@ export function ConsolePanel() {
 /**
  * 「定时做这件事」那一对控件：一个开关 + 打开时露出来的间隔。
  *
- * 定时重启和定时清缓存长得一模一样，只有文案和字段名不同，所以抽出来。
+ * 定时重启、定时清缓存、定时云备份长得一模一样，只有文案和字段名不同，所以抽出来。
  * 保存不用自己管 —— 改了 config 之后外壳底部的 GlobalSaveBar 会自己出来。
+ *
+ * 间隔是**两个框**（天 + 小时），不是一个大小时数。合并成一个数看着更省地方，
+ * 但「每 1 天 6 小时」会显示成「每 30 小时」，下次打开就认不出自己填的是什么了；
+ * 而且想填「每 3 天」还得自己心算 72（用户原话：「每 X 天 X 小时」）。
+ * 两个字段后端也是分开存的，见 config.js:normalizeInterval。
  */
 function MaintenanceFields({ title, desc, value, onChange }) {
   const enabled = Boolean(value?.enabled);
-  // hours 可能是 undefined（老配置里没这一块），显示上退到后端那份默认值
-  const hours = Number(value?.hours) || 24;
+  // 老配置里只有 hours 一个字段（能到 168），拆法照抄后端 normalizeInterval ——
+  // 用户打开面板看到的必须是同一个间隔。后端那边每次保存都会把 days 补上，
+  // 所以这条分支正常只在「刚升级、还没保存过」的时候走
+  const carry = useMemo(() => {
+    const total = Number(value?.hours);
+    if (!Number.isFinite(total) || total <= 23) return null;
+    const need = value?.days === undefined || !Number(value?.days);
+    if (!need) return null;
+    return { days: Math.floor(total / 24), hours: total % 24 };
+  }, [value?.days, value?.hours]);
+  const days = carry ? carry.days : Number(value?.days) || 0;
+  const hours = carry ? carry.hours : Number(value?.hours) || 0;
+
+  // 两个都是 0 等于每一跳都触发，那是灾难不是意图。开关一打开就补成 1 小时，
+  // 和后端 normalizeInterval 的兜底同一个规矩
+  const open = (next) => {
+    const d = next.days ?? days;
+    const h = next.hours ?? hours;
+    return { enabled: true, ...(d || h ? { days: d, hours: h } : { days: 0, hours: 1 }) };
+  };
+
   return (
     <div className="grid grid-cols-1 gap-4 border-t border-line pt-4">
       <label className="flex items-start justify-between gap-4">
@@ -351,21 +375,42 @@ function MaintenanceFields({ title, desc, value, onChange }) {
         </span>
         <Switch
           checked={enabled}
-          onChange={(v) => onChange({ enabled: v, hours })}
+          onChange={(v) =>
+            onChange(v ? open({}) : { enabled: false, days, hours })
+          }
           label={title}
         />
       </label>
       {enabled && (
-        <NumberField
-          label="每隔"
-          value={hours}
-          min={1}
-          max={168}
-          step={1}
-          suffix="小时"
-          onChange={(v) => onChange({ hours: v })}
-          hint="1 到 168 小时（一周）。计时从服务启动那一刻算起"
-        />
+        <>
+          <div className="grid grid-cols-2 gap-4">
+            <NumberField
+              label="每隔（天）"
+              value={days}
+              min={0}
+              max={90}
+              step={1}
+              suffix="天"
+              onChange={(v) => onChange(open({ days: v }))}
+            />
+            <NumberField
+              label="再加（小时）"
+              value={hours}
+              min={0}
+              max={23}
+              step={1}
+              suffix="小时"
+              onChange={(v) => onChange(open({ hours: v }))}
+            />
+          </div>
+          <p className="text-meta leading-relaxed text-ink-faint">
+            两个都填 0 按 1 小时算。填「0 天 6 小时」就是每 6 小时一次。
+            <br />
+            计时<span className="text-ink">不从服务启动算起</span> —— 从上次真跑过的
+            时刻接着数。重启服务、关掉再打开，倒计时都接着走；到点那一刻没跑成
+            （比如服务正好停着），回来就跑一次，中间的不会补。
+          </p>
+        </>
       )}
     </div>
   );
@@ -738,7 +783,7 @@ export function ServicePanel() {
             desc={
               canRestart === false
                 ? "这份服务不是用「启动.bat」跑起来的，定时重启开着也不会生效（退出之后没人把它开回来）。"
-                : "隔一阵子自己重启一次，用在长时间挂机后内存涨上去、桥接卡住这类地方。到点那一下所有对话会断几十秒。"
+                : "隔一阵子自己重启一次，用在长时间挂机后内存涨上去、桥接卡住这类地方。到点那一下所有对话会断几十秒。重启本身不会让计时重来。"
             }
             value={maintenance.restart}
             onChange={(patch) => updateMaintenance("restart", patch)}
@@ -766,7 +811,7 @@ export function ServicePanel() {
           </div>
           <MaintenanceFields
             title="定时清缓存"
-            desc="隔一阵子自己清一次，和上面那个按钮做的事一模一样。代价只是那一轮消息重查天气、慢一两秒。"
+            desc="隔一阵子自己清一次，和上面那个按钮做的事一模一样。代价只是那一轮消息重查天气、慢一两秒。重启服务不会让计时重来。"
             value={maintenance.cache}
             onChange={(patch) => updateMaintenance("cache", patch)}
           />
@@ -1620,7 +1665,7 @@ export function CloudBackupPanel() {
         <div className="border-t border-line pt-4">
           <MaintenanceFields
             title="定时自动备份"
-            desc="到点自己打包上传一次，跑在后台。上一轮还在传的话这一轮跳过，不会叠在一起"
+            desc="到点自己打包上传一次，跑在后台。上一轮还在传的话这一轮跳过，不会叠在一起。重启服务不会让计时重来"
             value={cb.auto}
             onChange={(patch) => updateCloudBackup({ auto: { ...(cb.auto ?? {}), ...patch } })}
           />

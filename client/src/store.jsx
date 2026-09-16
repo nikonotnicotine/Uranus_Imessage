@@ -2,6 +2,8 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 // labels.js 是纯常量 + 纯函数，不 import 这个文件，不会成环
 import { FORMAT_CHILD_KINDS } from "./labels.js";
+// 八股文规则的客户端副本，内容和服务端 cliche.js 一致（那边是单一事实来源）
+import { clicheRules } from "./clicherules.js";
 
 const ConfigContext = createContext(null);
 const LogContext = createContext(null);
@@ -463,14 +465,17 @@ function blankPreset(mode = "online") {
       ...(offline ? [{ id: newId("e"), kind: "userChoice", enabled: false }] : []),
     ],
     /*
-     * 只有「去掉思维链」这一条。
+     * 「去掉思维链」+ 线下那批八股文规则。
      *
-     * 线下预设那批「八股文」规则（删除 / 替换两组）**不在这儿抄一份**：服务端
-     * preset.js:defaultRegexRules("offline") 里已经写全了，而这份草稿一保存就会
-     * 被 normalizePreset 整份过一遍，规则表就补齐了。前端再抄一遍等于把二十多条
-     * 正则和一大串替换词维护在两个地方，早晚分叉。
+     * 八股文规则来自 clicherules.js（服务端 cliche.js 的副本），**新建时就摆进
+     * 草稿里**，用户一打开正则那一栏就能看见它们、能一条条开关 —— 这正是当初
+     * 提的需求（「我要在正则里的，不然我都不知道我要怎么开关」）。服务端那份是
+     * 单一事实来源，这份副本只是让草稿在保存之前就有内容。
      *
-     * 代价是：新建线下预设后、点保存之前，规则那一栏看着是空的。界面上标注了。
+     * ID 在这儿重新生成（newId("rx")），不用 clicheRules 里手写的 rx-d-1 那套：
+     * 手写 ID 是给**导出/粘贴**用的，同一份预设里两条规则撞 ID 会出乱子，而这份
+     * 草稿将来会和别处来的规则合在一起。顺序照抄 clicheRules —— rx-r-16 必须
+     * 在 rx-r-17 前面。
      */
     regex: [
       {
@@ -487,6 +492,7 @@ function blankPreset(mode = "online") {
         toUser: true,
         toHistory: true,
       },
+      ...(offline ? clicheRules().map((r) => ({ ...r, id: newId("rx") })) : []),
     ],
   };
 }
@@ -905,6 +911,50 @@ export function ConfigProvider({ children }) {
       return preset;
     },
     [updateConfig]
+  );
+
+  /*
+   * 正则规则的单独导出导入。
+   *
+   * 和预设那对的两点不同：导出的文件名带上预设名（「uranus-regexrules-线下默认预设-
+   * …json」），一眼看得出这套规则是从哪儿来的；导入是**往眼前这份预设里补几条**，
+   * 落在草稿上、点保存才写盘，已经是这套规则里的（按 id 认）会被跳过，所以
+   * 同一份文件导两次不会翻倍，被删掉的那几条倒会补回来。
+   *
+   * 导出的规则用 `preset.regex`（草稿里那份），不是磁盘上的 —— 和导出预设同理。
+   */
+  const exportRegexRules = useCallback((rules, presetName) => {
+    const slug = String(presetName ?? "").trim() || "未命名预设";
+    const safe = slug.replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 40);
+    return apiDownload(
+      "/api/regex/export",
+      { method: "POST", body: { rules, presetName: slug } },
+      `uranus-regexrules-${safe}.json`
+    );
+  }, []);
+
+  /** 把一批规则补进某份预设，返回一句给用户看的结果。 */
+  const importRegexRules = useCallback(
+    async (presetId, bundle) => {
+      const target = config?.presets?.find((p) => p.id === presetId);
+      const { rules, added, skipped } = await api("/api/regex/import", {
+        method: "POST",
+        body: { bundle, rules: target?.regex ?? [] },
+      });
+      if (added) {
+        updateConfig((c) => ({
+          ...c,
+          presets: (c.presets ?? []).map((p) =>
+            p.id === presetId ? { ...p, regex: [...(p.regex ?? []), ...rules] } : p
+          ),
+        }));
+      }
+      const parts = [`导入 ${added} 条`];
+      if (skipped) parts.push(`已有 ${skipped} 条跳过（同一份规则不用导两遍）`);
+      parts.push("还没落盘 —— 点下面的保存才写进去");
+      return parts.join("，");
+    },
+    [config, updateConfig]
   );
 
   const exportWorldBook = useCallback(
@@ -1965,6 +2015,8 @@ export function ConfigProvider({ children }) {
         // 单份预设 / 单本世界书的搬家
         exportPreset,
         importPreset,
+        exportRegexRules,
+        importRegexRules,
         exportWorldBook,
         importWorldBook,
         // 服务商源

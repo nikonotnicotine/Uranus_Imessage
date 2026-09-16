@@ -47,17 +47,19 @@ import {
   writeMemories,
   writePendingText,
 } from "./memorystore.js";
-import { normalizePresets, presetLabel } from "./preset.js";
+import { str } from "./normalize.js";
+import { normalizePresets, normalizeRegexRules, presetLabel } from "./preset.js";
 import { normalizeWorldBooks, worldBookLabel } from "./worldinfo.js";
 
 const APP = "uranus-imessage";
 const VERSION = 1;
 
-/** 三种单件。值会写进文件里，改了就读不了旧文件，别动。 */
+/** 四种单件。值会写进文件里，改了就读不了旧文件，别动。 */
 export const KIND = {
   preset: "preset",
   world: "worldbook",
   memory: "memorybank",
+  regex: "regexrules",
 };
 
 /** 报错时说人话用的。backup 也列进来 —— 拿备份文件来导预设是最常见的手滑。 */
@@ -65,6 +67,7 @@ const KIND_LABEL = {
   preset: "预设",
   worldbook: "世界书",
   memorybank: "记忆库",
+  regexrules: "正则规则",
   backup: "整份备份",
 };
 
@@ -164,6 +167,77 @@ export function importPreset(bundle, current) {
   const seed = { ...raw, id: "", name: uniqueName(presetLabel(raw), list.map(presetLabel)) };
   const all = normalizePresets([...list, seed]);
   return all[all.length - 1];
+}
+
+/* ================= 正则规则 ================= */
+
+/*
+ * 和预设、世界书**不一样**：这边导入**保留原来的 id**，也不改名。
+ *
+ * 上面那条「导入一律重新发 id」的规矩是为「两件不同的东西」定的 —— 两份预设
+ * 撞 id 就是两份打架的文件，所以必须换。规则是另一回事：
+ *
+ *  1. 用户导出一套八股文规则、粘到另一份预设里，要的正是「同一套规则出现在
+ *     两处」，id 一致反而方便对照、方便再导一次、方便两边一起改。
+ *  2. **顺序有意义**：`rx-r-16`（如同…岩浆…灌进/满）必须排在 `rx-r-17`
+ *     （岩浆）前面。重发 id 会把这个顺序连同「谁是原来那条」一起抹掉。
+ *  3. 规则是**追加**进某份预设的，不产生新的「件」；也不像预设那样有列表、
+ *     有唯一定位，id 撞了不会让谁找不到谁。
+ *
+ * 撞 id 的处理是**跳过**，不是改名：导进来的这条已经在这一份里了，再来一条
+ * 一模一样的是重复。改名（rx-d-1-2）会留下两条内容相同、名字看着就像同一套
+ * 的规则，用户还得自己猜该删哪条。
+ */
+
+/** 打包一组正则规则。**带 id** —— 理由见上面那段注释。 */
+export function exportRegexRules(rules, label = "") {
+  const list = Array.isArray(rules) ? rules : [];
+  return envelope(KIND.regex, {
+    name: str(label).trim(),
+    count: list.length,
+    rules: list,
+  });
+}
+
+/**
+ * 读一份规则出来，**只解析不落盘**，返回「该追加进这份预设的那几条」。
+ *
+ * 已经有的（按 id 认）不重复加，所以同一份文件连导两次不会翻倍 —— 用户想
+ * 拿回被自己删掉的某几条时，把整套再导一次也只会补回缺的那几条。
+ *
+ * 补字段走 normalizeRegexRules（和保存预设时同一份实现），所以导进来的规则
+ * 和用户手写一条新规则得到的字段完全一样；缺 flags / targets 的老文件也能读。
+ */
+export function importRegexRules(bundle, current) {
+  const raw = openBundle(bundle, KIND.regex).rules;
+  if (!Array.isArray(raw)) {
+    throw new Error("文件里没有 rules 这一块，内容不完整");
+  }
+  const list = Array.isArray(current) ? current : [];
+  const have = new Set(list.map((r) => str(r?.id).trim()).filter(Boolean));
+  // 没带 id 的（手写的包）也算新的，normalize 会给它发一个
+  const fresh = raw.filter((r) => {
+    const id = str(r?.id).trim();
+    return !id || !have.has(id);
+  });
+  if (!fresh.length) return { rules: [], added: 0, skipped: raw.length, skippedIds: [] };
+
+  // 现有规则一起过一遍：normalizeRegexRules 的 id 去重是整表算的，
+  // 只喂新规则的话它不知道哪些 id 已经被占
+  const normalized = normalizeRegexRules([...list, ...fresh]).slice(list.length);
+  const taken = new Set(have);
+  const rules = normalized.map((r, i) => {
+    // 原来的 id 优先（见上面那段注释）；没带 id 的用 normalize 发的那个
+    let id = str(fresh[i]?.id).trim() || r.id;
+    // normalize 是拿「在整张表里的位置」发 id 的（rx-3 这种），跳过重名的
+    // 那几条之后有可能撞上表里已有的 id —— 换上没被占的
+    let n = 2;
+    while (taken.has(id)) id = `${r.id}-${n++}`;
+    taken.add(id);
+    return { ...r, id };
+  });
+  const skippedIds = raw.map((r) => str(r?.id).trim()).filter((id) => id && have.has(id));
+  return { rules, added: rules.length, skipped: skippedIds.length, skippedIds };
 }
 
 /* ================= 世界书 ================= */

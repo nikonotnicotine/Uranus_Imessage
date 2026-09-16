@@ -706,8 +706,15 @@ const REGEX_GROUPS = [
 ];
 
 export function PresetRegexFold({ preset }) {
-  const { addRegexRule, moveRegexRule, reorderRegexRule, updateRegexRule, removeRegexRule } =
-    useConfig();
+  const {
+    addRegexRule,
+    moveRegexRule,
+    reorderRegexRule,
+    updateRegexRule,
+    removeRegexRule,
+    exportRegexRules,
+    importRegexRules,
+  } = useConfig();
   const rules = preset.regex ?? [];
   const [editId, setEditId] = useState("");
   // 界面上的顺序永远是「先删除、后替换」，和真正执行的一致
@@ -805,10 +812,11 @@ export function PresetRegexFold({ preset }) {
       <div className="grid grid-cols-1 gap-4">
         {rules.length === 0 && (
           <p className="py-4 text-center text-ui text-ink-faint">
-            {/* 线下预设的默认规则是保存时才由服务端补上的，见 store.jsx:blankPreset */}
-            这份预设没有正则规则，模型吐什么就发什么。
-            {presetMode(preset) === "offline" &&
-              "线下预设默认带一套「八股文」规则，点一下保存就会出现。"}
+            {presetMode(preset) === "offline"
+              ? // 新建的线下预设自带那套八股文规则（store.jsx:blankPreset），
+                // 走到这儿说明用户把它们全删了
+                "这份预设没有正则规则。线下预设默认那套「八股文」规则已经被删光了，点下面的「导入规则」可以再拉回来。"
+              : "这份预设没有正则规则，模型吐什么就发什么。"}
           </p>
         )}
 
@@ -880,6 +888,22 @@ export function PresetRegexFold({ preset }) {
               写复杂规则前先在下面试跑。
             </span>
           </p>
+        </div>
+
+        {/*
+         * 规则也能单独导出去 —— 这是当初提的需求里明写的一条：默认线下预设
+         * 自带那套八股文规则，用户想要就得能导出来、再贴到自己的其他预设里。
+         * 所以放在正则折叠**里面**，导出的是这一份预设的正则表。
+         */}
+        <div className="border-t border-line pt-4">
+          <TransferCard
+            what="这套正则规则"
+            title="导出 / 导入这些正则规则"
+            desc="把这一份预设的正则表存成文件带走，或者把别处的规则补进来"
+            busyText="导出的是这份预设现在的正则表（含还没保存的改动）。导入是往这份预设里补规则 —— 已经有的（同一套规则再导一次）会自动跳过，之前删掉的会补回来。"
+            onExport={() => exportRegexRules(rules, preset.name)}
+            onImport={(bundle) => importRegexRules(preset.id, bundle)}
+          />
         </div>
 
         <SaveBar hint="只影响这份预设" />

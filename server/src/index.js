@@ -101,10 +101,12 @@ import {
   embedMissing,
   exportMemoryBank,
   exportPreset,
+  exportRegexRules,
   exportWorldBook,
   importMemoryBank,
   importMemoryText,
   importPreset,
+  importRegexRules,
   importWorldBook,
   transferFileName,
   vectorGap,
@@ -846,6 +848,39 @@ app.post("/api/preset/import", (req, res) => {
   } catch (e) {
     const error = String(e?.message ?? e);
     logWarn("预设", "导入失败", error);
+    res.status(400).json({ ok: false, error });
+  }
+});
+
+/* ---- 正则规则单独导出导入 ----
+ *
+ * 比预设那对多一层：规则是**挂在某份预设上**的，导出要带上预设名（文件名和
+ * 提示里说得清是哪来的），导入要拿眼前这份预设**现有的规则表**去重 —— 同一份
+ * 文件导两次不会变成两份规则，被删掉的那几条倒会补回来。
+ *
+ * 和预设一样走「POST 发草稿 / 导入只解析不落盘」，所以导出的规则是用户眼前
+ * 那一份（含还没保存的改动），导入进来的也只是进草稿、点保存才写盘。
+ */
+app.post("/api/regex/export", (req, res) => {
+  const bundle = exportRegexRules(req.body?.rules, req.body?.presetName);
+  const name = transferFileName(KIND.regex, bundle.name);
+  logInfo("正则", `导出了 ${bundle.count} 条正则规则${bundle.name ? `（来自「${bundle.name}」）` : ""} → ${name}`);
+  attach(res, name);
+  res.send(JSON.stringify(bundle, null, 2));
+});
+
+app.post("/api/regex/import", (req, res) => {
+  const bundle = req.body?.bundle ?? req.body;
+  try {
+    const out = importRegexRules(bundle, req.body?.rules);
+    logInfo(
+      "正则",
+      `解析了一份导入的正则规则：新增 ${out.added} 条，已有 ${out.skipped} 条跳过（等用户保存才落盘）`
+    );
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    const error = String(e?.message ?? e);
+    logWarn("正则", "导入失败", error);
     res.status(400).json({ ok: false, error });
   }
 });

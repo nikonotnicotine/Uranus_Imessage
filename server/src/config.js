@@ -293,8 +293,8 @@ export const DEFAULT_CONFIG = {
    * 只有开关和间隔在这儿，真正的定时器在 maintenance.js。
    */
   maintenance: {
-    restart: { enabled: false, hours: 24 },
-    cache: { enabled: false, hours: 6 },
+    restart: { enabled: false, days: 1, hours: 0 },
+    cache: { enabled: false, days: 0, hours: 6 },
   },
   /*
    * 云备份：把 data/ 的选定部分打成 tar.gz 传到云上，留最近几份快照。
@@ -325,7 +325,7 @@ export const DEFAULT_CONFIG = {
     // 带不带 data.config.json（明文密钥）。和 backup.js 一样默认不带
     includeSecrets: false,
     keep: 7,
-    auto: { enabled: false, hours: 24 },
+    auto: { enabled: false, days: 1, hours: 0 },
     s3: {
       endpoint: "https://s3.bitiful.net",
       region: "", // 控制台「Bucket 设置」页面底部那个可用区码，不猜
@@ -1649,23 +1649,92 @@ function normalizeWebhookPath(input) {
  * 都进 data.config.json，不进 data/config.json。
  */
 /**
- * 定时维护：定时重启 / 定时清缓存。
+ * 一个「每 X 天 Y 小时」的间隔。
  *
- * 间隔钳在 1–168 小时（一小时到一周）。下限 1 是因为再密就没意义了 ——
- * 每次重启桥接都要断几十秒；上限一周是「最长也该转一圈」。
+ * 界面上是两个框，配置里就是两个字段。**不合并成一个小时数** —— 合并的话
+ * 「每 1 天 6 小时」显示成「每 30 小时」，用户下次打开就认不出自己填的是什么了。
+ *
+ * 范围：总共 1 小时到 90 天。下限 1 小时是因为再密就没意义了（每次重启桥接
+ * 都要断几十秒）；上限 90 天是「你还记得自己开过这个吗」的量级，再多基本
+ * 等于关着。两头都够不着日常用法，钳住只是防手滑。
+ *
+ * 两者都是 0 时兜到 1 小时 —— 间隔 0 等于每一跳都触发，那是灾难不是意图，
+ * 但也不该悄悄换成一个用户没填过的数字。
+ *
+ * 例外是**压根没填过**（新装、这块是空的）：那种情况用调用方给的默认值，
+ * 也就是 DEFAULT_CONFIG 里写的那一份 —— 少了这条，云备份的默认间隔在
+ * 「新装」和「保存过一次」两种情况下会不一样（1 小时 vs 1 天）。
+ */
+const MAX_INTERVAL_HOURS = 90 * 24;
+
+function normalizeInterval(p, fallback) {
+  const empty = !p || (p.days === undefined && p.hours === undefined);
+  if (empty && fallback) return { ...fallback };
+
+  // 小时数先按老规矩收着（老配置的 168 也在这儿）
+  let total = clampInt(p?.hours, 0, 0, MAX_INTERVAL_HOURS);
+  /*
+   * 老配置只有 `hours` 一个字段，天数那半边得现拆。
+   *
+   * 这里认的是「days 在不在」而不是「days 是不是 0」：新写的配置 days 一定在
+   * （哪怕是 0），所以 days 缺了就是老配置。
+   *
+   * 也顺手兜住手改出来的「days: 0 + hours: 30」那种：天数填 0 的时候小时数
+   * 没有理由被砍成 23（那等于把 30 小时偷偷改成 23 小时），重新折一遍更接近本意。
+   */
+  const legacy = p?.days === undefined;
+  let d = clampInt(p?.days, 0, 0, 90);
+  let h;
+  if (legacy || (!d && total > 23)) {
+    d = Math.min(Math.floor(MAX_INTERVAL_HOURS / 24), Math.floor(total / 24));
+    h = total % 24;
+  } else {
+    h = Math.min(total, 23);
+  }
+  if (d * 24 + h > MAX_INTERVAL_HOURS) {
+    d = Math.floor(MAX_INTERVAL_HOURS / 24);
+    h = MAX_INTERVAL_HOURS % 24;
+  }
+  // 两半都是 0：不是「每 0 小时」（那是每一跳都触发），按 1 小时算
+  if (d === 0 && h === 0) h = 1;
+  return { days: d, hours: h };
+}
+
+/**
+ * 拆出来的两个字段加起来是多少小时。间隔判定、显示、日志共用这一份算法。
+ *
+ * 空配置（还没保存过这一块）返回 0，调用方自己判 —— 0 在这儿是有意义的
+ * 「没设过」，不是「每 0 小时」。
+ */
+export function intervalHours(p) {
+  const d = clampInt(p?.days, 0, 0, 90);
+  const h = clampInt(p?.hours, 0, 0, 23);
+  return d * 24 + h;
+}
+
+/** 「1 天 6 小时」这种说法，界面上和日志里共用。0 的那半边不出现。 */
+export function intervalText(p) {
+  const d = clampInt(p?.days, 0, 0, 90);
+  const h = clampInt(p?.hours, 0, 0, 23);
+  if (!d && !h) return "关着";
+  return [d ? `${d} 天` : "", h ? `${h} 小时` : ""].filter(Boolean).join(" ");
+}
+
+/**
+ * 定时维护：定时重启 / 定时清缓存。
  *
  * 这一块和别的设置一样进 data.config.json。存配置会触发 syncBridges 把所有
  * 桥接重连一遍，但这两个值是用户手点手保存的，不像 Instagram 的 token 会被
  * 后台自动轮换（那种绝不能进 config.json），代价只有点「保存」那一下。
  */
 function normalizeMaintenance(input) {
-  const one = (p, hours) => ({
+  const one = (p, fallback) => ({
     enabled: Boolean(p?.enabled),
-    hours: clampInt(p?.hours, hours, 1, 168),
+    ...normalizeInterval(p, fallback),
   });
   return {
-    restart: one(input?.restart, 24),
-    cache: one(input?.cache, 6),
+    restart: one(input?.restart, DEFAULT_CONFIG.maintenance.restart),
+    cache: one(input?.cache, DEFAULT_CONFIG.maintenance.cache),
   };
 }
 
@@ -1693,7 +1762,7 @@ function normalizeCloudBackup(input) {
     keep: clampInt(input?.keep, 7, 1, 50),
     auto: {
       enabled: Boolean(input?.auto?.enabled),
-      hours: clampInt(input?.auto?.hours, 24, 1, 168),
+      ...normalizeInterval(input?.auto, DEFAULT_CONFIG.cloudBackup.auto),
     },
     s3: {
       // 空了兜回缤纷云的地址：这个字段基本没人会改，但清空了就连不上了

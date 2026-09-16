@@ -23,7 +23,8 @@
  */
 
 import { runBackup } from "./cloudbackup.js";
-import { clearConfigCache } from "./config.js";
+import { clearConfigCache, intervalHours, intervalText } from "./config.js";
+import { MAINTENANCE_PATH, readJson, writeJson } from "./datadir.js";
 import { clearEnvCache } from "./env.js";
 import { forgetHistory } from "./imessage.js";
 import { pruneOrphanMedia } from "./igstore.js";
@@ -90,16 +91,27 @@ export function clearCaches(why = "控制台") {
 const TICK_MS = 60000;
 
 /**
- * 上一次动手的时刻。
+ * 上一次**真动手**的时刻。落盘，见 datadir.js:MAINTENANCE_PATH。
  *
- * 进程起来时都设成**启动时刻**而不是 0：不然服务一开机就立刻重启一次
- * （`now - 0` 永远大于任何间隔），成了开机自杀。
+ * 以前这三个是内存变量、进程起来时设成启动时刻，于是「每 3 天重启一次」在
+ * 一个每天重启的服务上永远等不到点 —— 每次重启都把计时清零。现在从盘上读，
+ * 重启不影响倒计时。
  *
- * 开关关着的那一路也顺手把锚点推到现在 —— 关了半天再打开，不该立刻就触发。
+ * 三条规矩：
+ *  1. **算的是「上次真干过的时刻」，不是「上次到点的时刻」**（用户原话：
+ *     「不补，从上次真正干过的时刻接着数」）。服务停机三天、回来已经过点了，
+ *     那就是过点了，下一跳就跑 —— 不把中间那几次补出来，也不假装没过去。
+ *  2. **开关关着的时候什么都不做** —— 不推锚点、不落盘。以前是「关着就顺手推到
+ *     现在」，那会让「关了半天再打开」白等一个周期：明明上次真干过是两小时前，
+ *     关着一会儿再开，计时又从头。
+ *  3. 盘上没有记录（第一次跑这套代码）就当作**现在** —— 不然 `now - 0` 大于
+ *     任何间隔，服务一开机就立刻重启一次，成了开机自杀。
  */
-let lastRestartAt = Date.now();
-let lastCacheAt = Date.now();
-let lastBackupAt = Date.now();
+const anchors = readJson(MAINTENANCE_PATH, {}) ?? {};
+
+let lastRestartAt = Number(anchors.lastRestartAt) || Date.now();
+let lastCacheAt = Number(anchors.lastCacheAt) || Date.now();
+let lastBackupAt = Number(anchors.lastBackupAt) || Date.now();
 
 /** 「重启不了」只警告一次的标记，见文件头。 */
 let warnedNoRestart = false;
@@ -116,9 +128,26 @@ let warnedNoRestart = false;
  */
 let pushing = false;
 
-/** 到点了没。 */
-function due(last, hours, now) {
-  return now - last >= hours * 3600e3;
+/**
+ * 记下「这一件刚干过」。内存和盘一起写。
+ *
+ * 写盘失败**不能**让这一跳崩掉 —— 顶多是下次重启又从头计时（退回老毛病），
+ * 而重启本身比记时间重要。所以吞掉异常，只留一条警告。
+ */
+function markDone(which, now) {
+  if (which === "restart") lastRestartAt = now;
+  else if (which === "cache") lastCacheAt = now;
+  else lastBackupAt = now;
+  try {
+    writeJson(MAINTENANCE_PATH, { lastRestartAt, lastCacheAt, lastBackupAt });
+  } catch (e) {
+    logWarn("系统", `维护进度写盘失败（计时会退回「从启动算起」）：${String(e?.message ?? e)}`);
+  }
+}
+
+/** 到点了没。间隔是「天 + 小时」两个框，这里折成小时。 */
+function due(last, p, now) {
+  return now - last >= intervalHours(p) * 3600e3;
 }
 
 /* ---- 「这一跳什么都没到点」怎么说 ---- */
@@ -134,25 +163,142 @@ function due(last, hours, now) {
 let lastIdleLogAt = 0;
 const IDLE_LOG_MS = 30 * 60e3;
 
-/** 「还差多久」，说给人听。 */
-function untilText(last, hours, now) {
-  const left = hours * 3600e3 - (now - last);
-  if (left <= 0) return "马上";
+/** 「还剩 / 过了多久」，说给人听。 */
+function untilText(last, p, now) {
+  const left = intervalHours(p) * 3600e3 - (now - last);
+  // 过点了：服务停过一段，回来已经该干了。说「已过点」而不是「马上」——
+  // 停机三天回来还说「马上」等于没说
+  if (left <= 0) {
+    const over = Math.floor(-left / 3600e3);
+    return over >= 1 ? `已过点 ${spanText(over)}` : "马上";
+  }
   const mins = Math.round(left / 60e3);
-  return mins < 60 ? `还差 ${mins} 分钟` : `还差 ${(mins / 60).toFixed(1)} 小时`;
+  if (mins < 60) return `还差 ${mins} 分钟`;
+  return `还差 ${spanText(Math.round(mins / 60))}`;
 }
 
-/** 三件事各自的状态，拼成一行。启动那条 info 和闲状态那条 debug 共用。 */
+/** 小时数 → 「2 天 3 小时」。整天的那部分用天说。 */
+function spanText(hours) {
+  if (hours < 24) return `${hours} 小时`;
+  const d = Math.floor(hours / 24);
+  const h = hours % 24;
+  return [d ? `${d} 天` : "", h ? `${h} 小时` : ""].join(" ");
+}
+
+/**
+ * 三件事各自的状态，拼成一行。启动那条 info 和闲状态那条 debug 共用。
+ *
+ * 开机那一条尤其要说清楚「还差多久」：这现在是**从上次真干过的时刻**算的，
+ * 用户重启完服务看到「还差 5 小时」才不会以为计时被清了。
+ */
 function statusLine(config, now) {
   const m = config.maintenance ?? {};
   const cb = config.cloudBackup ?? {};
-  const one = (name, on, hours, last) =>
-    `${name} ${on ? `每 ${hours} 小时（${untilText(last, hours, now)}）` : "关"}`;
+  const one = (name, p, last) =>
+    `${name} ${p?.enabled ? `每 ${intervalText(p)}（${untilText(last, p, now)}）` : "关"}`;
   return [
-    one("云备份", cb.auto?.enabled, cb.auto?.hours, lastBackupAt),
-    one("清缓存", m.cache?.enabled, m.cache?.hours, lastCacheAt),
-    one("重启", m.restart?.enabled, m.restart?.hours, lastRestartAt),
+    one("云备份", cb.auto, lastBackupAt),
+    one("清缓存", m.cache, lastCacheAt),
+    one("重启", m.restart, lastRestartAt),
   ].join(" · ");
+}
+
+/**
+ * 跳一次。
+ *
+ * 正常由下面的 setInterval 每分钟调一次；单独导出来是为了能直接测 ——
+ * 「锚点落盘了没」「开关关着会不会推锚点」这些都不能靠等一分钟验。
+ *
+ * @param {() => object} getConfig
+ */
+export function runMaintenanceOnce(getConfig) {
+  const config = getConfig?.();
+  if (!config) return;
+  const m = config.maintenance ?? {};
+  const now = Date.now();
+  // 这一跳有没有真做事。没有的话下面按半小时节流报一次闲状态
+  let acted = false;
+
+  /*
+   * 清缓存排在重启前面：真要两件事同时到点，先清完再重启才有意义。
+   *
+   * 开关关着的那一路**什么都不做** —— 不推锚点、不落盘。以前是「关着就顺手
+   * 推到现在」，那会让「关了半天再打开」永远延后一个周期；现在关就是没跑过，
+   * 锚点还停在上次真干过的时刻，和用户「从上次真正干过的时刻接着数」一致。
+   */
+  if (m.cache?.enabled) {
+    if (due(lastCacheAt, m.cache, now)) {
+      acted = true;
+      logDebug("系统", `定时清缓存到点了（每 ${intervalText(m.cache)}）`);
+      markDone("cache", now);
+      try {
+        clearCaches(`定时（每 ${intervalText(m.cache)}）`);
+      } catch (e) {
+        logError("系统", `定时清缓存出错：${String(e?.message ?? e)}`, e);
+      }
+    }
+  }
+
+  /*
+   * 云备份排在清缓存后面、重启前面。
+   *
+   * 在重启前面是必须的：真要两件事同时到点，重启会把进程干掉 —— 那时候
+   * 备份传到一半就断了。先把包传完再重启。
+   *
+   * 和另外两件事不一样的地方是它 **async**，而 tick 是同步的。不 await：
+   * 拿不到结果没关系（成败都记在日志里），而 await 会让这一跳一直挂着，
+   * 后面重启那一段就轮不上。重入靠 `pushing` 挡。
+   */
+  const cb = config.cloudBackup ?? {};
+  if (cb.auto?.enabled) {
+    if (due(lastBackupAt, cb.auto, now)) {
+      acted = true;
+      if (pushing) {
+        // 上一次还在传。不推锚点，下一跳（一分钟后）再看
+        logWarn("云备份", "上一次自动备份还在传，这一次跳过");
+      } else {
+        pushing = true;
+        logDebug("云备份", `定时备份到点了（每 ${intervalText(cb.auto)}）`);
+        // 锚点在**开传之前**就落盘：备份失败也不重试（下次到点自然再来），
+        // 那就不能让它一分钟一跳地重试到成功为止
+        markDone("backup", now);
+        runBackup(cb, `定时（每 ${intervalText(cb.auto)}）`)
+          .catch((e) => {
+            // 不重试：下次到点自然会再来一遍。网断了、密钥过期了，
+            // 这一分钟内重试也不会好
+            logError("云备份", `定时备份失败：${String(e?.message ?? e)}`, e);
+          })
+          .finally(() => {
+            pushing = false;
+          });
+      }
+    }
+  }
+
+  if (m.restart?.enabled) {
+    if (due(lastRestartAt, m.restart, now)) {
+      acted = true;
+      logDebug("系统", `定时重启到点了（每 ${intervalText(m.restart)}）`);
+      // 同理，先记再重启：重启请求发出去进程就没了，来不及再写
+      markDone("restart", now);
+      const result = requestRestart(`定时重启（每 ${intervalText(m.restart)}）`);
+      // 不是启动器拉起来的：退了就没人开回来，restart.js 会拒。
+      // 每小时刷一条同样的警告没意义，只说一次
+      if (!result.ok && !warnedNoRestart) {
+        warnedNoRestart = true;
+        logWarn(
+          "系统",
+          "定时重启开着，但这份服务不是用「启动.bat」拉起来的，重启请求被拒（这条只提醒一次）"
+        );
+      }
+    }
+  }
+
+  // 什么都没到点：半小时说一次「还差多久」，理由见 lastIdleLogAt
+  if (!acted && now - lastIdleLogAt >= IDLE_LOG_MS) {
+    lastIdleLogAt = now;
+    logDebug("系统", `定时维护在看着：${statusLine(config, now)}`);
+  }
 }
 
 /**
@@ -164,96 +310,9 @@ function statusLine(config, now) {
  * @param {() => object} getConfig
  */
 export function startMaintenance(getConfig) {
-  const tick = () => {
-    const config = getConfig?.();
-    if (!config) return;
-    const m = config.maintenance ?? {};
-    const now = Date.now();
-    // 这一跳有没有真做事。没有的话下面按半小时节流报一次闲状态
-    let acted = false;
-
-    // 清缓存排在重启前面：真要两件事同时到点，先清完再重启才有意义
-    if (m.cache?.enabled) {
-      if (due(lastCacheAt, m.cache.hours, now)) {
-        lastCacheAt = now;
-        acted = true;
-        logDebug("系统", `定时清缓存到点了（每 ${m.cache.hours} 小时）`);
-        try {
-          clearCaches(`定时（每 ${m.cache.hours} 小时）`);
-        } catch (e) {
-          logError("系统", `定时清缓存出错：${String(e?.message ?? e)}`, e);
-        }
-      }
-    } else {
-      lastCacheAt = now;
-    }
-
-    /*
-     * 云备份排在清缓存后面、重启前面。
-     *
-     * 在重启前面是必须的：真要两件事同时到点，重启会把进程干掉 —— 那时候
-     * 备份传到一半就断了。先把包传完再重启。
-     *
-     * 和另外两件事不一样的地方是它 **async**，而 tick 是同步的。不 await：
-     * 拿不到结果没关系（成败都记在日志里），而 await 会让这一跳一直挂着，
-     * 后面重启那一段就轮不上。重入靠 `pushing` 挡。
-     */
-    const cb = config.cloudBackup ?? {};
-    if (cb.auto?.enabled) {
-      if (due(lastBackupAt, cb.auto.hours, now)) {
-        acted = true;
-        if (pushing) {
-          // 上一次还在传。不推锚点，下一跳（一分钟后）再看
-          logWarn("云备份", "上一次自动备份还在传，这一次跳过");
-        } else {
-          lastBackupAt = now;
-          pushing = true;
-          logDebug("云备份", `定时备份到点了（每 ${cb.auto.hours} 小时）`);
-          runBackup(cb, `定时（每 ${cb.auto.hours} 小时）`)
-            .catch((e) => {
-              // 不重试：下次到点自然会再来一遍。网断了、密钥过期了，
-              // 这一分钟内重试也不会好
-              logError("云备份", `定时备份失败：${String(e?.message ?? e)}`, e);
-            })
-            .finally(() => {
-              pushing = false;
-            });
-        }
-      }
-    } else {
-      lastBackupAt = now;
-    }
-
-    if (m.restart?.enabled) {
-      if (due(lastRestartAt, m.restart.hours, now)) {
-        lastRestartAt = now;
-        acted = true;
-        logDebug("系统", `定时重启到点了（每 ${m.restart.hours} 小时）`);
-        const result = requestRestart(`定时重启（每 ${m.restart.hours} 小时）`);
-        // 不是启动器拉起来的：退了就没人开回来，restart.js 会拒。
-        // 每小时刷一条同样的警告没意义，只说一次
-        if (!result.ok && !warnedNoRestart) {
-          warnedNoRestart = true;
-          logWarn(
-            "系统",
-            "定时重启开着，但这份服务不是用「启动.bat」拉起来的，重启请求被拒（这条只提醒一次）"
-          );
-        }
-      }
-    } else {
-      lastRestartAt = now;
-    }
-
-    // 什么都没到点：半小时说一次「还差多久」，理由见 lastIdleLogAt
-    if (!acted && now - lastIdleLogAt >= IDLE_LOG_MS) {
-      lastIdleLogAt = now;
-      logDebug("系统", `定时维护在看着：${statusLine(config, now)}`);
-    }
-  };
-
   const timer = setInterval(() => {
     try {
-      tick();
+      runMaintenanceOnce(getConfig);
     } catch (e) {
       logError("系统", `定时维护这一轮出错：${String(e?.message ?? e)}`, e);
     }
