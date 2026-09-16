@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "dev:sandbox": "node scripts/dev-sandbox.mjs",
+    "sync:cliche": "node scripts/sync-cliche.mjs",
     "build": "npm --workspace client run build",
     "start": "node server/src/index.js"
   }
