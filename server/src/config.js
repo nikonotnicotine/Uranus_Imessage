@@ -223,22 +223,19 @@ export const MODEL_CATEGORIES = ["chat", "vision", "image", "embedding", "audio"
  *  {{char}}     → 当前会话的角色名（roles[].name）
  *  {{user}}     → 生效的用户人设名（users[].name）
  *  {{sep}}      → 气泡分隔符（chat.separator）
- *  {{language}} → 角色单独配置里的语言项（roles[].language）
  *
  * 角色人设、用户人设两边都会替换，所以两个变量互相引用也没问题。
  * 预设的条目内容、正则的替换串里也能用。
  *
  * 变量替换。留空的变量用兜底词，不把 {{char}} 原样发给模型。
  * {{sep}} 没有兜底词 —— 分隔符本来就可能是空的，硬塞一个词会让格式提示词说谎。
- * {{language}} 兜底成「中文」：它出现在「用正确的 {{language}} 标点符号」
- * 这类句子里，留空的话整句话就没主语了。
  */
-export const VAR_FALLBACK = { char: "助手", user: "用户", language: "中文" };
+export const VAR_FALLBACK = { char: "助手", user: "用户" };
 
 export function applyVars(text, vars) {
   if (!text) return "";
   return String(text).replace(
-    /\{\{\s*(char|user|sep|language)\s*\}\}/gi,
+    /\{\{\s*(char|user|sep)\s*\}\}/gi,
     (_m, name) => {
       const key = name.toLowerCase();
       const value = String(vars?.[key] ?? "").trim();
@@ -416,8 +413,6 @@ export const DEFAULT_CONFIG = {
       dropCount: 1, // 「上下文限制」·到达上限后丢弃的最旧条数
       presetRef: "", // 用哪份预设。"" = 回落到 presets[0]
       worldBookRefs: [], // 额外挂哪几本世界书（global 的书不用写在这）
-      // 这个角色默认说什么语言。提示词里的 {{language}} 就是它
-      language: "中文",
       // 联网搜索，默认关。密钥是全局的（searchApi），这里只有开关和三个额度。
       // 2 次 × 2 条 × 800 字：三个乘起来就是每轮最多灌多少字，见 websearch.js
       webSearch: { enabled: false, maxQueries: 2, maxResults: 2, maxChars: 800 },
@@ -942,9 +937,6 @@ function normalizeRole(input, id, legacy) {
       : [],
     // 环境感知：时间/天气。拼成前缀加在每条用户消息开头，见 env.js
     env: normalizeRoleEnv(input?.env),
-    // 这个角色默认说什么语言 —— 提示词里的 {{language}}。
-    // 老配置没这个字段，兜底成「中文」（applyVars 那边的兜底词也是它）
-    language: str(input?.language).trim() || "中文",
     // 联网搜索：开关 + 三个额度，见 websearch.js。
     // 默认关 —— 开着就意味着每轮都往提示词里多一段说明，还可能触发外部请求。
     // 密钥是全局的（config.searchApi），角色这边只有开关和额度
@@ -1134,6 +1126,18 @@ function normalizeProactive(input) {
       start: normalizeClock(input?.focus?.start, "00:00"),
       end: normalizeClock(input?.focus?.end, "08:00"),
     },
+    /*
+     * 「对方读了没」：主动消息被读了但没回时，下一条后面缀一句
+     * 「{{user}}已读了你发的信息，但还没回复」（见 proactive.js:buildProactiveInput）。
+     *
+     * **默认开**，和这一块里别的功能反着 —— 它不会额外打模型、也不会多发一条
+     * 消息，只是给已经要发的那条多缀一句话。而且这是 v0.7 之前就一直在跑的
+     * 行为，默认关等于给老用户静悄悄改了脾气。
+     *
+     * 真正生效还要 `leaveOnRead.receipt` 开着（已读状态是从对方的已读回执里
+     * 读的，那个关着就没有「读了」这个信息）—— 那道闸在 proactive.js 里判。
+     */
+    notifyRead: input?.notifyRead === undefined ? true : Boolean(input.notifyRead),
   };
 }
 

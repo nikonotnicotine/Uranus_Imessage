@@ -100,6 +100,63 @@ function trimBase(url) {
   return String(url ?? "").trim().replace(/\/+$/, "");
 }
 
+/* ================= Gemini 3.7 / 3.8 的两条硬规矩 ================= */
+
+/**
+ * 这两个版本比别的模型多两条限制（实测）：
+ *
+ * 1. **消息数组不能以 assistant 结尾**，上游直接回 400
+ *    `Requests ending with a model turn are not supported.`
+ *    也就是「预填」（prefill）这套玩法在这两个版本上整个不支持。
+ * 2. **生成参数一个都不能带**：temperature / top_p / top_k /
+ *    frequency_penalty / presence_penalty，带上就报错。
+ *
+ * 3.1、2.5 和别家的模型都没这两条 —— 预填在它们身上是正常功能，预设里那条
+ * 「卡思维链（预填）」就是为它们写的。所以只能按模型名认人，不能一刀切。
+ *
+ * 认名字而不是让用户手动勾一个开关：中转站的模型名前面挂着分组标签
+ * （`逆[Ag1-次-0.02￥]gemini-3.8-flash-high`），但 `gemini-3.8` 这截总在里面。
+ */
+const GEMINI_STRICT = /gemini[^0-9]{0,4}3[._-][78](?![0-9])/i;
+
+/**
+ * 把消息数组的 assistant 尾巴挪走，返回改过的数组（本来就不以 assistant
+ * 结尾时原样返回）。
+ *
+ * 预填的正文**不扔掉**，改挂到 user 名下 —— 预填那个效果是保不住的（上游
+ * 不支持），但正文里写的格式要求还是让模型看到，比直接丢掉强。前面紧跟着
+ * 就是 user 的话并进那条，避免发出两条连着的 user。
+ */
+function moveModelTail(messages, label) {
+  const out = (Array.isArray(messages) ? messages : []).slice();
+  // 尾部可能连着好几条（预设里能写多条预填条目），一路收到不是 assistant 为止
+  const tails = [];
+  while (out.length && out.at(-1)?.role === "assistant") {
+    const content = out.pop()?.content;
+    if (typeof content === "string") tails.unshift(content);
+  }
+  if (!tails.length) return messages;
+
+  const text = tails.filter((s) => s.trim()).join("\n\n");
+  if (text) {
+    const prev = out.at(-1);
+    if (prev?.role === "user" && typeof prev.content === "string") {
+      out[out.length - 1] = { ...prev, content: `${prev.content}\n\n${text}` };
+    } else {
+      out.push({ role: "user", content: text });
+    }
+  }
+
+  logWarn(
+    label,
+    "这个模型不收以 assistant 结尾的消息数组，末尾的预填已改挂到 user 名下",
+    text
+      ? `预填正文（${text.length} 字）并进了最后一条 user，预填本身的效果在这个模型上拿不到`
+      : "预填是空的，整条去掉了"
+  );
+  return out;
+}
+
 /**
  * 上游错误体可能是 JSON 也可能是 HTML，尽量挖出人能看的一句话。
  *
@@ -244,19 +301,28 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
   if (!key) throw new Error(`${label} 没填密钥`);
   if (!model) throw new Error(`${label} 没填模型名`);
 
-  const body = { model, messages };
+  // Gemini 3.7 / 3.8 的两条硬规矩，见 GEMINI_STRICT
+  const strict = GEMINI_STRICT.test(model);
+
+  const body = { model, messages: strict ? moveModelTail(messages, label) : messages };
 
   /*
    * 生成参数。逐个判 typeof 再发，而不是一股脑塞进去 ——
    * 有些中转站对 top_p / penalty 这些字段挑食，没配的就别发。
+   *
+   * strict 的模型一个都不发（连 temperature 都不行），预设里配了也当没配 ——
+   * 那不是我们能替用户绕过去的事，发了整轮请求就废了。
    */
-  const p = opts.params ?? {};
+  const p = strict ? {} : opts.params ?? {};
   const temperature =
-    typeof p.temperature === "number" ? p.temperature : endpoint.temperature;
+    typeof p.temperature === "number" ? p.temperature : strict ? undefined : endpoint.temperature;
   if (typeof temperature === "number") body.temperature = temperature;
   if (typeof p.topP === "number") body.top_p = p.topP;
   if (typeof p.frequencyPenalty === "number") body.frequency_penalty = p.frequencyPenalty;
   if (typeof p.presencePenalty === "number") body.presence_penalty = p.presencePenalty;
+  if (strict) {
+    logDebug(label, `${model} 不收生成参数，这轮温度 / Top P / 两个惩罚项都不发`);
+  }
 
   // 0 = 不限制，交给上游默认。opts.maxTokens 是「测试连接」那种场合直接指定的
   const maxTokens = opts.maxTokens ?? p.maxTokens;

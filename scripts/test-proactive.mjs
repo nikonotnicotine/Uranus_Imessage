@@ -59,8 +59,17 @@ function inFreshProcess(code) {
 }
 
 const store = await import("../server/src/proactivestore.js");
-const { judgeWaitMs, randomWaitMs, msUntilFocusEnd, inFocus, parseHours, COOLDOWN_MS } =
-  await import("../server/src/proactive.js");
+const {
+  judgeWaitMs,
+  randomWaitMs,
+  msUntilFocusEnd,
+  inFocus,
+  parseHours,
+  COOLDOWN_MS,
+  buildProactiveInput,
+  notifyReadOn,
+} = await import("../server/src/proactive.js");
+const { normalizeConfig } = await import("../server/src/config.js");
 
 const SCHEDULE = path.join(TMP, "proactive.json");
 const P = "proj-line-1";
@@ -273,6 +282,59 @@ console.log("\n=== 10. 勿扰时段（跨午夜那种）===");
   const hold = msUntilFocusEnd(focus, at03);
   check("03:00 要推迟到 08:00（5 小时）", Math.round(hold / 3600_000), 5);
   check("不在勿扰里就不推迟", msUntilFocusEnd(focus, at12), 0);
+}
+
+console.log("\n=== 11. 「对方读了没」那个开关 ===");
+{
+  const roleOf = (over) =>
+    normalizeConfig({ roles: [{ name: "小柚", proactive: { prompt: "开口吧" }, ...over }] })
+      .roles[0];
+  const 米洛 = { name: "米洛" };
+  const 缀了 = (role) => buildProactiveInput(role, 米洛, { read: true }).toModel.includes("米洛已读了");
+
+  /*
+   * 默认开。这一条是防回归的重点：v0.7 之前这个行为一直在跑，
+   * 加开关时若默认给了 false（或忘了在 normalizeProactive 里补默认值，
+   * 那样读出来是 undefined），老用户升级后就静悄悄少了这句话。
+   */
+  const 默认 = roleOf({ leaveOnRead: { receipt: true } });
+  check("normalizeProactive 补上了 notifyRead，而且默认是 true", 默认.proactive.notifyRead, true);
+  checkThat("默认开：被读了没回就缀上那句", 缀了(默认));
+
+  // 关掉：下一条照发，只是不缀那句
+  const 关掉 = roleOf({ leaveOnRead: { receipt: true }, proactive: { prompt: "开口吧", notifyRead: false } });
+  checkThat("关掉之后不缀", !缀了(关掉));
+  checkThat("关掉之后主动消息本身照发", 关掉.proactive.prompt === "开口吧");
+  check(
+    "关掉之后 toModel 就是提示词本身",
+    buildProactiveInput(关掉, 米洛, { read: true }).toModel,
+    "开口吧"
+  );
+
+  // 已读回执关着：拿不到「读了」这个信息，这一项无从谈起
+  const 没回执 = roleOf({ leaveOnRead: { receipt: false } });
+  checkThat("已读回执关着 → 开关开着也不缀", !缀了(没回执));
+
+  // 两道闸的真值表
+  checkThat("notifyReadOn：两个都开 = 生效", notifyReadOn(默认) === true);
+  checkThat("notifyReadOn：开关关了 = 不生效", notifyReadOn(关掉) === false);
+  checkThat("notifyReadOn：没回执 = 不生效", notifyReadOn(没回执) === false);
+
+  // 这一轮压根没被读：不管开关怎么设都不该缀
+  checkThat(
+    "没被读就不缀（哪个开关都一样）",
+    !buildProactiveInput(默认, 米洛, { read: false }).toModel.includes("已读了")
+  );
+
+  // 存档那份永远只有占位符，缀的那句不许漏进上下文
+  const both = buildProactiveInput(默认, 米洛, { read: true });
+  checkThat("缀的那句不进存档（toHistory 还是占位符）", !both.toHistory.includes("已读了"));
+
+  // 老配置里没有这个字段 → 按默认开处理（升级不改脾气）
+  const 老配置 = normalizeConfig({
+    roles: [{ name: "小柚", leaveOnRead: { receipt: true }, proactive: { prompt: "开口吧" } }],
+  }).roles[0];
+  checkThat("老配置里没这个字段时按开着算", 缀了(老配置));
 }
 
 fs.rmSync(TMP, { recursive: true, force: true });

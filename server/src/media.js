@@ -112,12 +112,32 @@ export const MAX_TTS_CHARS = 1000;
  * emoji 本身不含冒号所以这么切没歧义 —— 真正的切分在 splitMedia 里做，正则只
  * 负责把整段抠出来。
  */
+/*
+ * 语音和图片那两组的标记体：不许裸的方括号，但**允许嵌成对的**。
+ *
+ * 最早的写法是简单的 `[^…]`（不吃右括号），后果是模型写带语气词标签的语音
+ * `[audio_message:[whispers] …正文… [sighs] …]` 时，标记在 `[whispers]` 的
+ * 那个 `]` 上就提前闭了 —— 抠出来的一条语音只有 `[whispers` 九个字，剩下的
+ * 正文漏出去当了普通文字。语气标签（[whispers]、[sighs]）和画面描述
+ * （[image:[特写] …]）都是模型的自然习惯，所以这两组换成上面这条：
+ * 三选一循环 —— 普通字符、一对半角括号、一对全角括号。每个位置只有一种走法，
+ * 没有回溯炸弹；碰上不成对的 `]` 照旧在它前面停下，退化成老行为。
+ *
+ * 其他组**不**换：表情包是个情绪标签、点歌是「歌手-歌名」、位置是地名 ——
+ * 这些内容里出现方括号多半是模型写坏了，在第一个 `]` 前面刹住更安全。
+ */
+const BRACKET_BODY = "(?:[^\\[\\]］［]|\\[[^\\[\\]］［]*\\]|［[^\\[\\]］［]*］){1,2000}?";
+
 const MEDIA_TAG = new RegExp(
   [
-    "[[［]\\s*(?:audio_message|audio|语音|voice)\\s*[:：]\\s*(?<audio>[^\\]］]{1,2000}?)\\s*[\\]］]",
+    "[[［]\\s*(?:audio_message|audio|语音|voice)\\s*[:：]\\s*(?<audio>" +
+      BRACKET_BODY +
+      ")\\s*[\\]］]",
     "[[［]\\s*语音\\s*[\\]］]\\s*(?<audioRest>[^\\n]{1,2000})",
     "[[［]\\s*(?:send_emoji|sticker|emoji|表情包|表情)\\s*[:：]\\s*(?<sticker>[^\\]］]{1,60}?)\\s*[\\]］]",
-    "[[［]\\s*(?:image|生成图片|生图|画图|图片)\\s*[:：]\\s*(?<image>[^\\]］]{1,2000}?)\\s*[\\]］]" +
+    "[[［]\\s*(?:image|生成图片|生图|画图|图片)\\s*[:：]\\s*(?<image>" +
+      BRACKET_BODY +
+      ")\\s*[\\]］]" +
       "(?:\\s*[[［]\\s*(?<ref>[^\\]］:：]{1,60}?)\\s*[\\]］])?",
     "[[［]\\s*(?:undosend|undo_send|unsend|撤回消息|撤回)\\s*[:：]\\s*(?<undo>\\d{1,2})\\s*[\\]］]",
     "[[［]\\s*(?<undoBare>undosend|undo_send|unsend)\\s*[\\]］]",
@@ -248,6 +268,23 @@ export function stripMediaTags(text) {
     .map((p) => p.text)
     .join("")
     .trim();
+}
+
+/**
+ * 把一条气泡降成「线下能当普通文字发出去的部分」。
+ *
+ * 线下模式没有媒体那条路（预设的 format 条目整段不进提示词，模型照理学不会
+ * 写标记），但「照理」不兜底：线下预设里那路「线上聊天记录」会把带标记的
+ * 线上发言摆到模型眼前，有样学样写出 `[audio_message:…]` 不是不可能。原样
+ * 发出去就是一对方括号，所以照线上「功能关着」的同一套待遇退化：
+ * 语音变成它要念的那句话、卡片退成网址、位置退成地名，图片/表情包/撤回/
+ * 回应直接丢掉 —— 再加上摘掉引用和特效这两个「气泡属性」标记。
+ *
+ * @returns {string} 可能是空串（整条都是要丢的标记）—— 调用方跳过这条不发
+ */
+export function degradeToPlain(text) {
+  const noReply = takeReplyTag(String(text ?? "")).text;
+  return stripMediaTags(takeEffectTag(noReply).text);
 }
 
 /* ================= 引用回复 ================= */
@@ -1164,7 +1201,12 @@ async function ttsSovits(cfg, text, voiceId) {
  * 和 websearch.js:pickSource 一个写法，区别是这里没有「不要密钥的兜底源」——
  * 三家都没配就返回 null，调用方据此退化成文字。
  *
- * @returns {{name: string, run: (text: string, voiceId: string) => Promise<object>}|null}
+ * `keepTags` 是给 synthesizeVoice 看的：这一家的**这个模型**认不认方括号的
+ * 语气标签。ElevenLabs 只有 eleven_v3 认（[whispers] 这类是 v3 的功能），
+ * v2 和另外两家都会把它们当正文念出来 —— 那种情况下不如剥掉。
+ *
+ * @returns {{name: string, keepTags?: boolean,
+ *            run: (text: string, voiceId: string) => Promise<object>}|null}
  */
 export function pickTtsSource(api) {
   const mm = api?.minimax;
@@ -1173,13 +1215,37 @@ export function pickTtsSource(api) {
   }
   const el = api?.elevenlabs;
   if (el?.enabled && String(el.key ?? "").trim()) {
-    return { name: "ElevenLabs", run: (t, v) => ttsElevenLabs(el, t, v) };
+    return {
+      name: "ElevenLabs",
+      keepTags: /v3/i.test(String(el?.model ?? "")),
+      run: (t, v) => ttsElevenLabs(el, t, v),
+    };
   }
   const sv = api?.sovits;
   if (sv?.enabled && String(sv.url ?? "").trim()) {
     return { name: "GPT-SoVITS", run: (t, v) => ttsSovits(sv, t, v) };
   }
   return null;
+}
+
+/**
+ * 把方括号的语气标签从要念的文本里剥掉。
+ *
+ * `[whispers] 过来 [sighs] 坐下` → `过来 坐下`。半角全角都认；长度限在 24 字
+ * 以内 —— 语气标签就该是「一个词」的规模，更长的括号内容更像是有意义的正文
+ * （引用、示例），不该顺手删。
+ *
+ * 只在 TTS 不认这些标签时用（见 pickTtsSource 的 keepTags）：模型写标签是想让
+ * 声音带情绪，TTS 念不了的时候把它们原样喂进去，出来的语音会真的说一句
+ * 「whispers」，那比没有情绪更糟。
+ *
+ * @returns {string} 剥完的文本。一条标签不剩时可能是空串 —— 调用方要自己兜
+ */
+export function stripToneTags(text) {
+  return String(text ?? "")
+    .replace(/[[［][^[［\]］]{1,24}[\]］]/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 /**
@@ -1202,6 +1268,19 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音") {
 
   let clean = String(text ?? "").trim();
   if (!clean) throw new Error("语音内容是空的");
+
+  /*
+   * 语气标签剥不剥，跟着 TTS 的能力走：ElevenLabs 的 v3 认方括号音效标签，
+   * 其他模型和另外两家都会把它们当正文念出来（语音里真的说一句 "whispers"）。
+   * 剥掉少一分情绪，留着多一句怪话 —— 取剥掉。
+   * 整条剥完一件不剩（极端情况：整条语音就是个 [laughs]）时留着原样，
+   * 让合成那边自己对付，比走「内容是空的」报错再退化成文字强。
+   */
+  if (!source.keepTags) {
+    const plain = stripToneTags(clean);
+    if (plain) clean = plain;
+  }
+
   if (clean.length > MAX_TTS_CHARS) {
     logWarn(scope, `语音内容 ${clean.length} 字，超过 ${MAX_TTS_CHARS} 字上限，已截断`);
     clean = clean.slice(0, MAX_TTS_CHARS);

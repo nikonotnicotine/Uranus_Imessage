@@ -793,33 +793,6 @@ function RoleSpyFields({ role, onGoto }) {
 }
 
 /**
- * 「说什么语言」。
- *
- * 它就是提示词里那个 `{{language}}` —— 现在只有语音那条子条目用它
- * （「语言规范应主要使用 {{language}}」），但变量是通用的，以后别的地方
- * 写 `{{language}}` 也按这里填的来。所以放在上下文限制后面、语音前面，
- * 不挂在语音那一段里。
- */
-function RoleLanguageField({ role }) {
-  const { updateRole } = useConfig();
-  return (
-    <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
-      <Field
-        label="语言"
-        hint="提示词里的 {{language}} 就是这个。留空按「中文」算"
-      >
-        <input
-          className={inputCls}
-          value={role.language ?? ""}
-          onChange={(e) => updateRole(role.id, { language: e.target.value })}
-          placeholder="中文"
-        />
-      </Field>
-    </div>
-  );
-}
-
-/**
  * 「发语音」那一段。三层结构和 RoleSearchFields 一模一样：
  * 开关在角色、密钥全局（config.ttsApi，在「连接」面板里配）、
  * 提示词在「预设 → 消息格式与功能」。
@@ -2835,30 +2808,43 @@ function RoleProactiveFields({ role }) {
           </div>
 
           <div className="grid grid-cols-1 gap-3 border-t border-line pt-6">
-            <p className="text-ui text-ink">对方读了没</p>
             {lor.receipt ? (
-              <p className="text-meta leading-relaxed text-ink-faint">
-                发出去的主动消息如果
-                <strong className="text-ink-soft">被读了但没回</strong>
-                ，下一条触发的时候会在提示词后面缀一句「{who}
-                已读了你发的信息，但还没回复」，
-                让角色知道自己被晾着了 —— 是继续找话说还是收着点，交给人设决定。
-              </p>
+              <label className="flex items-start justify-between gap-4">
+                <span className="min-w-0">
+                  <span className="block text-ui text-ink">对方读了没</span>
+                  <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                    发出去的主动消息如果
+                    <strong className="text-ink-soft">被读了但没回</strong>
+                    ，下一条触发的时候会在提示词后面缀一句「{who}
+                    已读了你发的信息，但还没回复」，
+                    让角色知道自己被晾着了 —— 是继续找话说还是收着点，交给人设决定。
+                    关掉的话下一条照发，只是不告诉它这件事。
+                  </span>
+                </span>
+                <Switch
+                  checked={p.notifyRead !== false}
+                  onChange={(v) => patch({ notifyRead: v })}
+                  label="告诉角色「对方读了但没回」"
+                />
+              </label>
             ) : (
-              <p className="text-meta leading-relaxed text-ink-faint">
-                这一项要
-                <strong className="text-warn">先打开「已读与不回 → 已读回执」</strong>
-                ：已读状态是从对方发回来的已读回执里读的，那个开关关着就收不到，
-                也就没法在下一条主动消息里告诉角色「他读了但没回」。
-                <button
-                  type="button"
-                  className="mx-1 underline decoration-line underline-offset-2 hover:text-ink"
-                  onClick={() => updateRole(role.id, { leaveOnRead: { ...lor, receipt: true } })}
-                >
-                  顺手打开
-                </button>
-                （只改这个角色，保存后生效）。
-              </p>
+              <>
+                <p className="text-ui text-ink">对方读了没</p>
+                <p className="text-meta leading-relaxed text-ink-faint">
+                  这一项要
+                  <strong className="text-warn">先打开「已读与不回 → 已读回执」</strong>
+                  ：已读状态是从对方发回来的已读回执里读的，那个开关关着就收不到，
+                  也就没法在下一条主动消息里告诉角色「他读了但没回」。
+                  <button
+                    type="button"
+                    className="mx-1 underline decoration-line underline-offset-2 hover:text-ink"
+                    onClick={() => updateRole(role.id, { leaveOnRead: { ...lor, receipt: true } })}
+                  >
+                    顺手打开
+                  </button>
+                  （只改这个角色，保存后生效）。
+                </p>
+              </>
             )}
           </div>
         </>
@@ -4594,11 +4580,11 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
           </div>
         </Fold>
 
-        {/* 三、上下文与语言。语言就是 {{language}}，不只语音在用，所以和上下文摆一块 */}
+        {/* 三、上下文 */}
         <Fold
-          title="上下文与语言"
-          desc="每轮带多少上文、说什么语言"
-          badge={`上文 ${role.maxContext} 条 · ${role.language?.trim() || "中文"}`}
+          title="上下文"
+          desc="每轮带多少上文"
+          badge={`上文 ${role.maxContext} 条`}
         >
           <div className="grid grid-cols-1 gap-6">
             <div>
@@ -4630,9 +4616,6 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
                 suffix="条"
               />
             </div>
-
-            {/* 说什么语言（提示词里的 {{language}}） */}
-            <RoleLanguageField role={role} />
           </div>
         </Fold>
 

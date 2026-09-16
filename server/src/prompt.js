@@ -700,8 +700,6 @@ export async function buildPrompt(config, role, user, history, weatherNote = "",
     char: role?.name ?? "",
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
-    // 角色单独配置里的语言项。提示词里凡是 {{language}} 都按它来
-    language: role?.language ?? "",
   };
   const fill = (text) => applyVars(text, vars).trim();
 

@@ -2224,6 +2224,142 @@ const diaryDirsBefore = fs.readdirSync(path.join(MEMORY_DIR, "日记")).sort();
   const presetAsWorld = await send("/api/world/import", { bundle: pExp.json });
   check("交叉：拿预设导世界书 → 400", presetAsWorld.status, 400);
   checkThat("交叉：400 点名是预设", /预设/.test(presetAsWorld.json?.error ?? ""));
+
+  /* ================================================================
+   * 22. 手动加 / 改一条记忆：日期自定义、关键词手填、向量当场算
+   *
+   * 界面上「手加一条」和「编辑」走的两条路由。向量这条要真打上游
+   * `/embeddings`，所以把 fetch 包一层：只有发去假域名的被截，
+   * 测试自己打 127.0.0.1 的照走真 fetch —— 不然等于自己把自己打断。
+   * ================================================================ */
+  console.log("\n=== 22. 手动加 / 改：日期、关键词、当场算向量 ===");
+
+  const cfgRes = await fetch(`${base}/api/config`, { headers: { cookie: COOKIE } });
+  const cfgNow = await cfgRes.json();
+  cfgNow.providers = [
+    ...(cfgNow.providers ?? []),
+    {
+      id: "p-embed",
+      name: "向量中转",
+      url: "https://embed.fake.example/v1",
+      keys: ["sk-test"],
+      models: [
+        {
+          id: "m-embed",
+          model: "text-embedding-test",
+          name: "向量测试",
+          enabled: true,
+          categories: ["embed"],
+        },
+      ],
+    },
+  ];
+  cfgNow.memories = {
+    ...cfgNow.memories,
+    memory: { ...cfgNow.memories?.memory, embedModel: { provider: "p-embed", modelId: "m-embed" } },
+  };
+  const savedCfg = await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", cookie: COOKIE },
+    body: JSON.stringify(cfgNow),
+  });
+  checkThat("配置：带向量模型的配置存进去了", savedCfg.ok, String(savedCfg.status));
+
+  const realNow = globalThis.fetch;
+  const embedBodies = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith("https://embed.fake.example")) {
+      embedBodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(
+        JSON.stringify({ data: [{ embedding: [0.25, 0.25, 0.25, 0.25] }] }),
+        { status: 200 }
+      );
+    }
+    return realNow(url, init);
+  };
+
+  try {
+    const mem = async (p, body, method = "POST") =>
+      grab(
+        await fetch(`${base}/api/memories/${MANUAL}${p}`, {
+          method,
+          headers: { "content-type": "application/json", cookie: COOKIE },
+          body: JSON.stringify(body),
+        })
+      );
+
+    // 不带日期：落今天的日期，向量在落盘前就算好了
+    const add1 = await mem("/memory", { content: "她今天把猫抱来了。", keywords: ["手动词"] });
+    check("手加：写成了", add1.status, 200);
+    check("手加：没填日期就用今天", add1.json?.item?.date, store.localDate());
+    checkThat("手加：向量当场算出来了", add1.json?.item?.embedded === true);
+    checkThat(
+      "手加：响应里不泄露向量本体",
+      !("embedding" in (add1.json?.item ?? {})) || add1.json.item.embedding === undefined
+    );
+    checkThat(
+      "手加：手填关键词和自动抽的合并",
+      (add1.json?.item?.keywords ?? []).includes("手动词") &&
+        (add1.json?.item?.keywords ?? []).includes("今天"),
+      JSON.stringify(add1.json?.item?.keywords)
+    );
+    check("手加：向量真打去了 /embeddings", embedBodies.length, 1);
+    check("手加：打过去的是配的那个模型", embedBodies[0]?.model, "text-embedding-test");
+
+    // 带日期：补记旧事，日期原样落盘
+    const add2 = await mem("/memory", {
+      content: "去年跨年一起看了烟花。",
+      date: "2025-12-31",
+    });
+    check("手加：自定义日期落盘", add2.json?.item?.date, "2025-12-31");
+
+    // 日期不合格式 / 不存在的日期：400，不默默改成今天（和日记那条路由一个规矩）
+    const badFmt = await mem("/memory", { content: "x", date: "2025-2-3" });
+    check("手加：日期少补零 → 400", badFmt.status, 400);
+    const badDay = await mem("/memory", { content: "x", date: "2025-02-30" });
+    check("手加：不存在的日期 → 400", badDay.status, 400);
+    check(
+      "手加：两次 400 一条都没落盘",
+      store.readMemories(MANUAL).filter((m) => m.content === "x").length,
+      0
+    );
+
+    // embed:false 显式跳过（界面不用，留给以后可能的批量导入）
+    const add3 = await mem("/memory", { content: "这条先不算向量。", embed: false });
+    check("手加：embed=false 跳过向量", add3.json?.item?.embedded, false);
+
+    const addedId = add2.json?.item?.id;
+    const beforeKwOnly = embedBodies.length;
+
+    // 只改关键词：旧向量还对着正文，不该白打一次接口
+    const kwOnly = await mem(`/memory/${addedId}`, { content: "去年跨年一起看了烟花。", keywords: ["烟花"] }, "PUT");
+    check("手改：只加关键词，向量原样留着", kwOnly.json?.item?.embedded, true);
+    check("手改：没有为关键词重算向量", embedBodies.length, beforeKwOnly);
+    check("手改：日期没被顶掉", kwOnly.json?.item?.date, "2025-12-31");
+
+    // 改正文：旧向量作废，当场补一条新的
+    const reText = await mem(
+      `/memory/${addedId}`,
+      { content: "去年跨年在江边一起看了烟花。", date: "2025-12-31" },
+      "PUT"
+    );
+    check("手改：改了正文向量当场重算", reText.json?.item?.embedded, true);
+    check("手改：真去重算了", embedBodies.length, beforeKwOnly + 1);
+    check(
+      "手改：重算后的向量落了盘",
+      store.readMemories(MANUAL).find((m) => m.id === addedId)?.embedding,
+      [0.25, 0.25, 0.25, 0.25]
+    );
+
+    // 手改这边同样不收不合格式的日期
+    const putBad = await mem(`/memory/${addedId}`, { content: "y", date: "明天" }, "PUT");
+    check("手改：日期不合格式 → 400", putBad.status, 400);
+
+    const putGone = await mem("/memory/no-such-id", { content: "y" }, "PUT");
+    check("手改：没有这条 → 404", putGone.status, 404);
+  } finally {
+    globalThis.fetch = realNow;
+  }
 }
 
 console.log(`\n${fail ? "✗" : "✓"} ${pass} 项通过，${fail} 项失败`);

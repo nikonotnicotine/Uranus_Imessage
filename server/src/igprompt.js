@@ -311,7 +311,6 @@ export async function buildIgPrompt(config, role, scene, opts = {}) {
     char: role?.name ?? "",
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
-    language: role?.language ?? "",
   };
   const fill = (text) => applyVars(text, vars).trim();
 

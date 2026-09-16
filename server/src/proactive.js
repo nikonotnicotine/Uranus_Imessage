@@ -103,6 +103,22 @@ function fillFocusVars(text, focus) {
     .replace(/\{Focus_time_end\}/g, on ? String(focus.end ?? "") : "无");
 }
 
+/**
+ * 「对方读了没」这一项现在生效吗。
+ *
+ * 两道闸：角色自己的开关（`proactive.notifyRead`，默认开，见
+ * config.js:normalizeProactive），以及「已读与不回 → 已读回执」
+ * （`leaveOnRead.receipt`）—— 已读状态就是从那个回执里读的，关着的话
+ * 根本不知道对方读没读，这一项也就无从谈起。
+ *
+ * 导出是给测试和界面对口径用的：面板上写「这一项要先打开已读回执」，
+ * 依据就是这个函数。
+ */
+export function notifyReadOn(role) {
+  if (role?.proactive?.notifyRead === false) return false;
+  return Boolean(role?.leaveOnRead?.receipt);
+}
+
 /** 把内存历史拍成给判断模型看的几行文本。 */
 function historyLines(history, vars) {
   return (history ?? [])
@@ -140,8 +156,13 @@ export function buildProactiveInput(role, user, opts = {}) {
    * 用户规范里要求缀在主动消息提示词**后面**，所以是拼在这份 toModel 上，
    * 而不是单开一条消息 —— 单开一条的话它会以自己的身份进上下文，
    * 而这句是元信息，不该在存档里留痕（存档那份只有 PROACTIVE_MARK）。
+   *
+   * 三个条件都要成立：这轮真的被读了没回（opts.read，由调度槽记着）、
+   * 角色开着「对方读了没」（notifyRead，默认开）、并且已读回执开着
+   * （receipt —— 关着的话 opts.read 压根不会为真，这里再判一遍是为了
+   * 「关了回执但槽里还留着上一轮的 read」那种时序）。
    */
-  if (opts.read) {
+  if (opts.read && notifyReadOn(role)) {
     toModel += `\n${applyVars("{{user}}已读了你发的信息，但还没回复。", vars)}`;
   }
 

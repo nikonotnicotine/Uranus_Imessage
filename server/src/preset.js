@@ -257,7 +257,7 @@ export const LEGACY_FORMAT_INTRO = [
  * 十一个子条目的默认内容。
  *
  * voice / sticker / image / quote / undoSend 这几段是用户给的规范原文（含
- * `{{language}}`、`{{表情包变量}}`、`{{图生图变量}}` 三个变量）。外层的
+ * `{{表情包变量}}`、`{{图生图变量}}` 两个变量）。外层的
  * `<audio_message>` / `<send_emoji>` / `<Generate_Image>` 标签由 prompt.js 拼
  * （FORMAT_CHILD_TAGS），这里只写标签里面那部分。
  *
@@ -286,7 +286,6 @@ export const DEFAULT_FORMAT_CHILDREN = {
     "触发条件：忙碌或不便打字时（开车、做饭、健身或手里拿着东西）；表达情绪时，语音更能传递情感。",
     "规则：格式必须严格遵循 [audio_message:语音内容]；" +
       "语音条与文字消息之间必须使用 {{sep}} 符号分隔，语音内容本身严禁使用 {{sep}}；" +
-      "语言规范应主要使用 {{language}} 并使用正确的 {{language}} 标点符号；" +
       "语气词根据人设、上下文以及情绪适当添加，非必须。",
     "示例：「你在干什么呢{{sep}}[audio_message:我刚下班，好想你。]{{sep}}不理我吗？」",
   ].join("\n"),

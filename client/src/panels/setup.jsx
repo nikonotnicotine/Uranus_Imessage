@@ -562,14 +562,6 @@ function StepContext({ role }) {
           hint="丢弃最旧的 N 条"
           suffix="条"
         />
-        <Field label="说什么语言" hint="留空就是中文">
-          <input
-            className={inputCls}
-            value={role?.language ?? ""}
-            onChange={(e) => patch({ language: e.target.value })}
-            placeholder="中文"
-          />
-        </Field>
       </div>
 
       <Note icon={Brain}>

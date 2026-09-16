@@ -487,7 +487,6 @@ export function igComposeNote(config, role, opts = {}) {
     char: role?.name ?? "",
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
-    language: role?.language ?? "",
   }).trim();
 }
 

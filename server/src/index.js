@@ -68,7 +68,7 @@ import {
   buildAssistantMessages,
   resolveAssistantEndpoint,
 } from "./assistant.js";
-import { extractKeywords } from "./memory.js";
+import { extractKeywords, truncate } from "./memory.js";
 import {
   manualDiary,
   manualMemo,
@@ -2124,36 +2124,129 @@ app.get("/api/memories/:key", (req, res) => {
 });
 
 /**
+ * 把一条记忆的向量当场算出来。
+ *
+ * 没配向量模型 / 引用失效 / 接口失败一律返回 null —— 向量在这条链路里是
+ * 「锦上添花」：算不出这条照样存进去、照样走「近 N 天」，不该挡保存。
+ */
+async function embedOneMemory(config, cfg, content) {
+  const ref = cfg?.embedModel;
+  if (!ref?.provider || !ref?.modelId) return null;
+  const endpoint = resolveEndpoint(config, ref);
+  if (!endpoint) return null;
+  try {
+    return await embedText(endpoint, truncate(content, cfg.maxInputChars ?? 4000));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 「2026-09-09」→ `{date, timestamp}`（当天零点，本地时区）。格式不对或是不
+ * 存在的日期（2026-02-31 这类）返回 null —— 调用方就当没传这个字段。
+ */
+function memoryDay(input) {
+  const s = String(input ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const [y, m, d] = s.split("-").map(Number);
+  const t = new Date(y, m - 1, d);
+  if (t.getFullYear() !== y || t.getMonth() !== m - 1 || t.getDate() !== d) return null;
+  return { date: s, timestamp: t.getTime() };
+}
+
+/**
  * 手改一条记忆 / 加一条 / 删一条。
  *
- * 关键词跟着正文重算（`extractKeywords`），向量则由 `updateMemory` 置空 ——
- * 正文改了旧向量就对不上了，下次总结/检索时再补。手加的那条同理没有向量：
- * 为一次手动编辑单独打一次向量接口不值当，而且这条照旧能被「近 N 天」那路拿到。
+ * 加和改都收三个可选字段：`date`（YYYY-MM-DD，不传就是今天）、
+ * `keywords`（数组，和自动抽的合并去重）、`embed`（默认 true）——
+ * 落盘**前后**把这条的向量当场算出来，语义检索立刻就能拿到它。
+ * 没配向量模型 / 引用失效 / 接口失败都只是跳过（`embedded: false`，
+ * 照旧能被「近 N 天」那路拿到，之后可去「导入 / 导出」补算），不挡保存。
  */
-app.post("/api/memories/:key/memory", (req, res) => {
+app.post("/api/memories/:key/memory", async (req, res) => {
   const ctx = memoryCtx(req, res);
   if (!ctx) return;
   const content = String(req.body?.content ?? "").trim();
   if (!content) return res.status(400).json({ ok: false, error: "记忆正文不能为空" });
 
-  const item = appendMemory(ctx.key, { content, keywords: extractKeywords(content) });
-  logInfo("记忆库", `${ctx.key} 手动加了一条记忆（${content.length} 字）`);
-  res.json({ ok: true, item: { ...item, embedding: undefined, embedded: false } });
+  /*
+   * 日期不合格式直接 400，不默默改成今天 —— 和日记那条路由（POST
+   * /api/memories/:key/diary）同一个规矩：界面上有日期选择器，能走到这里的
+   * 非法值只可能是请求拼错了，替用户改成今天反而把补记的日子悄悄弄丢。
+   */
+  const rawDate = String(req.body?.date ?? "").trim();
+  const day = memoryDay(rawDate);
+  if (rawDate && !day) {
+    return res.status(400).json({ ok: false, error: "日期格式不对，要 YYYY-MM-DD" });
+  }
+  const manual = Array.isArray(req.body?.keywords)
+    ? req.body.keywords.map((k) => String(k).trim()).filter(Boolean)
+    : [];
+  const cfg = ctx.config.memories?.memory ?? {};
+
+  const embedding =
+    req.body?.embed === false ? null : await embedOneMemory(ctx.config, cfg, content);
+  const item = appendMemory(ctx.key, {
+    content,
+    ...(day ?? {}),
+    keywords: [...new Set([...extractKeywords(content), ...manual])],
+    embedding,
+  });
+  logInfo(
+    "记忆库",
+    `${ctx.key} 手动加了一条记忆（${content.length} 字${day ? `，日期 ${day.date}` : ""}` +
+      `${embedding ? "，向量已算" : "，没算向量"}）`
+  );
+  res.json({
+    ok: true,
+    item: { ...item, embedding: undefined, embedded: Boolean(embedding) },
+  });
 });
 
-app.put("/api/memories/:key/memory/:id", (req, res) => {
+app.put("/api/memories/:key/memory/:id", async (req, res) => {
   const ctx = memoryCtx(req, res);
   if (!ctx) return;
   const content = String(req.body?.content ?? "").trim();
   if (!content) return res.status(400).json({ ok: false, error: "记忆正文不能为空" });
+
+  // 日期不合格式直接 400，同 POST（注释在那边）
+  const rawDate = String(req.body?.date ?? "").trim();
+  const day = memoryDay(rawDate);
+  if (rawDate && !day) {
+    return res.status(400).json({ ok: false, error: "日期格式不对，要 YYYY-MM-DD" });
+  }
+  const manual = Array.isArray(req.body?.keywords)
+    ? req.body.keywords.map((k) => String(k).trim()).filter(Boolean)
+    : [];
+  const cfg = ctx.config.memories?.memory ?? {};
 
   const item = updateMemory(ctx.key, req.params.id, {
     content,
-    keywords: extractKeywords(content),
+    ...(day ?? {}),
+    keywords: [...new Set([...extractKeywords(content), ...manual])],
+    // 正文改了旧向量就对不上，updateMemory 把它置空了 —— 这里当场补上新的
+    embedding: null,
   });
   if (!item) return res.status(404).json({ ok: false, error: "没有这条记忆" });
-  logInfo("记忆库", `${ctx.key} 改了一条记忆（${content.length} 字，向量已置空待重算）`);
-  res.json({ ok: true, item: { ...item, embedding: undefined, embedded: false } });
+
+  // 向量是空的才要补（正文改了被置空，或者本来就没有）；只改日期/关键词时
+  // 旧向量还是对的，不重算 —— 白打一次接口
+  let finalItem = item;
+  if (req.body?.embed !== false && !item.embedding) {
+    const embedding = await embedOneMemory(ctx.config, cfg, content);
+    // updateMemory 的 patch 只带 embedding 时正文没变，向量会被原样收下。
+    // 它返回的是重读磁盘后的新对象，响应要用这份才带得上 embedded: true
+    if (embedding) finalItem = updateMemory(ctx.key, req.params.id, { embedding }) ?? item;
+  }
+  logInfo(
+    "记忆库",
+    `${ctx.key} 改了一条记忆（${content.length} 字${day ? `，日期 ${day.date}` : ""}` +
+      `${finalItem.embedding ? "，向量已算" : "，向量待补"}）`
+  );
+  res.json({
+    ok: true,
+    item: { ...finalItem, embedding: undefined, embedded: Boolean(finalItem.embedding) },
+  });
 });
 
 app.delete("/api/memories/:key/memory/:id", (req, res) => {

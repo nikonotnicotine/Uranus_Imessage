@@ -22,6 +22,7 @@ import { igComposeNote, igRouteFor, publishIgTags, publishLines, tickIgQueue } f
 import { splitIg, stripIgTags } from "./igtags.js";
 import {
   WORD_EFFECT_LABELS,
+  degradeToPlain,
   describeEffectId,
   generateImage,
   hasLeaveOnRead,
@@ -1601,7 +1602,6 @@ async function runAssistTurn(getConfig, runner, space, spaceId, userText, peer =
     char: role?.name ?? "",
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
-    language: role?.language ?? "",
   };
 
   const messages = buildAssistMessages({
@@ -1856,10 +1856,21 @@ async function runOfflineTurnHere(getConfig, runner, space, spaceId, userText, p
   }
 
   const bubbles = splitBubbles(out.display, config.chat);
+  let sent = 0;
   for (const [i, bubble] of bubbles.entries()) {
+    /*
+     * 线下没有媒体那条路（format 条目整段不进提示词，模型照理学不会写标记），
+     * 但「照理」不兜底：线下预设里那条「线上聊天记录」会把带标记的线上发言摆
+     * 到模型眼前，有样学样写出 `[audio_message:…]` 不是不可能。原样发出去就是
+     * 一对方括号，所以照线上「功能关着」的同一套待遇退化 —— 语音变文字、
+     * 图片描述丢弃。整条都是要丢的标记时这条就不发了。
+     */
+    const plain = degradeToPlain(bubble.text);
+    if (!plain) continue;
     try {
       await sleep(bubble.delay); // 秒。按字数算的打字停顿，和线上一套（delay.js）
-      await space.send(bubble.text);
+      await space.send(plain);
+      sent += 1;
     } catch (e) {
       logError(scope, `线下正文第 ${i + 1} 条发不出去`, e);
       break;
@@ -1884,7 +1895,7 @@ async function runOfflineTurnHere(getConfig, runner, space, spaceId, userText, p
 
   logInfo(
     scope,
-    `线下这轮发了 ${bubbles.length} 条正文${out.options.length ? ` + ${out.options.length} 条选项` : ""}` +
+    `线下这轮发了 ${sent} 条正文${out.options.length ? ` + ${out.options.length} 条选项` : ""}` +
       `（会话 ${sessionIdOf(runner, role, peer || spaceId)}）`
   );
 }

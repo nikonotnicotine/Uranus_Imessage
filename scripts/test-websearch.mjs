@@ -31,6 +31,7 @@ import {
   stripSearchTags,
   stripXmlBlocks,
 } from "../server/src/websearch.js";
+import { chatCompletion } from "../server/src/llm.js";
 
 let passed = 0;
 function ok(name) {
@@ -259,15 +260,8 @@ console.log("\n[语音和图片压着同一道闸]");
   ok("子条目关掉 → 角色开着也不注入");
 }
 
-console.log("\n[{{language}} 和 {{图生图变量}}]");
+console.log("\n[{{图生图变量}}]");
 {
-  // {{language}} 来自角色单独配置里的语言项，语音那条正文里用了它
-  const jp = setup({ voiceSend: { enabled: true }, language: "日语" });
-  const jpText = await formatSection(jp.config, jp.role);
-  assert.ok(jpText.includes("日语"), jpText);
-  assert.ok(!jpText.includes("{{language}}"), jpText);
-  ok("{{language}} 换成角色配置里的语言");
-
   // 图生图关着：变量展开成空串，不留下占位符也不留下空行
   const noI2i = setup({ imageGen: { enabled: true, img2img: false } });
   const noI2iText = await formatSection(noI2i.config, noI2i.role);
@@ -821,7 +815,7 @@ console.log("\n[find 里的 {{char}} / {{user}} 也要展开]");
     toHistory: false,
   });
   const 原文 = "沈亦衣着：风衣\n你姿势：坐着";
-  const vars = { char: "沈亦", user: "你", sep: "\n", language: "中文" };
+  const vars = { char: "沈亦", user: "你", sep: "\n" };
   const r = applyRules(原文, [行规则("{{char}}衣着"), 行规则("{{user}}姿势")], {
     target: "aiOutput",
     field: "toUser",
@@ -835,7 +829,7 @@ console.log("\n[find 里的 {{char}} / {{user}} 也要展开]");
   const 空 = applyRules("助手衣着：风衣", [行规则("{{char}}衣着")], {
     target: "aiOutput",
     field: "toUser",
-    vars: { char: "", user: "", sep: "", language: "" },
+    vars: { char: "", user: "", sep: "" },
   });
   assert.equal(空.text, "<row>助手衣着=风衣</row>");
   ok("角色名为空时 find 走兜底词，跟 applyVars 一个口径");
@@ -844,7 +838,7 @@ console.log("\n[find 里的 {{char}} / {{user}} 也要展开]");
   const 元 = applyRules("A.C衣着：风衣\nABC衣着：外套", [行规则("{{char}}衣着")], {
     target: "aiOutput",
     field: "toUser",
-    vars: { char: "A.C", user: "你", sep: "", language: "" },
+    vars: { char: "A.C", user: "你", sep: "" },
   });
   assert.ok(元.text.includes("<row>A.C衣着=风衣</row>"), 元.text);
   assert.ok(元.text.includes("ABC衣着：外套"), "带点的名字把 ABC 那行也吃了，说明没转义");
@@ -854,16 +848,137 @@ console.log("\n[find 里的 {{char}} / {{user}} 也要展开]");
   const 甲 = applyRules("甲衣着：风衣", [行规则("{{char}}衣着")], {
     target: "aiOutput",
     field: "toUser",
-    vars: { char: "甲", user: "你", sep: "", language: "" },
+    vars: { char: "甲", user: "你", sep: "" },
   });
   const 乙 = applyRules("乙衣着：外套", [行规则("{{char}}衣着")], {
     target: "aiOutput",
     field: "toUser",
-    vars: { char: "乙", user: "你", sep: "", language: "" },
+    vars: { char: "乙", user: "你", sep: "" },
   });
   assert.equal(甲.text, "<row>甲衣着=风衣</row>");
   assert.equal(乙.text, "<row>乙衣着=外套</row>", "编译缓存把甲的正则给了乙");
   ok("编译缓存按展开后的正则分桶，换角色不串味");
+}
+
+console.log("\n[Gemini 3.7 / 3.8 的两条硬规矩]");
+{
+  /*
+   * 假 fetch 拦在 /chat/completions 上，看真正发出去的 body 长什么样 ——
+   * 这两条规矩全在 llm.js 的组包那一步，不到上游就能验。
+   */
+  const real = globalThis.fetch;
+  let sent = [];
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), body: JSON.parse(init.body) });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "好" } }] }), {
+      status: 200,
+    });
+  };
+
+  const ep = (model) => ({ url: "https://api.test/v1", key: "sk-test", model });
+  const PARAMS = { temperature: 0.9, topP: 0.8, frequencyPenalty: 0.3, presencePenalty: 0.2 };
+  const call = async (model, messages, params = PARAMS) => {
+    sent = [];
+    await chatCompletion(ep(model), messages, { params, retries: 0 });
+    return sent[0].body;
+  };
+
+  const 预填 = [
+    { role: "system", content: "人设" },
+    { role: "user", content: "在吗" },
+    { role: "assistant", content: "[incipere]" },
+  ];
+
+  try {
+    // 3.8：尾部的预填要挪走，并进最后那条 user
+    const b38 = await call("逆[Ag1-次-0.02￥]gemini-3.8-flash-high", 预填);
+    assert.equal(b38.messages.at(-1).role, "user", JSON.stringify(b38.messages));
+    assert.equal(b38.messages.length, 2);
+    assert.ok(b38.messages.at(-1).content.includes("在吗"), b38.messages.at(-1).content);
+    assert.ok(b38.messages.at(-1).content.includes("[incipere]"), b38.messages.at(-1).content);
+    ok("3.8：assistant 尾巴并进最后那条 user，正文不丢");
+
+    // 生成参数一个都不许发
+    for (const k of ["temperature", "top_p", "frequency_penalty", "presence_penalty", "top_k"]) {
+      assert.equal(k in b38, false, `${k} 还发出去了：${JSON.stringify(b38)}`);
+    }
+    ok("3.8：温度 / Top P / 两个惩罚项一个都不发");
+
+    // 3.7 同样待遇（连字符、点、下划线三种写法都要认出来）
+    for (const name of ["gemini-3.7-pro", "gemini_3.7", "google/gemini-3-7-flash"]) {
+      const b = await call(name, 预填);
+      assert.equal(b.messages.at(-1).role, "user", name);
+      assert.equal("temperature" in b, false, name);
+    }
+    ok("3.7 的几种写法都认出来了");
+
+    // 上一条不是 user 时另起一条，不许发出两条连着的 user
+    const b另起 = await call("gemini-3.8-flash", [
+      { role: "user", content: "在吗" },
+      { role: "system", content: "补充说明" },
+      { role: "assistant", content: "[incipere]" },
+    ]);
+    assert.deepEqual(
+      b另起.messages.map((m) => m.role),
+      ["user", "system", "user"]
+    );
+    ok("前一条不是 user 时预填另起一条 user");
+
+    // 连着几条 assistant 一起收
+    const b多条 = await call("gemini-3.8-flash", [
+      { role: "user", content: "在吗" },
+      { role: "assistant", content: "甲" },
+      { role: "assistant", content: "乙" },
+    ]);
+    assert.equal(b多条.messages.length, 1);
+    assert.ok(b多条.messages[0].content.includes("甲"), b多条.messages[0].content);
+    assert.ok(b多条.messages[0].content.includes("乙"), b多条.messages[0].content);
+    ok("尾部连着几条 assistant 一起挪走");
+
+    // 空预填：整条去掉，不留一条空 user
+    const b空 = await call("gemini-3.8-flash", [
+      { role: "user", content: "在吗" },
+      { role: "assistant", content: "   " },
+    ]);
+    assert.deepEqual(
+      b空.messages.map((m) => m.role),
+      ["user"]
+    );
+    assert.equal(b空.messages[0].content, "在吗");
+    ok("空预填整条去掉，不留空 user");
+
+    // 本来就以 user 结尾的不动它
+    const 正常 = [
+      { role: "system", content: "人设" },
+      { role: "user", content: "在吗" },
+    ];
+    const b正常 = await call("gemini-3.8-flash", 正常);
+    assert.deepEqual(b正常.messages, 正常);
+    ok("本来就以 user 结尾的数组一个字不改");
+
+    /*
+     * 3.1 / 2.5 和别家的模型不受这两条约束 —— 预填在它们身上是正常功能，
+     * 预设里那条「卡思维链（预填）」就是给它们写的，绝不能顺手也给挪了。
+     */
+    for (const name of ["gemini-3.1-pro", "gemini-2.5-flash", "gpt-4o", "claude-opus-4"]) {
+      const b = await call(name, 预填);
+      assert.equal(b.messages.at(-1).role, "assistant", `${name} 的预填被挪走了`);
+      assert.equal(b.temperature, 0.9, name);
+      assert.equal(b.top_p, 0.8, name);
+      assert.equal(b.frequency_penalty, 0.3, name);
+      assert.equal(b.presence_penalty, 0.2, name);
+    }
+    ok("3.1 / 2.5 / 别家模型：预填留着，生成参数照发");
+
+    // 名字里带 3.78 / 3.70 这种不能被误认成 3.7
+    for (const name of ["gemini-3.78-pro", "gemini-3.80"]) {
+      const b = await call(name, 预填);
+      assert.equal(b.messages.at(-1).role, "assistant", `${name} 被误认成 3.7/3.8`);
+    }
+    ok("3.78 / 3.80 这类名字不被误认");
+  } finally {
+    globalThis.fetch = real;
+  }
 }
 
 console.log(`\n${passed} 项全部通过\n`);

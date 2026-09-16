@@ -62,6 +62,7 @@ const {
   saveEmojiFile,
 } = await import("../server/src/emoji.js");
 const {
+  degradeToPlain,
   generateImage,
   hasLeaveOnRead,
   hasMedia,
@@ -75,6 +76,7 @@ const {
   splitMedia,
   stripLeaveOnRead,
   stripMediaTags,
+  stripToneTags,
   synthesizeVoice,
 } = await import("../server/src/media.js");
 const {
@@ -162,6 +164,47 @@ console.log("\n[标记解析：图片]");
     ]
   );
   ok("语音和图片混在一条里，顺序不乱");
+}
+
+console.log("\n[标记解析：嵌套括号]");
+{
+  // 用户实测翻车的原句：老正则在 [whispers] 的 ] 上提前闭了，语音只剩 9 个字
+  assert.deepEqual(
+    shape(
+      splitMedia(
+        "[audio_message:[whispers] Needy little thing... [sighs] I'm right here, puppy.]$happy now"
+      )
+    ),
+    [
+      ["audio", "[whispers] Needy little thing... [sighs] I'm right here, puppy."],
+      ["text", "$happy now"],
+    ]
+  );
+  ok("语音里嵌语气标签，整段都算语音内容");
+
+  assert.deepEqual(shape(splitMedia("［audio_message：［气声］过来……坐好。］")), [
+    ["audio", "［气声］过来……坐好。"],
+  ]);
+  ok("全角括号嵌套同理");
+
+  assert.deepEqual(shape(splitMedia("[image:[特写] 她抬眼的样子][小猫]")), [
+    ["image", "[特写] 她抬眼的样子", "小猫"],
+  ]);
+  ok("图片描述里嵌括号，参考图名照旧认");
+
+  // 不成对的 ] 保持老行为：在它前面刹住，别把后面整段吞进标记里
+  assert.deepEqual(shape(splitMedia("[audio_message:说一句]然后]")), [
+    ["audio", "说一句"],
+    ["text", "然后]"],
+  ]);
+  ok("不成对的 ] 退化成老行为");
+
+  // 表情包/点歌这些**没有**换嵌套写法：里面出现方括号多半是写坏了，在第一个 ] 刹住
+  assert.deepEqual(shape(splitMedia("[send_emoji:开心]后缀")), [
+    ["sticker", "开心"],
+    ["text", "后缀"],
+  ]);
+  ok("其他标记不吃嵌套，行为不变");
 }
 
 console.log("\n[标记解析：表情包]");
@@ -270,6 +313,22 @@ console.log("\n[stripMediaTags：功能关掉时的退化]");
   assert.equal(hasMedia("今天天气不错"), false);
   assert.equal(hasMedia("[image:一只猫]"), true);
   ok("hasMedia 认得出有没有标记");
+}
+
+console.log("[degradeToPlain：线下模式的退化]");
+{
+  // 线下模式整条走 space.send 之前把媒体标记降级 —— 线上「功能关着」的同一套待遇
+  assert.equal(
+    degradeToPlain("[audio_message:[whispers] 我在的 [sighs] 别怕]"),
+    "[whispers] 我在的 [sighs] 别怕"
+  );
+  ok("带嵌套语气标签的语音降成那句话");
+
+  assert.equal(degradeToPlain("[reply:2][effect:烟花]我在的"), "我在的");
+  ok("引用和特效这两个气泡属性先摘掉");
+
+  assert.equal(degradeToPlain("[image:一张照片][send_emoji:紧张]"), "");
+  ok("全是该丢的标记时是空串（调用方跳过不发）");
 }
 
 /* ================= 2. 参考图 ================= */
@@ -832,11 +891,11 @@ console.log("\n[配置：默认值]");
   ok("referenceImages 默认空；config 里不再有 emojiTags 这一项");
 
   const role = normalizeConfig({ roles: [{ name: "小柚" }] }).roles[0];
-  assert.equal(role.language, "中文");
+  assert.equal("language" in role, false);
   assert.deepEqual(role.voiceSend, { enabled: false, voiceId: "" });
   assert.deepEqual(role.imageGen, { enabled: false, img2img: false, refs: [] });
   assert.deepEqual(role.stickerSend, { enabled: false, blacklist: [], noRepeat: 5 });
-  ok("角色上四块默认值（语言「中文」、三个功能默认关、连着 5 次不重样）");
+  ok("角色上三块默认值（三个功能默认关、连着 5 次不重样；language 已整个删掉）");
 }
 
 console.log("\n[配置：收口]");
@@ -858,7 +917,6 @@ console.log("\n[配置：收口]");
     roles: [
       {
         name: "小柚",
-        language: "  日语  ",
         voiceSend: { enabled: true, voiceId: " v-1 " },
         imageGen: { enabled: true, img2img: true, refs: ["小猫", "小猫", " ", "自拍"] },
         stickerSend: {
@@ -888,11 +946,10 @@ console.log("\n[配置：收口]");
   ok("老配置里的 emojiTags 收口时整个丢掉（下次保存就从磁盘上消失）");
 
   const role = c.roles[0];
-  assert.equal(role.language, "日语");
   assert.equal(role.voiceSend.voiceId, "v-1");
   assert.deepEqual(role.imageGen.refs, ["小猫", "自拍"]);
   assert.deepEqual(role.stickerSend, { enabled: true, blacklist: ["紧张"], noRepeat: 4 });
-  ok("角色：语言去空格、音色 ID 去空格、refs 和表情包黑名单去重去空");
+  ok("角色：音色 ID 去空格、refs 和表情包黑名单去重去空");
 
   // 「连着 N 次不重样」夹在 1~50：0 和负数没有意义，大到离谱也只是白占内存
   const noRepeat = (v) =>
@@ -1041,7 +1098,83 @@ console.log("\n[TTS：挑哪一家]");
   });
   assert.equal(all.name, "MiniMax");
   ok("都开着时按 minimax → elevenlabs → sovits 的顺序");
+
+  // 语气标签认不认跟着模型走：[whispers] 这类是 ElevenLabs v3 的功能
+  assert.equal(pickTtsSource({ minimax: { enabled: true, key: "k" } }).keepTags, undefined);
+  assert.equal(
+    pickTtsSource({ sovits: { enabled: true, url: "http://x" } }).keepTags,
+    undefined
+  );
+  assert.equal(
+    pickTtsSource({ elevenlabs: { enabled: true, key: "k" } }).keepTags,
+    false,
+    "默认模型 v2 不认标签"
+  );
+  assert.equal(
+    pickTtsSource({ elevenlabs: { enabled: true, key: "k", model: "eleven_multilingual_v2" } })
+      .keepTags,
+    false
+  );
+  assert.equal(
+    pickTtsSource({ elevenlabs: { enabled: true, key: "k", model: "eleven_v3" } }).keepTags,
+    true
+  );
+  ok("keepTags：只有 ElevenLabs 的 v3 模型留着语气标签");
 }
+
+console.log("\n[TTS：语气标签剥不剥]");
+{
+  const realFetch = globalThis.fetch;
+  try {
+    const bodies = [];
+    globalThis.fetch = async (url, init) => {
+      bodies.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) });
+      if (String(url).includes("elevenlabs")) return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      return new Response(
+        JSON.stringify({ data: { audio: "494433" }, base_resp: { status_code: 0 } }),
+        { status: 200 }
+      );
+    };
+
+    // MiniMax 不认标签：剥掉再合成，别让语音里真的念出一句 "whispers"
+    await synthesizeVoice(
+      { minimax: { enabled: true, key: "k", groupId: "G" } },
+      "v",
+      "[whispers] 过来 [sighs] 坐下",
+      "测试"
+    );
+    assert.equal(bodies[0].body.text, "过来 坐下");
+    ok("MiniMax：请求里的 text 已剥掉语气标签");
+
+    // v2 同理；v3 认标签，原样保留
+    await synthesizeVoice(
+      { elevenlabs: { enabled: true, key: "k", model: "eleven_multilingual_v2" } },
+      "v",
+      "[whispers] 过来",
+      "测试"
+    );
+    assert.equal(bodies[1].body.text, "过来");
+    await synthesizeVoice(
+      { elevenlabs: { enabled: true, key: "k", model: "eleven_v3" } },
+      "v",
+      "[whispers] 过来",
+      "测试"
+    );
+    assert.equal(bodies[2].body.text, "[whispers] 过来");
+    ok("ElevenLabs：v2 剥掉、v3 原样保留");
+
+    // stripToneTags 本体：全角也认；整条都是标签时剥成空串 —— synthesizeVoice
+    // 见空会留着原样交给合成那边，这里只验剥的部分
+    assert.equal(stripToneTags("［气声］过来［叹气］坐好。"), "过来 坐好。");
+    assert.equal(stripToneTags("没有标签的话"), "没有标签的话");
+    assert.equal(stripToneTags("[laughs]"), "");
+    ok("stripToneTags：全角认、没标签不动、整条都是标签时剥成空串");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+console.log("\n[TTS：三家的响应形状]");
 
 console.log("\n[TTS：三家的响应形状]");
 {

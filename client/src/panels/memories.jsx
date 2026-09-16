@@ -161,6 +161,9 @@ export function MemoriesPanel({ onGoto }) {
   const role = (config.roles ?? []).find((r) => r.id === itemId) ?? null;
   const gates = entry?.gates ?? {};
   const stats = detail?.stats ?? entry?.stats ?? {};
+  // 向量模型配没配好 —— 记忆页手加/手改之后要据此说清楚「向量没算成」的原因
+  const embedRef = config?.memories?.memory?.embedModel ?? null;
+  const embedReady = Boolean(embedRef?.provider && embedRef?.modelId);
 
   /* ---------- 齿轮：全局设置 ---------- */
   if (view === "settings") {
@@ -229,6 +232,8 @@ export function MemoriesPanel({ onGoto }) {
           detail={detail}
           gate={Boolean(gates[mod.id])}
           role={role}
+          modelRef={config?.memories?.[mod.id]?.model}
+          embedReady={embedReady}
           reload={reload}
           onGoto={onGoto}
           onTransfer={() => setView("transfer")}
@@ -440,15 +445,34 @@ function GateNote({ on, name, onGoto }) {
   );
 }
 
+/** 「还没给「生成备忘录」选模型……」—— 这类失败的原因后来被用户解决了。 */
+const NO_MODEL_ERROR = /^还没给「.+?」选模型/;
+
 /**
  * 上一次失败的原因。定时那条路在后台跑，失败时用户不在现场，所以要留一条。
  *
  * 原因**原样全显**、不截断 —— 中转站常把真正的原因写在很后面，截一半等于
  * 让用户对着半截话猜。代价是可能很长，所以单独一块：能选中复制、长串不换行
  * 的报文也强制折行、超高了自己滚，不把整页顶下去。
+ *
+ * 有一个特例：「还没选模型」这种失败，原因后来被用户自己解决了（模型选上了）
+ * 错误文本却还钉在原地 —— lastError 只在下次成功时才清。检测到「原因已经
+ * 解除」就换个说法，不然用户会对着一句已经不成立的报错反复检查自己的配置。
  */
-function FailNote({ fails, lastError, at }) {
+function FailNote({ fails, lastError, at, modelRef }) {
   if (!lastError) return null;
+
+  if (NO_MODEL_ERROR.test(lastError) && modelRef?.provider && modelRef?.modelId) {
+    return (
+      <div className="border-l-2 border-line py-1.5 pl-3 text-meta leading-relaxed text-ink-soft">
+        <p>
+          上次没成功{fails ? `（连着 ${fails} 次）` : ""}，原因是那时候还没选模型 ——
+          现在已经选好了。攒够轮数会自动接着总结，不想等就点右上角的生成按钮。
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="border-l-2 border-warn py-1.5 pl-3 text-meta leading-relaxed text-warn">
       <p>
@@ -597,14 +621,22 @@ function PendingLogEditor({ memKey, kind, name, log, onBack, reload }) {
 /** 每页多少条。默认 25 —— 和参考实现（romantic_memory 的面板）一致。 */
 const PAGE_SIZES = [10, 25, 50, 0];
 
+/** 「露营、约定, lake」→ ["露营", "约定", "lake"]。空串 → []。 */
+function parseKeywords(s) {
+  return String(s ?? "")
+    .split(/[、,，;；\s]+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+}
+
 /**
  * 记忆页：一条一条的长期事件，按日期分组，可以手改、手删、手加。
  *
- * 手改和手加的那条**没有向量**（后端把它置空了）：为一次手动编辑单独打一次
- * 向量接口不值当，而且这条照旧能被「近 N 天」那一路拿到 —— 只是暂时进不了
- * 向量检索。界面上把这件事标出来（「未向量化」），否则用户会以为改坏了。
+ * 手加和手改都能带**日期**（不填就是今天）和**关键词**（和按正文自动抽的
+ * 合并）。落盘时后端会顺手把这条的向量当场算出来（配了向量模型的话）——
+ * 算不成就留空，界面上标出来（「未向量化」），去「导入 / 导出」页可以补。
  */
-function MemoryPage({ memKey, detail, gate, reload, onGoto, onTransfer }) {
+function MemoryPage({ memKey, detail, gate, modelRef, embedReady, reload, onGoto, onTransfer }) {
   const gen = useGenerate(memKey, reload);
   const [pendingView, setPendingView] = useState(false);
   const [query, setQuery] = useState("");
@@ -613,7 +645,11 @@ function MemoryPage({ memKey, detail, gate, reload, onGoto, onTransfer }) {
   const [picked, setPicked] = useState([]);
   const [editId, setEditId] = useState("");
   const [draft, setDraft] = useState("");
+  const [editDate, setEditDate] = useState("");
+  const [editKw, setEditKw] = useState("");
   const [adding, setAdding] = useState("");
+  const [addDate, setAddDate] = useState(todayKey());
+  const [addKw, setAddKw] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -643,16 +679,17 @@ function MemoryPage({ memKey, detail, gate, reload, onGoto, onTransfer }) {
   const current = Math.min(page, pages);
   const slice = perPage ? shown.slice((current - 1) * perPage, current * perPage) : shown;
 
+  /** 和上面几个页面不同：要拿响应里的 item（带没带向量），不能只回 true/false。 */
   async function call(path, options) {
     setBusy(true);
     setError("");
     try {
-      await api(path, options);
+      const r = await api(path, options);
       await reload();
-      return true;
+      return r ?? true;
     } catch (e) {
       setError(String(e?.message ?? e));
-      return false;
+      return null;
     } finally {
       setBusy(false);
     }
@@ -664,24 +701,54 @@ function MemoryPage({ memKey, detail, gate, reload, onGoto, onTransfer }) {
       setError("记忆正文不能为空 —— 想删掉这条请用右边的垃圾桶。");
       return;
     }
-    const ok = await call(
+    const r = await call(
       `/api/memories/${encodeURIComponent(memKey)}/memory/${encodeURIComponent(id)}`,
-      { method: "PUT", body: { content } }
+      {
+        method: "PUT",
+        body: {
+          content,
+          date: editDate || undefined,
+          keywords: parseKeywords(editKw),
+        },
+      }
     );
-    if (ok) {
+    if (r) {
       setEditId("");
       setDraft("");
+      setEditKw("");
+      if (!r.item?.embedded) {
+        setError(
+          embedReady
+            ? "改是改好了，但这条的向量没算成 —— 稍后可以去「导入 / 导出」页补算。"
+            : "改是改好了，但还没选向量模型（记忆库 → 设置 → 记忆），这条暂时进不了语义检索。"
+        );
+      }
     }
   }
 
   async function addOne() {
     const content = adding.trim();
     if (!content) return;
-    const ok = await call(`/api/memories/${encodeURIComponent(memKey)}/memory`, {
+    const r = await call(`/api/memories/${encodeURIComponent(memKey)}/memory`, {
       method: "POST",
-      body: { content },
+      body: {
+        content,
+        date: addDate || undefined,
+        keywords: parseKeywords(addKw),
+      },
     });
-    if (ok) setAdding("");
+    if (r) {
+      setAdding("");
+      setAddKw("");
+      // 日期故意留着 —— 连着补同一个旧日期的几条是常见的补记操作
+      if (!r.item?.embedded) {
+        setError(
+          embedReady
+            ? "加是加上了，但向量没算成 —— 稍后可以去「导入 / 导出」页补算。"
+            : "加是加上了，但还没选向量模型（记忆库 → 设置 → 记忆），这条暂时进不了语义检索。"
+        );
+      }
+    }
   }
 
   /** 删勾选的那几条。一条一个请求 —— 后端没有批量删的路由，几条而已。 */
@@ -722,7 +789,7 @@ function MemoryPage({ memKey, detail, gate, reload, onGoto, onTransfer }) {
   return (
     <div className="grid grid-cols-1 gap-6">
       <GateNote on={gate} name="记忆" onGoto={onGoto} />
-      <FailNote fails={pending.fails} lastError={pending.lastError} />
+      <FailNote fails={pending.fails} lastError={pending.lastError} modelRef={modelRef} />
 
       <PageBar
         note={
@@ -839,10 +906,16 @@ function MemoryPage({ memKey, detail, gate, reload, onGoto, onTransfer }) {
               editing={editId === m.id}
               draft={draft}
               setDraft={setDraft}
+              draftDate={editDate}
+              setDraftDate={setEditDate}
+              draftKw={editKw}
+              setDraftKw={setEditKw}
               busy={busy}
               onEdit={() => {
                 setEditId(m.id);
                 setDraft(m.content);
+                setEditDate(m.date ?? "");
+                setEditKw((m.keywords ?? []).join("、"));
               }}
               onCancel={() => setEditId("")}
               onCommit={() => commitEdit(m.id)}
@@ -892,10 +965,28 @@ function MemoryPage({ memKey, detail, gate, reload, onGoto, onTransfer }) {
             placeholder="例如：两人约好周末去湖边的营地露营。"
           />
         </Field>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-[180px_1fr]">
+          <Field label="日期" hint="补记旧事就改这里">
+            <input
+              type="date"
+              className={inputCls}
+              value={addDate}
+              onChange={(e) => setAddDate(e.target.value)}
+            />
+          </Field>
+          <Field label="关键词（可选）" hint="顿号或逗号隔开，和按正文自动抽的合并">
+            <input
+              className={inputCls}
+              value={addKw}
+              onChange={(e) => setAddKw(e.target.value)}
+              placeholder="例如：露营、约定"
+            />
+          </Field>
+        </div>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-meta leading-relaxed text-ink-faint">
-            手加的这条没有向量（不为一次手动编辑单独打一次向量接口），
-            但「近 N 天记忆」那一路照样能拿到它。
+            落盘时会顺手把这条的向量当场算出来（要配了向量模型），算不成也不挡保存
+            —— 那条照样能被「近 N 天记忆」拿到，之后可以去「导入 / 导出」页补算。
           </p>
           <Button onClick={addOne} disabled={busy || !adding.trim()}>
             <Plus size={14} /> 加一条
@@ -920,6 +1011,10 @@ function MemoryRow({
   editing,
   draft,
   setDraft,
+  draftDate,
+  setDraftDate,
+  draftKw,
+  setDraftKw,
   busy,
   onEdit,
   onCancel,
@@ -952,6 +1047,24 @@ function MemoryRow({
                   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) onCommit();
                 }}
               />
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-[180px_1fr]">
+                <Field label="日期" hint="改这里 = 补记到别的日子">
+                  <input
+                    type="date"
+                    className={inputCls}
+                    value={draftDate}
+                    onChange={(e) => setDraftDate(e.target.value)}
+                  />
+                </Field>
+                <Field label="关键词（可选）" hint="顿号或逗号隔开，和按正文自动抽的合并">
+                  <input
+                    className={inputCls}
+                    value={draftKw}
+                    onChange={(e) => setDraftKw(e.target.value)}
+                    placeholder="留空就按正文自动抽"
+                  />
+                </Field>
+              </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Button onClick={onCommit} disabled={busy}>
                   <Check size={14} /> 保存这条
@@ -960,7 +1073,7 @@ function MemoryRow({
                   取消
                 </Button>
                 <span className="text-meta text-ink-meta">
-                  {draft.length} 字 · 改完向量会置空，下次检索前自动重算
+                  {draft.length} 字 · 正文动过的话，保存后向量当场重算（没配向量模型就先空着，可在「导入 / 导出」补算）
                 </span>
               </div>
             </div>
@@ -1016,7 +1129,7 @@ function MemoryRow({
  * 不该做成条目增删（模型每次生成也是整份重写的）。后端 writeMemo 覆盖前
  * 自己留了一份 .bak，所以手改改坏了还能从磁盘上找回来。
  */
-function MemoPage({ memKey, detail, gate, reload, onGoto }) {
+function MemoPage({ memKey, detail, gate, modelRef, reload, onGoto }) {
   const gen = useGenerate(memKey, reload);
   const [pendingView, setPendingView] = useState(false);
   const [text, setText] = useState(detail.memo ?? "");
@@ -1073,7 +1186,7 @@ function MemoPage({ memKey, detail, gate, reload, onGoto }) {
   return (
     <div className="grid grid-cols-1 gap-6">
       <GateNote on={gate} name="备忘录" onGoto={onGoto} />
-      <FailNote fails={pending.fails} lastError={pending.lastError} />
+      <FailNote fails={pending.fails} lastError={pending.lastError} modelRef={modelRef} />
 
       <PageBar
         note={
@@ -1168,7 +1281,7 @@ function todayKey() {
  *    天气是生成那一刻现查的瞬时值。它就是日记的「待总结」。
  *  - **成品**是一篇篇 markdown，程序永远不删，只有在这儿手动点删除才会掉。
  */
-function DiaryPage({ memKey, detail, gate, role, reload, onGoto }) {
+function DiaryPage({ memKey, detail, gate, role, modelRef, reload, onGoto }) {
   const gen = useGenerate(memKey, reload);
   const [pendingView, setPendingView] = useState(false);
   const [writing, setWriting] = useState(false); // 手写一篇的那个表单开着没有
@@ -1261,7 +1374,7 @@ function DiaryPage({ memKey, detail, gate, role, reload, onGoto }) {
   return (
     <div className="grid grid-cols-1 gap-6">
       <GateNote on={gate} name="日记" onGoto={onGoto} />
-      <FailNote lastError={state.lastError} at={state.lastErrorAt} />
+      <FailNote lastError={state.lastError} at={state.lastErrorAt} modelRef={modelRef} />
 
       <PageBar
         note={
@@ -1969,8 +2082,11 @@ function MemoryTransferPage({ memKey, roleName, detail, reload, onSettings }) {
         text:
           `导进来 ${r.added} 条${r.from ? `（${r.from} … ${r.to}）` : ""}，` +
           `现在一共 ${r.total} 条${tail.length ? `。${tail.join("，")}。` : "。"}` +
-          (r.added ? "这批还没有向量 —— 要走语义检索的话，往下点一次「补算向量」。" : ""),
+          (r.added ? "接着自动补算向量，进度和结果在下面那张卡。" : ""),
       });
+      // 导进来就有向量这件事不该让用户再点一次 —— 直接接着补算循环。
+      // runEmbed 自己全套 try/catch/finally，没配向量模型也会把原因写在那张卡上。
+      if (r.added > 0) await runEmbed();
     } catch (e) {
       setTextNote({ ok: false, text: String(e?.message ?? e) });
     } finally {

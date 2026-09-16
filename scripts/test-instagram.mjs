@@ -561,7 +561,7 @@ const custom = await build({ kind: "userPost", owner: "user", post: userPost }, 
 checkThat("存了自定义模板就用自定义的", custom.messages[0].content.includes("小满 又发疯了。"));
 
 console.log("\n=== 23. igprompt：快照 ===");
-const snapVars = { char: "林一", user: "小满", sep: "||", language: "" };
+const snapVars = { char: "林一", user: "小满", sep: "||" };
 const ownPost = {
   id: "p3",
   owner: "林一",
@@ -1048,7 +1048,7 @@ const composeCfg = {
   users: [{ id: "u-1", name: "阿岚", enabled: true, scope: "global", roleRefs: [] }],
   roles: netCfg.roles,
 };
-const noteRole = (instagram) => ({ id: "r-9", name: "小明", language: "中文", instagram });
+const noteRole = (instagram) => ({ id: "r-9", name: "小明", instagram });
 
 check("没开 IG → 一个字都不给", run.igComposeNote(composeCfg, noteRole({ enabled: false, autoPublish: true })), "");
 check("开了 IG 但没开主动发布 → 还是不给", run.igComposeNote(composeCfg, noteRole({ enabled: true, autoPublish: false })), "");

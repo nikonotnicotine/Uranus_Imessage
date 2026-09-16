@@ -250,7 +250,6 @@ export function storyForView(config, role, story) {
     char: role?.name ?? "",
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
-    language: role?.language ?? "",
   };
   const turns = (story?.turns ?? []).map((t) =>
     t.role === "assistant"
@@ -325,7 +324,6 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
     char: role?.name ?? "",
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
-    language: role?.language ?? "",
   };
 
   if (reroll) {
@@ -508,7 +506,7 @@ async function makeSummary(config, role, story, kind) {
   const user = resolveUser(config, role);
   const charName = role?.name ?? "";
   const userName = user?.name ?? "";
-  const vars = { char: charName, user: userName, sep: "", language: role?.language ?? "" };
+  const vars = { char: charName, user: userName, sep: "" };
 
   let material = "";
   let from = 0;

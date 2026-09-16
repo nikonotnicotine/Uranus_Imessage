@@ -141,7 +141,6 @@ const vars = {
   char: second.name ?? "",
   user: resolveUser(config, second)?.name ?? "",
   sep: config?.chat?.separator ?? "",
-  language: second.language ?? "",
 };
 line();
 line(`──── ${second.name} 被叫起来时看到的那段（<Instagram> 块） ────`);

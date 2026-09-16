@@ -28,11 +28,10 @@ export function roleLabel(role) {
  */
 export function applyVars(text, vars) {
   if (!text) return "";
-  return String(text).replace(/\{\{\s*(char|user|sep|language)\s*\}\}/gi, (_m, name) => {
+  return String(text).replace(/\{\{\s*(char|user|sep)\s*\}\}/gi, (_m, name) => {
     const key = name.toLowerCase();
     const value = String(vars?.[key] ?? "").trim();
     if (key === "sep") return value;
-    if (key === "language") return value || "中文";
     return value || (key === "char" ? "助手" : "用户");
   });
 }

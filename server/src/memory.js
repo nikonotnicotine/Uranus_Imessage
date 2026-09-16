@@ -381,7 +381,7 @@ export function pendingText(text, maxChars) {
  */
 function commonBlocks(config, role, scanText, books) {
   const user = resolveUser(config, role);
-  const vars = { char: role?.name ?? "", user: user?.name ?? "", sep: "", language: role?.language ?? "" };
+  const vars = { char: role?.name ?? "", user: user?.name ?? "", sep: "" };
   const fill = (text) => applyVars(text, vars).trim();
 
   let world = "";
