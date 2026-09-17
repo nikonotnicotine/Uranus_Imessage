@@ -137,6 +137,21 @@ console.log("\n[标记解析：图片]");
   }
   ok("兼容 [生成图片：…] / [生图:…] / [画图:…] / 全角");
 
+  // 内置的「线上默认预设」自己写的就是 `Must start with [Image:]`，
+  // 模型照着写出来是大写开头的 —— 认不出来就等于生图整个功能没了
+  for (const s of ["[Image:一只橘猫]", "[IMAGE:一只橘猫]", "［Image：一只橘猫］"]) {
+    assert.deepEqual(shape(splitMedia(s)), [["image", "一只橘猫", ""]], s);
+  }
+  assert.deepEqual(shape(splitMedia("[Image:趴在窗台上][小猫]")), [
+    ["image", "趴在窗台上", "小猫"],
+  ]);
+  ok("标签名不分大小写：[Image:…] / [IMAGE:…] 一样出图，参考图名也跟得上");
+
+  // 同一条正则里的其它标签跟着一起不分大小写
+  assert.deepEqual(shape(splitMedia("[Audio_message:我刚下班]")), [["audio", "我刚下班"]]);
+  assert.deepEqual(shape(splitMedia("[Send_emoji:开心]")), [["sticker", "开心"]]);
+  ok("语音和表情包的标签名同样不分大小写");
+
   assert.deepEqual(shape(splitMedia("[image:让它躺在地上][小猫]")), [
     ["image", "让它躺在地上", "小猫"],
   ]);

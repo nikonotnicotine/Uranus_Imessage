@@ -13,7 +13,7 @@
  * 由 `imessage.js` 自己去发。记提示词走 `lastprompt.js`（当初就是为了这条链
  * 才把 `notePrompt` 从 `imessage.js` 里搬出来的）。
  *
- * 网页上的「对话框」和 iMessage 里的线下模式**跑的是同一条链、同一份存档**，
+ * 网页上的「线下模式」分区和 iMessage 里的线下模式**跑的是同一条链、同一份存档**，
  * 所以在手机上发 `/开启线下` 起的头，能在浏览器里接着演。
  *
  * 三个刻意的取舍：
@@ -297,6 +297,9 @@ function historyOf(story) {
  *        给了这个就不用再传 text —— 网页上点「直接发送」走的是这条
  * @param {string} [opts.storyId] 演哪一条剧情。给了且和当前那条不同就先切过去
  * @param {boolean} [opts.reroll] 重 roll：删掉末尾的助手轮次，按同一份上文再生成
+ * @param {AbortSignal} [opts.signal] 用户按「停下」用的。中止时上游那个 fetch
+ *        当场断开，抛出来的错带 `aborted = true`；**用户那句已经落盘了**，
+ *        所以点一下「再来一次」就能按同一份上文重来
  * @returns {Promise<{turn: object, display: string, options: string[],
  *   story: object, usedFallback: boolean, summary: object|null}>}
  *   `display` 是过了 `toUser` 正则的那份（发气泡 / 网页上显示用），
@@ -305,11 +308,17 @@ function historyOf(story) {
  */
 export async function runOfflineTurn(config, role, user, opts = {}) {
   const roleKey = memoryKeyFor(role);
-  const { text = "", choiceIndex = 0, storyId = "", reroll = false } = opts ?? {};
+  const {
+    text = "",
+    choiceIndex = 0,
+    storyId = "",
+    reroll = false,
+    signal = undefined,
+  } = opts ?? {};
 
   if (storyId && readIndex(roleKey).currentId !== storyId) setCurrent(roleKey, storyId);
   let story = currentStory(roleKey);
-  if (!story) throw new Error("这个角色现在没有在演的剧情（先在「对话框」里开一条）");
+  if (!story) throw new Error("这个角色现在没有在演的剧情（先在「线下模式」里开一条）");
 
   const { endpoint, fallback } = offlineEndpoint(config, role);
   if (!endpoint) {
@@ -406,11 +415,15 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
   let usedFallback = false;
   try {
     // params 用预设那一份：线下要的就是有变化，这是和协助模式最大的区别
-    const out = await chatWithFallback(endpoint, fallback, built.messages, built.params);
+    const out = await chatWithFallback(endpoint, fallback, built.messages, built.params, {
+      signal,
+    });
     reply = out.content;
     usedFallback = out.usedFallback;
   } catch (e) {
-    logError(SCOPE, "线下这轮没回上来", e);
+    // 用户按的「停下」不是故障，日志里别报红
+    if (e?.aborted) logInfo(SCOPE, "线下这轮被用户按停了");
+    else logError(SCOPE, "线下这轮没回上来", e);
     throw e;
   }
   if (usedFallback) logWarn(SCOPE, "线下这轮走的是副 API");

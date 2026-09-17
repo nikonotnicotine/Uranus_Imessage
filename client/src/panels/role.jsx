@@ -3239,7 +3239,7 @@ function AvatarField({ label, hint, file, fallback, onChange }) {
  *
  * 这里那个 `enabled` 是**允许闸**，不是「现在开着吗」：真正的开关状态在
  * `data/offline/index/<roleKey>.json` 里（每轮都写，不能进配置 —— `PUT /api/config`
- * 会顺带重启所有 iMessage 桥接）。所以这一栏配完还要去「对话框」分区、或者在
+ * 会顺带重启所有 iMessage 桥接）。所以这一栏配完还要去「线下模式」分区、或者在
  * iMessage 里发 `/开启线下` 才真的开始演。这层区分写在开关底下。
  *
  * 三个默认值是用户钉死的：小总结 6 轮、大总结默认关、大总结攒 8 个小总结。
@@ -3289,7 +3289,7 @@ export function RoleOfflineFields({ role, onGoto }) {
               onClick={() => onGoto?.("offline")}
               className="link-slide mx-1 text-ink"
             >
-              「对话框」
+              「线下模式」分区
             </button>
             点开，或者在 iMessage 里发{" "}
             <code className="font-mono text-ink-soft">/开启线下</code>
@@ -3439,7 +3439,7 @@ export function RoleOfflineFields({ role, onGoto }) {
               <p className="text-ui text-ink">总结</p>
               <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
                 剧情会演得很长，全塞进上下文迟早爆。攒够几轮就出一份小总结，小总结
-                攒够几份再出一份大的。内容在「对话框」面板里看得到，
+                攒够几份再出一份大的。内容在「线下模式」分区里看得到，
                 <strong className="text-ink-soft">可以自由改</strong>
                 。点「结束当前线下模式」的时候，注进记忆库待总结的
                 <strong className="text-ink-soft">只有这些总结</strong>
@@ -3600,14 +3600,14 @@ export function RoleOfflineFields({ role, onGoto }) {
               </button>
               里配。这条开关不看「发语音」开着没有 —— 演剧情时不发
               <code className="mx-1 bg-sunken px-1">[audio_message:…]</code>
-              ，念的是对话框里「」那几句。
+              ，念的是剧情里「」那几句。
             </p>
           </div>
 
           {/* 两张头像 */}
           <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
             <div>
-              <p className="text-ui text-ink">对话框里的头像</p>
+              <p className="text-ui text-ink">剧情里的头像</p>
               <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
                 角色的气泡在左、你的在右，头像画在各自那一侧。不挑就显示名字的
                 首字母。图片存在数据目录的 <span className="font-mono">offline/media/</span> 里，

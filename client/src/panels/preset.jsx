@@ -98,7 +98,7 @@ export function PresetPanel({ onGoto }) {
             </p>
             <p className="text-meta leading-relaxed text-ink-faint">
               每份预设分线上和线下两种，在它的「基本信息」里切。线上给 iMessage
-              聊天用，线下给「对话框」里演剧情用 —— 角色两边各选一份，两批不串。
+              聊天用，线下给「线下模式」里演剧情用 —— 角色两边各选一份，两批不串。
             </p>
           </div>
         ) : (
@@ -158,7 +158,7 @@ export function PresetDetail({ preset, onBack, onGoto }) {
            */}
           <Field
             label="用在哪种玩法"
-            hint="线上 = iMessage 上发消息；线下 = 「对话框」里演剧情。同一份预设只能属于一边"
+            hint="线上 = iMessage 上发消息；线下 = 「线下模式」里演剧情。同一份预设只能属于一边"
           >
             <div className="flex flex-wrap gap-2">
               {PRESET_MODES.map((m) => (
@@ -631,7 +631,7 @@ export function PresetEntryEditor({ preset, entry, onGoto }) {
       </div>
       <Field
         label="内容"
-        hint="支持 {{char}} / {{user}} / {{sep}}"
+        hint="支持 {{char}} / {{user}} / {{sep}} / {{lastUserMessage}}（用户最后说的那句，没说过就整条不发）"
       >
         <textarea
           className={`${inputCls} min-h-[140px] resize-y leading-relaxed`}
@@ -646,6 +646,34 @@ export function PresetEntryEditor({ preset, entry, onGoto }) {
 
 /** 试跑用的默认样本：正好是最想过滤掉的那种回复。 */
 export const REGEX_SAMPLE = "好的<thinking>我该怎么回答</thinking>今天天气不错";
+
+/**
+ * 把替换模板里的 `$` 占位展开成这一处匹配的实际内容。
+ *
+ * **服务端 `server/src/regex.js:expandMatch` 的镜像，改那边记得改这边。**
+ * 只认 `$$` / `$&` / `$1`..`$99` / `$<name>`；`` $` `` 和 `$'` 这两个 JS 原生的
+ * 魔法不认（那边的注释里有为什么：替换值里一行 `startsWith('$')` 就能把正文
+ * 复制四份），其余带 `$` 的写法一律原样留着。
+ */
+function expandMatch(tpl, args) {
+  const groups = typeof args.at(-1) === "object" && args.at(-1) !== null ? args.at(-1) : null;
+  const caps = args.slice(1, groups ? args.length - 3 : args.length - 2);
+
+  return tpl.replace(/\$(\$|&|<([^>]*)>|\d{1,2})/g, (whole, what, name) => {
+    if (what === "$") return "$";
+    if (what === "&") return args[0];
+    if (name !== undefined) return groups?.[name] ?? whole;
+
+    const n = Number(what);
+    if (what.length === 2 && (n === 0 || n > caps.length)) {
+      const one = Number(what[0]);
+      if (one >= 1 && one <= caps.length) return (caps[one - 1] ?? "") + what[1];
+      return whole;
+    }
+    if (n < 1 || n > caps.length) return whole;
+    return caps[n - 1] ?? "";
+  });
+}
 
 /**
  * 拿一条规则跑一遍测试文本。
@@ -666,6 +694,7 @@ export function tryRegex(rule, text) {
      * 和服务端 regex.js:replacementFor 一个规矩：
      *  - 删除类一律换成空串，不看替换词
      *  - 替换类有多个候选时，每处匹配随机挑一个
+     *  - 替换词里的 $ 占位自己展开（expandMatch）
      *
      * 试跑**只挑一次**：真跑起来每一处匹配各挑各的，而这里要的是「这条规则长
      * 什么样」。每次改一个字就重跑一遍、每次都换一个说法，反而看不清效果。
@@ -675,12 +704,10 @@ export function tryRegex(rule, text) {
       out = text.replace(re, "");
     } else {
       const alts = regexAlternatives(rule);
-      if (alts.length > 1) {
-        const pick = alts[Math.floor(Math.random() * alts.length)];
-        out = text.replace(re, () => pick);
-      } else {
-        out = text.replace(re, rule.replace ?? "");
-      }
+      const tpl = alts.length
+        ? alts[Math.floor(Math.random() * alts.length)]
+        : (rule.replace ?? "");
+      out = text.replace(re, (...args) => expandMatch(tpl, args));
     }
     return { ok: true, out, untouched: out === text };
   } catch (e) {

@@ -194,7 +194,7 @@ export const NAV = [
   },
   {
     id: "offline",
-    label: "对话框",
+    label: "线下模式",
     icon: MessagesSquare,
     itemIcon: Users,
     group: "角色",
@@ -204,7 +204,7 @@ export const NAV = [
      * 都会把所有 iMessage 号码重启一次。所以由 OfflinePanel 上报（`live: true`）。
      */
     live: true,
-    desc: "线下剧情：坐下来演一段，不是发短信。开着的时候这个角色的线上功能全部停用（主动消息、消息格式与功能都不生效）。开关和总结节奏在「角色 → 线下模式」，这里是剧情本身。",
+    desc: "坐下来演一段，不是发短信。开关和总结节奏在「角色 → 线下模式」。",
     empty: "还没有角色。线下剧情是按角色分的，先去「角色」里建一个。",
   },
   {

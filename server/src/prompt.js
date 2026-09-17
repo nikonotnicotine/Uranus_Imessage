@@ -712,6 +712,16 @@ export async function buildPrompt(config, role, user, history, weatherNote = "",
     applyVars(weatherNote, { char: vars.char, user: vars.user })
   );
 
+  /*
+   * {{lastUserMessage}}：用户在上文里说的最后一句，补在 vars 上（fill 闭包读的是
+   * 同一个对象，补在这里对后面每一条都生效）。取的是 sent 而不是 hist —— 正则滤掉的
+   * 部分模型本来就看不见，复述一遍等于把它捅回去。
+   *
+   * 没有（第一轮、或者主动消息那种轮到模型先开口的场合）就是空串，引用它的条目
+   * 整条不产出（mergeAdjacent 会把空内容跳过）。
+   */
+  vars.lastusermessage = [...sent].reverse().find((m) => m.role === "user")?.content ?? "";
+
   // 世界书：只有 world 条目开着才扫。
   // 关掉 = 整个步骤跳过（含 depth 条目）—— 一句话能说清的规则比
   // 「关了一半还生效」好调试。

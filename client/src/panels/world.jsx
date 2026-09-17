@@ -5,6 +5,7 @@ import {
   POSITIONS,
   POSITION_LABELS,
   worldBookBlockReason,
+  worldBookUsageText,
   worldEntryBlockReason,
   worldEntryLabel,
   worldEntryTriggerText,
@@ -72,6 +73,9 @@ export function WorldBookDetail({ book, onBack, onGoto }) {
   const [editId, setEditId] = useState("");
   const entries = book.entries ?? [];
   const blocked = worldBookBlockReason(config, book);
+  // 生效时把「谁在用它」摊开写。线上和线下是两份独立的书单，不写清楚的话
+  // 用户只能看到「生效了」，看不出自己勾的到底是哪一边
+  const usage = blocked ? "" : worldBookUsageText(config, book);
 
   function drop() {
     removeWorldBook(book.id);
@@ -169,6 +173,12 @@ export function WorldBookDetail({ book, onBack, onGoto }) {
                   去「角色」面板
                 </button>
               )}
+            </p>
+          )}
+
+          {usage && (
+            <p className="border-l-2 border-line py-1.5 pl-3 text-meta leading-relaxed text-ink-faint">
+              {usage}
             </p>
           )}
 

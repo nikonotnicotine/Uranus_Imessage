@@ -24,7 +24,7 @@ export const FIXED_KINDS = ["char", "user", "world", "format", "context", "memor
  * 一份预设是给哪种玩法用的。
  *
  * `online`  iMessage 上的即时通讯（角色扮演聊天）
- * `offline` 线下剧情（网页上的对话框，仿酒馆那种坐下来演一段）
+ * `offline` 线下剧情（网页上的「线下模式」分区，仿酒馆那种坐下来演一段）
  *
  * 缺字段算 `online` —— 这一版之前所有预设都是线上的，老配置原样升级。
  * 两种玩法的要求是互斥的（线下不发气泡、不用消息格式与功能、不发主动消息），

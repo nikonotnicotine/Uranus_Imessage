@@ -439,17 +439,22 @@ export function ContextPanel({ onGoto }) {
 }
 
 /**
- * 「原始提示词」面板：最后一次发给模型的那份完整消息数组。
+ * 拉「最后一次发给模型的提示词」那份快照。
  *
- * 后端只在内存里留一份（每轮覆盖），所以这里没有历史可翻 ——
- * 界面上要把这点写明白，否则用户会以为翻得到上一轮。
+ * 抽成 hook 是因为它有两个出口：这一页底下的 `Fold`，和「线下模式」分区顶上
+ * 那个弹窗 —— 线下剧情比线上更需要看这份（预设更长、世界书更多），而
+ * 后端本来就把线下那条链也记进同一个槽（`server/src/offline.js` 里调的
+ * `notePrompt`，角色名缀了「（线下）」好认）。
+ *
+ * 两处要的数据一模一样，只是外壳不同：`Fold` 的 badge 还要拿字数，所以
+ * 数据留在外面、正文交给 `LastPromptBody`。
  */
-export function LastPromptFold() {
+export function useLastPrompt() {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const load = useCallback(async () => {
+  const reload = useCallback(async () => {
     setLoading(true);
     try {
       const r = await api("/api/prompt/last");
@@ -463,9 +468,21 @@ export function LastPromptFold() {
   }, []);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    reload();
+  }, [reload]);
 
+  return { data, error, loading, reload };
+}
+
+/**
+ * 那份提示词的正文：元信息表 + 每一段 + 整份复制。
+ *
+ * 后端只在内存里留一份（每轮覆盖），所以这里没有历史可翻 ——
+ * 界面上要把这点写明白，否则用户会以为翻得到上一轮。
+ *
+ * `empty` 由调用方给：这一页说「发一条 iMessage」，线下那边说「演一轮」。
+ */
+export function LastPromptBody({ data, error, loading, reload, empty }) {
   const full = useMemo(() => {
     if (!data?.messages?.length) return "";
     return data.messages
@@ -474,80 +491,87 @@ export function LastPromptFold() {
   }, [data]);
 
   return (
+    <div className="grid grid-cols-1 gap-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="outline" onClick={reload} disabled={loading}>
+          <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> 刷新
+        </Button>
+        <p className="text-meta text-ink-faint">
+          只留最后一次，发新消息会覆盖，服务重启就没了。
+        </p>
+      </div>
+
+      {error && (
+        <p className="border-l-2 border-warn py-1.5 pl-3 text-meta leading-relaxed text-warn">
+          {error}
+        </p>
+      )}
+
+      {!error && !data && <p className="py-8 text-center text-ui text-ink-faint">{empty}</p>}
+
+      {data && (
+        <>
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 border-l-2 border-line py-1.5 pl-3 text-meta sm:grid-cols-3">
+            {[
+              ["时间", data.at ? fmtStamp(data.at) : "—"],
+              ["角色", data.roleName || "—"],
+              ["用户人设", data.userName || "（没有生效的）"],
+              ["模型", data.model || "—"],
+              ["预设", data.presetName || "—"],
+              ["会话", data.sessionId || "—"],
+              ["消息数", `${data.messages?.length ?? 0} 条 · ${data.chars ?? 0} 字`],
+              [
+                "命中的世界书条目",
+                data.worldHits?.length ? data.worldHits.join("、") : "（这轮没有触发）",
+              ],
+            ].map(([k, v]) => (
+              <div key={k} className="min-w-0">
+                <dt className="text-ink-faint">{k}</dt>
+                <dd className="truncate text-ink-soft" title={String(v)}>
+                  {v}
+                </dd>
+              </div>
+            ))}
+          </dl>
+
+          <div className="grid grid-cols-1 gap-2">
+            {(data.messages ?? []).map((m, i) => (
+              <div
+                key={i}
+                className="flex items-start gap-3 border border-line bg-paper px-3.5 py-3"
+              >
+                <div className="shrink-0">
+                  <RoleBadge role={m.role} />
+                </div>
+                <p className="min-w-0 flex-1 whitespace-pre-wrap break-words text-meta leading-relaxed text-ink-soft">
+                  {m.content}
+                </p>
+              </div>
+            ))}
+          </div>
+
+          <Field label="整份复制" hint="拼成一段纯文本，方便贴到别处对比">
+            <CodeBlock code={full} />
+          </Field>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 「原始提示词」面板：最后一次发给模型的那份完整消息数组。 */
+export function LastPromptFold() {
+  const state = useLastPrompt();
+  return (
     <Fold
       title="原始提示词（最后一次发送）"
       desc="变量替换、人设拼接、上下文截断之后，真正打给模型的那份"
-      badge={data ? `${data.chars ?? 0} 字` : "空"}
+      badge={state.data ? `${state.data.chars ?? 0} 字` : "空"}
     >
-      <div className="grid grid-cols-1 gap-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" onClick={load} disabled={loading}>
-            <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> 刷新
-          </Button>
-          <p className="text-meta text-ink-faint">
-            只留最后一次，发新消息会覆盖，服务重启就没了。
-          </p>
-        </div>
-
-        {error && (
-          <p className="border-l-2 border-warn py-1.5 pl-3 text-meta leading-relaxed text-warn">
-            {error}
-          </p>
-        )}
-
-        {!error && !data && (
-          <p className="py-8 text-center text-ui text-ink-faint">
-            还没有记录 —— 发一条 iMessage 之后回来刷新就能看到。
-          </p>
-        )}
-
-        {data && (
-          <>
-            <dl className="grid grid-cols-2 gap-x-4 gap-y-2 border-l-2 border-line py-1.5 pl-3 text-meta sm:grid-cols-3">
-              {[
-                ["时间", data.at ? fmtStamp(data.at) : "—"],
-                ["角色", data.roleName || "—"],
-                ["用户人设", data.userName || "（没有生效的）"],
-                ["模型", data.model || "—"],
-                ["预设", data.presetName || "—"],
-                ["会话", data.sessionId || "—"],
-                ["消息数", `${data.messages?.length ?? 0} 条 · ${data.chars ?? 0} 字`],
-                [
-                  "命中的世界书条目",
-                  data.worldHits?.length ? data.worldHits.join("、") : "（这轮没有触发）",
-                ],
-              ].map(([k, v]) => (
-                <div key={k} className="min-w-0">
-                  <dt className="text-ink-faint">{k}</dt>
-                  <dd className="truncate text-ink-soft" title={String(v)}>
-                    {v}
-                  </dd>
-                </div>
-              ))}
-            </dl>
-
-            <div className="grid grid-cols-1 gap-2">
-              {(data.messages ?? []).map((m, i) => (
-                <div
-                  key={i}
-                  className="flex items-start gap-3 border border-line bg-paper px-3.5 py-3"
-                >
-                  <div className="shrink-0">
-                    <RoleBadge role={m.role} />
-                  </div>
-                  <p className="min-w-0 flex-1 whitespace-pre-wrap break-words text-meta leading-relaxed text-ink-soft">
-                    {m.content}
-                  </p>
-                </div>
-              ))}
-            </div>
-
-            <Field label="整份复制" hint="拼成一段纯文本，方便贴到别处对比">
-              <CodeBlock code={full} />
-            </Field>
-          </>
-        )}
-      </div>
+      <LastPromptBody
+        {...state}
+        empty="还没有记录 —— 发一条 iMessage 之后回来刷新就能看到。"
+      />
     </Fold>
   );
 }

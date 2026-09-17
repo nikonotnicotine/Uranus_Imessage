@@ -2655,7 +2655,7 @@ app.post("/api/embedding/test", async (req, res) => {
   }
 });
 
-// ---- 线下模式（「对话框」分区）----
+// ---- 线下模式（网页上的「线下模式」分区）----
 
 /**
  * 这一段的 `:roleKey` 和记忆库那边是**同一个 key**（`memoryKeyFor` 算出来的），
@@ -2870,6 +2870,29 @@ app.delete("/api/offline/:roleKey/story/:storyId", (req, res) => {
 });
 
 /**
+ * 正在生成的那些轮，key = roleKey。
+ *
+ * 一个角色同一时刻只该有一轮在跑（界面上 busy 的时候发送键是禁着的），所以
+ * 一个 key 存一个 controller 就够用。`/abort` 按 roleKey 把它找出来、掐掉
+ * 上游那个 fetch。真要是手机和网页同时发，后来那轮会顶掉前一个 —— 按停停的
+ * 是最新那轮，那也正是按的人想停的那一轮。
+ */
+const offlineAborts = new Map();
+
+/** 起一轮：登记 controller，回一个 signal 和「跑完撤掉」的收尾函数。 */
+function trackOfflineRun(roleKey) {
+  const ctrl = new AbortController();
+  offlineAborts.set(roleKey, ctrl);
+  return {
+    signal: ctrl.signal,
+    // 按引用比对：这轮跑完的时候 map 里可能已经换成别人刚放进去的那个了
+    done: () => {
+      if (offlineAborts.get(roleKey) === ctrl) offlineAborts.delete(roleKey);
+    },
+  };
+}
+
+/**
  * 演一轮。
  *
  * 打模型，几十秒，前端要长超时。业务上的失败（没配模型、没在演的剧情、
@@ -2877,6 +2900,9 @@ app.delete("/api/offline/:roleKey/story/:storyId", (req, res) => {
  * `/api/memories/:key/generate/:kind` 的分法，4xx 留给「请求本身不对」。
  * 失败时也回一份 state：用户那句已经落盘了，界面得立刻显示出来，
  * 这样点一下「重 roll」就能重来，不用重打一遍。
+ *
+ * 用户按「停下」走的是 `/abort`，中止落在这儿的 catch 里 —— 和别的失败一个
+ * 形状（200 + `ok:false` + 一句「被你按停了」+ 一份 state）。
  */
 app.post("/api/offline/:roleKey/turn", async (req, res) => {
   const ctx = offlineCtx(req, res);
@@ -2884,11 +2910,13 @@ app.post("/api/offline/:roleKey/turn", async (req, res) => {
   const storyId = storyIdFrom(req, ctx.roleKey);
   if (!storyId) return res.status(400).json({ ok: false, error: "现在没有在演的剧情" });
 
+  const run = trackOfflineRun(ctx.roleKey);
   try {
     const out = await runOfflineTurn(ctx.config, ctx.role, resolveUser(ctx.config, ctx.role), {
       text: String(req.body?.text ?? ""),
       choiceIndex: Number(req.body?.choiceIndex) || 0,
       storyId,
+      signal: run.signal,
     });
     res.json({
       ok: true,
@@ -2898,22 +2926,27 @@ app.post("/api/offline/:roleKey/turn", async (req, res) => {
     });
   } catch (e) {
     const error = String(e?.message ?? e);
-    logWarn("线下模式", `「${ctx.role.name}」这轮没成：${error}`);
+    // 按停是用户自己的操作，offline.js 那边已经记过一行了，这里不再报警
+    if (!e?.aborted) logWarn("线下模式", `「${ctx.role.name}」这轮没成：${error}`);
     res.json({ ok: false, error, ...offlineState(ctx.config, ctx.role, ctx.roleKey) });
+  } finally {
+    run.done();
   }
 });
 
-/** 重 roll：删掉末尾的助手轮次，按同一份上文再生成一次。 */
+/** 重 roll：删掉末尾的助手轮次，按同一份上文再生成一次。也能按停。 */
 app.post("/api/offline/:roleKey/reroll", async (req, res) => {
   const ctx = offlineCtx(req, res);
   if (!ctx) return;
   const storyId = storyIdFrom(req, ctx.roleKey);
   if (!storyId) return res.status(400).json({ ok: false, error: "现在没有在演的剧情" });
 
+  const run = trackOfflineRun(ctx.roleKey);
   try {
     const out = await runOfflineTurn(ctx.config, ctx.role, resolveUser(ctx.config, ctx.role), {
       storyId,
       reroll: true,
+      signal: run.signal,
     });
     res.json({
       ok: true,
@@ -2922,9 +2955,37 @@ app.post("/api/offline/:roleKey/reroll", async (req, res) => {
     });
   } catch (e) {
     const error = String(e?.message ?? e);
-    logWarn("线下模式", `「${ctx.role.name}」重 roll 没成：${error}`);
+    if (!e?.aborted) logWarn("线下模式", `「${ctx.role.name}」重 roll 没成：${error}`);
     res.json({ ok: false, error, ...offlineState(ctx.config, ctx.role, ctx.roleKey) });
+  } finally {
+    run.done();
   }
+});
+
+/**
+ * 按停正在跑的这一轮。
+ *
+ * 真中止：掐的是上游那个 fetch，不是前端假装放弃等它自己跑完。中止之后
+ * `/turn` 那边会回一句「被你按停了」，而**用户那句早就落盘了**，所以点一下
+ * 「再来一次」就是按同一份上文重来。
+ *
+ * 没有在跑的时候回 200 + `ok:false` —— 用户手快点两下不该看见一个 500。
+ */
+app.post("/api/offline/:roleKey/abort", (req, res) => {
+  const ctx = offlineCtx(req, res);
+  if (!ctx) return;
+
+  const ctrl = offlineAborts.get(ctx.roleKey);
+  if (!ctrl) {
+    return res.json({
+      ok: false,
+      error: "这个角色现在没有在生成",
+      ...offlineState(ctx.config, ctx.role, ctx.roleKey),
+    });
+  }
+  ctrl.abort();
+  logInfo("线下模式", `「${ctx.role.name}」这轮被按停了`);
+  res.json({ ok: true, ...offlineState(ctx.config, ctx.role, ctx.roleKey) });
 });
 
 /** 编辑正文 / 切「隐藏回复」。隐藏的那些不进下一轮的上下文。 */

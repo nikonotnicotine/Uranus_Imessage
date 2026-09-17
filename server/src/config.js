@@ -223,23 +223,33 @@ export const MODEL_CATEGORIES = ["chat", "vision", "image", "embedding", "audio"
  *  {{char}}     → 当前会话的角色名（roles[].name）
  *  {{user}}     → 生效的用户人设名（users[].name）
  *  {{sep}}      → 气泡分隔符（chat.separator）
+ *  {{lastUserMessage}} → 上文里用户最后说的那一句
  *
  * 角色人设、用户人设两边都会替换，所以两个变量互相引用也没问题。
  * 预设的条目内容、正则的替换串里也能用。
  *
+ * {{lastUserMessage}} 只有 prompt.js:buildPrompt 那一路填得出来（要先有上文），
+ * 别处调 applyVars 拿不到值 —— 拿不到就换成空串。它的用法是在预设最末尾单开一条
+ * `role: user` 的条目把用户那句话再说一遍，好让模型回复的直接对象是它，而不是
+ * 中间那几千字系统指令。
+ *
  * 变量替换。留空的变量用兜底词，不把 {{char}} 原样发给模型。
- * {{sep}} 没有兜底词 —— 分隔符本来就可能是空的，硬塞一个词会让格式提示词说谎。
+ * {{sep}} 和 {{lastUserMessage}} 没有兜底词 —— 分隔符本来就可能是空的、用户也可能
+ * 一句话都还没说，硬塞一个词会让提示词说谎。
  */
 export const VAR_FALLBACK = { char: "助手", user: "用户" };
+
+/** 拿不到值就换成空串的变量（其余的用 VAR_FALLBACK 兜底） */
+const VAR_NO_FALLBACK = new Set(["sep", "lastusermessage"]);
 
 export function applyVars(text, vars) {
   if (!text) return "";
   return String(text).replace(
-    /\{\{\s*(char|user|sep)\s*\}\}/gi,
+    /\{\{\s*(lastUserMessage|char|user|sep)\s*\}\}/gi,
     (_m, name) => {
       const key = name.toLowerCase();
       const value = String(vars?.[key] ?? "").trim();
-      if (key === "sep") return value;
+      if (VAR_NO_FALLBACK.has(key)) return value;
       return value || VAR_FALLBACK[key];
     }
   );
@@ -1209,7 +1219,7 @@ function normalizeOffline(input) {
     // 用户选项：默认关。真正的注入靠线下预设里那条 userChoice 条目，
     // 这里是角色这一侧的闸 —— 同一份线下预设给两个角色用，一个要选项一个不要
     userChoice: Boolean(input?.userChoice),
-    // 对话框里的两张头像。文件名，不是图片内容
+    // 线下剧情里的两张头像。文件名，不是图片内容
     avatar: str(input?.avatar),
     userAvatar: str(input?.userAvatar),
     // 线下语音自动朗读：每轮生成完后自动念所有「」台词

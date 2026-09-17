@@ -203,6 +203,17 @@ check("纯私聊不认", tags.hasIgTag("今天去哪吃饭"), false);
 check("私聊里的语音标签不认", tags.hasIgTag("[audio_message:喂]"), false);
 check("thinking 里复述格式不算", tags.hasIgTag("<thinking>格式是 [post:文案]</thinking>好的"), false);
 
+// 标签名不分大小写，和 media.js 一个口径（内置预设写的就是大写的 [Image:]）
+check("[Image:] 认得", tags.hasImageTag("[Image:一只猫]"), true);
+check("[Post:] 认得", tags.hasIgPublishTag("[Post:今天真好]"), true);
+{
+  const r = tags.splitIg("[Post:下班了][Image:橘色的天]", "$");
+  check("大写 [Post:] 归成帖子", r.posts.length, 1);
+  check("大写 [Image:] 归给它", r.posts[0].images, [{ alt: "橘色的天" }]);
+  check("裸的 [Story] 还是快拍、不是帖子", tags.splitIg("[Story]", "$").stories.length, 1);
+  check("裸的 [Story] 没被当成帖子", tags.splitIg("[Story]", "$").posts.length, 0);
+}
+
 console.log("\n=== 14. 标签解析：post / story / image 归属 ===");
 {
   const r = tags.splitIg("[post:刚去吃了火锅][image:一桌火锅]", "$");

@@ -552,16 +552,65 @@ export function worldBooksFor(config, role) {
   return books.filter((b) => b?.enabled && (b.global || refs.has(b.id)));
 }
 
+/**
+ * 谁在用这本书。**三路各存各的字段，一路都不能漏。**
+ *
+ *  - 线上：`role.worldBookRefs`
+ *  - 线下：`role.offline.worldBookRefs` —— 剧情走的是**另一份书单**
+ *    （server/src/prompt.js:743 换掉的就是这个字段），线上勾了线下不算数，
+ *    反过来也一样
+ *  - 日记：`memories.diary.worldBookRefs`，**只在「不跟角色走」时才数**
+ *    （`useRoleWorldBooks === false`，见 server/src/memory.js:698）。跟角色走的
+ *    时候日记用的就是角色那两路，在这儿再数一遍等于把同一件事算两遍
+ *
+ * 这个函数存在的理由就是「别只查线上那一路」：以前 worldBookBlockReason 只扫
+ * `role.worldBookRefs`，于是一本只挂在线下（或只给日记挑的）书会被一直判成
+ * 「还没有角色用它」—— 明明在剧情里生效着。预设那边踩过同一个坑并修掉了
+ * （见 panels/preset.jsx:130 的注释），世界书这边当时没跟上。
+ *
+ * global 的书对谁都生效、压根不用挂，所以调用方只在非 global 时才问它。
+ */
+export function worldBookUsage(config, bookId) {
+  const roles = config?.roles ?? [];
+  const has = (refs) => (Array.isArray(refs) ? refs : []).includes(bookId);
+  const diary = config?.memories?.diary ?? {};
+  return {
+    online: roles.filter((r) => has(r?.worldBookRefs)),
+    offline: roles.filter((r) => has(r?.offline?.worldBookRefs)),
+    diary: diary.useRoleWorldBooks === false && has(diary.worldBookRefs),
+  };
+}
+
 /** 这本书为什么没生效（生效就返回 null）。 */
 export function worldBookBlockReason(config, book) {
   if (!book?.enabled) return "这本世界书被关掉了，谁都不会用它";
   if (!(book.entries ?? []).length) return "还没有任何条目，等于没生效";
   if (!(book.entries ?? []).some((e) => e.enabled)) return "所有条目都被关掉了";
   if (!book.global) {
-    const used = (config?.roles ?? []).some((r) => (r.worldBookRefs ?? []).includes(book.id));
-    if (!used) return "还没有角色用它（去角色的「单独配置」里挂上，或打开「全局」）";
+    // 三路里有任意一路挂着就算生效 —— 只查线上那一路是这条提示以前的老毛病
+    const use = worldBookUsage(config, book.id);
+    if (!use.online.length && !use.offline.length && !use.diary) {
+      return "还没有角色用它（去角色的「单独配置」或「线下模式」里挂上，或打开「全局」）";
+    }
   }
   return null;
+}
+
+/**
+ * 「谁在用它」说成一句话，没人用返回空串。
+ *
+ * 判断和上面同一个来源，所以不会出现「提示说没人用、这句又列出几个角色」。
+ * 分开写线上 / 线下是因为两者是两份独立的书单，用户最需要看清的恰恰是
+ * 「我勾的是哪一边」—— 在 VPS 上远程改配置时尤其如此。
+ */
+export function worldBookUsageText(config, book) {
+  if (book?.global) return "全局生效：所有角色都在用它。";
+  const use = worldBookUsage(config, book?.id);
+  const parts = [];
+  if (use.online.length) parts.push(`线上：${use.online.map(roleLabel).join("、")}`);
+  if (use.offline.length) parts.push(`线下：${use.offline.map(roleLabel).join("、")}`);
+  if (use.diary) parts.push("日记（在记忆库里单独挑的）");
+  return parts.length ? `在用它的：${parts.join("；")}。` : "";
 }
 
 /** 这个条目为什么不会被触发（会触发就返回 null）。 */

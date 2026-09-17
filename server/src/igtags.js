@@ -38,6 +38,10 @@ import { xmlBlockRanges } from "./websearch.js";
  *
  * post/story 各自最多认到 2000 字（配文可以很长），image 描述同样 2000，
  * comment 300 —— IG 的评论上限本来就短，给模型一个隐含的长度上限也好。
+ *
+ * 标签名**不分大小写**（`gi`），和 media.js:MEDIA_TAG 一个口径：内置预设里
+ * 写的就是大写开头的 `[Image:…]`，两边认的必须是同一套，否则同一条输出在
+ * 私聊里能出图、在 IG 那条路上却认不出来。
  */
 const POST_PART = "[[［]\\s*(?:post|帖子|发帖)\\s*[:：]\\s*(?<post>[^\\]］]{0,2000}?)\\s*[\\]］]";
 const STORY_PART =
@@ -51,7 +55,7 @@ const BARE_PART = "[[［]\\s*(?<bare>post|story|帖子|快拍)\\s*[\\]］]";
 
 const IG_TAG = new RegExp(
   [POST_PART, STORY_PART, IMAGE_PART, COMMENT_PART, BARE_PART].join("|"),
-  "g"
+  "gi"
 );
 
 /**
@@ -65,7 +69,7 @@ const IG_TAG = new RegExp(
  * 所以路由判据用这个：只有明确写了 post / story / comment 才算「这是 IG 的事」。
  * 光一个 `[image:]` 的归属交给 igrun.js:igRouteFor 按角色的生图开关决定。
  */
-const IG_PUBLISH_TAG = new RegExp([POST_PART, STORY_PART, COMMENT_PART, BARE_PART].join("|"), "g");
+const IG_PUBLISH_TAG = new RegExp([POST_PART, STORY_PART, COMMENT_PART, BARE_PART].join("|"), "gi");
 
 /** 这段文字里，`re` 在 xml 块之外命中过没有。 */
 function matchesOutsideXml(text, re) {
@@ -90,7 +94,7 @@ export function hasIgPublishTag(text) {
 
 /** 有没有 `[image:]`。和上面那个搭着用，判断「只有图、没别的」。 */
 export function hasImageTag(text) {
-  return matchesOutsideXml(text, new RegExp(IMAGE_PART, "g"));
+  return matchesOutsideXml(text, new RegExp(IMAGE_PART, "gi"));
 }
 
 /**
@@ -155,8 +159,9 @@ export function splitIg(text, sep) {
     const g = m.groups ?? {};
 
     if (g.post !== undefined || g.story !== undefined || g.bare !== undefined) {
+      // 标签名认大小写，所以这儿抠出来的可能是 `Story`，判断也得跟着不分大小写
       const isStory =
-        g.story !== undefined || (g.bare !== undefined && /story|快拍/.test(g.bare));
+        g.story !== undefined || (g.bare !== undefined && /story|快拍/i.test(g.bare));
       const body = g.post ?? g.story ?? "";
       current = { caption: commaSeparators(body, sep), images: [] };
       (isStory ? stories : posts).push(current);

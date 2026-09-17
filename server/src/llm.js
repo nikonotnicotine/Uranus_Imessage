@@ -95,6 +95,21 @@ function isTransient(status, error) {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 「用户自己按停的」这一句。
+ *
+ * 单独拎出来是因为它要被三处认出来：`chatWithFallback` 靠 `err.aborted` 决定
+ * **不换线**（按停了就是按停了，不是主 API 坏了）、路由靠它把这轮记成「用户
+ * 取消」而不是故障、前端靠「按停」这两个字在错误条旁边挂一个「再来一次」。
+ */
+export const ABORTED_MESSAGE = "这次生成被你按停了";
+
+function abortedError() {
+  const err = new Error(ABORTED_MESSAGE);
+  err.aborted = true;
+  return err;
+}
+
 /** 去掉末尾斜杠，避免拼出 //chat/completions。 */
 function trimBase(url) {
   return String(url ?? "").trim().replace(/\/+$/, "");
@@ -276,12 +291,17 @@ function describeNetworkError(e) {
  * `x-goog-api-key` 而不是 `Authorization`，见 transcribeAudio）。给了它就
  * 完全接管鉴权头，`key` 不再自动拼成 Bearer。
  *
+ * `signal` 是「用户按停」那条路（线下模式的「停下」按钮）。它和超时那个
+ * 信号用 `AbortSignal.any` 并起来 —— 谁先响都算，fetch 当场断开，不是等它
+ * 跑完再把结果丢掉。
+ *
  * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
  */
 async function requestJson(
   url,
-  { method = "POST", key, body, timeout = REQUEST_TIMEOUT, headers }
+  { method = "POST", key, body, timeout = REQUEST_TIMEOUT, headers, signal }
 ) {
+  const timer = AbortSignal.timeout(timeout);
   const res = await fetch(url, {
     method,
     headers: headers ?? {
@@ -289,7 +309,7 @@ async function requestJson(
       ...(key ? { Authorization: `Bearer ${key}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeout),
+    signal: signal ? AbortSignal.any([timer, signal]) : timer,
     // 模型 API 那一类**默认不走代理**：中转站在国内直连本来就通，套上代理多半
     // 更慢，还可能因为落地 IP 变了被风控。要走的话在控制台的「代理」那节勾上
     ...(await proxyFor("llm")),
@@ -318,8 +338,9 @@ async function requestJson(
  *        走 opts.params（来自预设）
  * @param {Array} messages OpenAI 格式的消息数组
  * @param {{label?:string, timeout?:number, maxTokens?:number, retries?:number,
- *          params?:object}} [opts] label 只用于日志；params 见 preset.js 的
- *        DEFAULT_PARAMS（温度 / Top P / 最大token / 频率惩罚 / 存在惩罚）
+ *          params?:object, signal?:AbortSignal}} [opts] label 只用于日志；
+ *        params 见 preset.js 的 DEFAULT_PARAMS（温度 / Top P / 最大token /
+ *        频率惩罚 / 存在惩罚）；signal 是「用户按停」，命中就抛 ABORTED_MESSAGE
  */
 export async function chatCompletion(endpoint, messages, opts = {}) {
   const label = opts.label ?? "API";
@@ -370,14 +391,25 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
    */
   let attempt = 0;
   for (;;) {
+    // 每圈开头看一眼：等重试的那几秒里用户可能已经按停了
+    if (opts.signal?.aborted) throw abortedError();
     const retryIn = delays[attempt];
     try {
       result = await requestJson(`${base}/chat/completions`, {
         key,
         body,
         timeout: opts.timeout ?? REQUEST_TIMEOUT,
+        signal: opts.signal,
       });
     } catch (e) {
+      /*
+       * 按停要在 isTransient 之前判掉。
+       *
+       * 被 abort 掐断的 fetch 抛的是 AbortError，而 isTransient 把 AbortError
+       * 当「网络抖动」—— 不先拦这一下，用户按一次停会换来「第 1 次请求失败，
+       * 800ms 后重试」三轮，然后还要再去打一遍副 API。
+       */
+      if (opts.signal?.aborted) throw abortedError();
       const why = describeNetworkError(e);
       if (retryIn !== undefined && isTransient(null, e)) {
         logWarn(label, `第 ${attempt + 1} 次请求失败，${retryIn}ms 后重试`, why);
@@ -445,10 +477,12 @@ function endpointUsable(ep) {
  * @param {object|null} primary 聊天模型的 endpoint
  * @param {object|null} fallback 副 API 的 endpoint，没有就传 null
  * @param {object} [params] 预设里的生成参数。主副共用同一份 —— 一个角色一份预设
+ * @param {{signal?:AbortSignal}} [opts] 用户按停用的信号。按停**不换线** ——
+ *        那不是主 API 坏了
  * @returns {Promise<{content: string, usedFallback: boolean}>}
  * @throws {Error} 两条线都失败时抛出，消息里带上两边的原因
  */
-export async function chatWithFallback(primary, fallback, messages, params = {}) {
+export async function chatWithFallback(primary, fallback, messages, params = {}, opts = {}) {
   const primaryLabel = primary?.label ? `主 API（${primary.label}）` : "主 API";
   const fallbackLabel = fallback?.label ? `副 API（${fallback.label}）` : "副 API";
 
@@ -457,9 +491,13 @@ export async function chatWithFallback(primary, fallback, messages, params = {})
       label: primaryLabel,
       params,
       timeout: CHAT_TIMEOUT,
+      signal: opts.signal,
     });
     return { content, usedFallback: false };
   } catch (primaryError) {
+    // 用户按停的：原样抛出去，不换线、不写「主 API 失败」那条日志
+    if (primaryError?.aborted || opts.signal?.aborted) throw primaryError;
+
     const primaryMsg = String(primaryError?.message ?? primaryError);
 
     if (!endpointUsable(fallback)) {
@@ -486,10 +524,13 @@ export async function chatWithFallback(primary, fallback, messages, params = {})
         label: fallbackLabel,
         params,
         timeout: CHAT_TIMEOUT,
+        signal: opts.signal,
       });
       logInfo("LLM", "副 API 顶上了，这轮由它回复");
       return { content, usedFallback: true };
     } catch (fallbackError) {
+      // 副 API 打到一半被按停：同样原样抛，别报成「主副都失败」
+      if (fallbackError?.aborted || opts.signal?.aborted) throw fallbackError;
       const fallbackMsg = String(fallbackError?.message ?? fallbackError);
       logError("LLM", "主副两条 API 都失败", `主：${primaryMsg}\n副：${fallbackMsg}`);
       throw new Error(`主副都失败 —— 主：${primaryMsg}；副：${fallbackMsg}`);
