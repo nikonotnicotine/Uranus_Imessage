@@ -511,6 +511,8 @@ cd ~/Uranus_Imessage && git pull && npm install && npm run build && npm start
 
 > ⚠️ **`data` 就是你的全部数据**——配置、密钥、聊天记录、角色、图片、记忆都在里面。换版本、搬电脑，只要这一个文件夹跟着走。
 
+> 💡 仓库里那个 `更新.bat` / `scripts/update.mjs` 是给 Windows 用的（停服务靠 `taskkill`，重启靠 `cmd`），在 Mac 上跑会直接告诉你用上面那行命令。
+
 ### 8.2 让它后台常驻（launchd）
 
 **先说清楚**：Mac 睡眠或关机它照样会停。真要 24 小时在线，[VPS](VPS部署教程.md) 才对。

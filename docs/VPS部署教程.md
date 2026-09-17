@@ -638,6 +638,8 @@ cd /opt/imessage && git pull && npm install && npm run build && sudo systemctl r
 
 > ⚠️ `git pull` 报「本地修改会被覆盖」说明你改过仓库里的文件。先 `git status` 看改了哪些，决定保留还是丢弃，**别硬来**。
 
+> 💡 仓库里那个 `更新.bat` / `scripts/update.mjs` 是给 Windows 用的（停服务靠 `taskkill`，重启靠 `cmd`），在这里跑会直接告诉你用上面这行。VPS 上本来就是 git + systemd，没必要多套一层。
+
 ### 4.4 备份
 
 **所有数据都在 `/opt/imessage/data/` 这一个文件夹里**，备份就是拷走它：

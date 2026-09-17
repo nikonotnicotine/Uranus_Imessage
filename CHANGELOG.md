@@ -5,6 +5,39 @@ BUG 反馈与功能建议，请加入 QQ 群：**1125033956**。
 
 ---
 
+## 0.9.1  2026-09-17
+
+- **Windows 上多了个 `更新.bat`，双击就升级**。以前 ZIP 装的人更新要「重新下一份、
+  解压到新文件夹、把 `data` 拷过去」，`node_modules` 还得重装一遍好几分钟。现在是
+  **原地换文件**：停服务 → 备份 → 换代码 → 起回来，`node_modules` 从头到尾没动过。
+- **依赖没变就不装**。判据是更新前后各给三个 `package.json` 的依赖块算一次
+  SHA-256 再比（`depFingerprint`），不是 `启动.bat` 里那个手写的哨兵清单 ——
+  那个清单要靠人记得往里补包，忘一次就是所有人一起炸。常见情况下这一步是零秒。
+- **换文件之前整套备份**，进 `.update-backup\日期_时间\`，留最近三份。每份里有个
+  `这是什么.txt`，写了备份时间、从哪个版本更到哪个版本、动了多少文件。新版起不来
+  就把里面的东西按原样盖回根目录。
+- **撞上你自己改过的文件会停下来报错，一个字节都不覆盖**。有 `.git` 的走
+  `git pull --ff-only`，工作区脏就拒绝并把改动列出来；没 `.git` 的靠
+  `.update-state.json` 里上一版每个文件的 SHA-256 认出「哪些是你动过的」，
+  对不上就停。第一次用没有指纹可比，会**明说**查不出来，而不是假装查过了。
+- **`data/`、`node_modules/`、`.sandbox/` 永远不碰**。前两个本来就不在源码包里，
+  这里再拦一道（`PROTECTED`）—— 「更新把聊天记录弄没了」这种事发生一次就没法挽回。
+- **从没有 `更新.bat` 的老版本也能上来**：`更新.bat` 发现 `scripts/update.mjs`
+  不在就自己下一份。太老的版本连 `更新.bat` 都没有，在项目目录里跑一行
+  `curl.exe -fsSL -o scripts\update.mjs https://raw.githubusercontent.com/nikonotnicotine/Uranus_Imessage/master/scripts/update.mjs; node scripts\update.mjs`
+  就能补上，更完 `更新.bat` 就在文件夹里了。（`curl.exe` 不能简写成 `curl` ——
+  PowerShell 里那是 `Invoke-WebRequest` 的别名，不认 `-fsSL -o`。）
+- 几个只有踩过才知道的坑，一并处理了：解包用手写的 tar 解析器而不是系统的
+  `tar.exe`（bsdtar 按当前代码页 936 解文件名，`启动.bat` 和 `docs/VPS部署教程.md`
+  会变乱码）；下载 curl 优先、`fetch` 兜底（curl 认 `HTTPS_PROXY` 和 `.curlrc`，
+  Node 的 `fetch` 两个都不认）；`更新.bat` 最后一行把 `node` 和 `exit /b` 写在
+  **同一行**（cmd 是按字节偏移边跑边读 .bat 的，而这次更新会把这个文件本身换掉）。
+- Mac 和 VPS 上跑 `scripts/update.mjs` 会直接告诉你用 `git pull && npm install &&
+  npm run build` 那一行 —— 停服务靠 `taskkill`、重启靠 `cmd`，都是 Windows 专属，
+  与其在那边跑出个半截结果，不如明说。
+
+---
+
 ## 0.9.0  2026-09-17
 
 - **八股文规则进了正则栏，能开关了**。原先线下预设那套「去八股文」是服务端

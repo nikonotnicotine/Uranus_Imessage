@@ -51,13 +51,15 @@ node -v
 >
 > ⚠️ **路径里别有特殊符号**。中文和空格现在没问题，但 `&`、`%`、`!` 这类会让批处理解析出错。`D:\Uranus` 这种最稳。
 
-**方法二：用 git**（以后更新方便，见 [5.1](#51-更新到新版本)）
+**方法二：用 git**
 
 装个 [Git for Windows](https://git-scm.com/download/win)，然后在你想放的位置右键 → **Open Git Bash here**，敲：
 
 ```bash
 git clone https://github.com/nikonotnicotine/Uranus_Imessage.git
 ```
+
+> 💡 两种方法都能一键更新（双击 `更新.bat`，见 [5.1](#51-更新到新版本)），不用为了「以后好更新」专门去装 git。
 
 ### 第 3 步：双击 `启动.bat`
 
@@ -93,6 +95,8 @@ git clone https://github.com/nikonotnicotine/Uranus_Imessage.git
 > **这个黑窗口不能关。** 关掉服务就停了。想停服务就在窗口里按 `Ctrl + C`。
 >
 > 以后每次要用，还是双击这同一个 `启动.bat`。第二次开就快了，依赖不用重装。
+>
+> 旁边还有个 **`更新.bat`**，想升到新版本时双击它，见 [5.1](#51-更新到新版本)。
 
 ---
 
@@ -292,11 +296,72 @@ node -v
 
 ### 5.1 更新到新版本
 
-**如果你是下 ZIP 装的**：重新下一份 ZIP，解压到**新文件夹**，然后把**旧文件夹里的 `data` 整个文件夹**拷进新的。
+双击 **`更新.bat`**，完事。
+
+它会问一句「更新到 vX.Y.Z？」，你按 `Y`，然后它自己做完这几件事：
+
+| 步骤 | 说明 |
+|---|---|
+| 查新版 | 版本号没比你现在的新就直接退出，不折腾 |
+| 停服务 | 只停它认得出是 Uranus 的那个进程，端口上是别的程序就不动 |
+| **备份** | 旧文件整套拷进 `.update-backup\日期_时间\`，留最近三份 |
+| 换文件 | 只换代码，`data` 一个字节都不碰 |
+| 装依赖 | **依赖没变就跳过**，所以通常是零秒 |
+| 起回来 | 弹一个新窗口，就是新版 |
+
+> ⚠️ **撞上你自己改过的文件，它会停下来报错，不会覆盖。** 会把改过的文件列出来，你自己决定是挪走还是放弃修改，处理完再跑一次。
+
+**如果你的版本太老，根本没有 `更新.bat`**（v0.9.1 之前都没有）：在项目文件夹里按住 <kbd>Shift</kbd> 右键 → 「在此处打开 PowerShell 窗口」，粘这一行：
+
+```bash
+curl.exe -fsSL -o scripts\update.mjs https://raw.githubusercontent.com/nikonotnicotine/Uranus_Imessage/master/scripts/update.mjs; node scripts\update.mjs
+```
+
+> ⚠️ 必须写 `curl.exe`，不能只写 `curl`。PowerShell 里 `curl` 是 `Invoke-WebRequest` 的别名，不认 `-fsSL -o` 这几个参数。
+
+更完之后 `更新.bat` 就在文件夹里了（它是新版自带的），以后双击它就行。
+
+<details>
+<summary>新版起不来，想退回旧版</summary>
+
+把 `.update-backup\` 里**最新那个日期文件夹**打开，里面的东西**按原样**拷回项目根目录，覆盖掉。那个文件夹里有个 `这是什么.txt`，写了备份时间和从哪个版本更到哪个版本。
+
+确认新版没问题之后，整个 `.update-backup` 文件夹都可以删。
+
+</details>
+
+<details>
+<summary>它在命令行里还能这么用</summary>
+
+```bash
+node scripts\update.mjs --check
+```
+
+只查有没有新版，什么都不动。
+
+```bash
+node scripts\update.mjs --yes
+```
+
+不问直接更（写脚本用）。
+
+```bash
+node scripts\update.mjs --force
+```
+
+版本号一样也照更一遍——上次更新中途断了、文件半新半旧的时候用这个。
+
+</details>
+
+#### 不想用更新器，自己来
+
+**ZIP 装的**：重新下一份 ZIP，解压到**新文件夹**，然后把**旧文件夹里的 `data` 整个文件夹**拷进新的。
 
 > ⚠️ **`data` 就是你的全部数据**——配置、密钥、聊天记录、角色、图片、记忆都在里面。换版本、搬电脑，只要这一个文件夹跟着走就行。
 
-**如果你是 git clone 装的**，在项目目录的 PowerShell 里：
+代价是 `node_modules` 也要重装一遍（好几分钟）。`更新.bat` 就是为了省掉这一步——它是在原地换文件，`node_modules` 一直没动过。
+
+**git clone 装的**，在项目目录的 PowerShell 里：
 
 ```bash
 git pull
