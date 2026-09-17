@@ -80,6 +80,16 @@ npm-debug.log*
 tmp-*/
 *.tmp
 
+# ---------- 界面上「导出」按钮产出的单件文件 ----------
+# 预设 / 世界书 / 记忆库 / 正则规则的导出（transfer.js:transferFileName 的命名）。
+# 落在哪个目录由用户点保存时决定，根目录是最顺手的那个 —— 必须挡住：
+# 里面是**别人写的预设正文**（有的作者明确不许二传），而且世界书和记忆库
+# 的导出会带上聊天里的私人内容
+uranus-preset-*.json
+uranus-worldbook-*.json
+uranus-memorybank-*.json
+uranus-regexrules-*.json
+
 # ---------- 一键更新留下的东西（更新.bat / scripts/update.mjs） ----------
 # 替换前的旧版文件。留最近三份，新版起不来能照原样盖回去，确认没问题就能删
 .update-backup/
