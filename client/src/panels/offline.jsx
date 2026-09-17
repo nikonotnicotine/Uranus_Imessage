@@ -772,6 +772,18 @@ const Bubble = memo(function Bubble({
         ) : (
           <div
             className={`mt-1.5 border px-3.5 py-3 ${
+              /*
+               * 不带 widget 的那条按字数量宽（`w-fit`）。以前这儿是撑满整行的，
+               * 一句「好」也横着穿过去、停在对面头像底下。
+               *
+               * 带 widget 的仍旧撑满：里面那些 iframe 是 `w-full`，宽度反过来
+               * 靠外面这层给，外面一收缩它就塌回 300px（替换元素的默认宽）。
+               *
+               * 自己那侧再收一道（`max-w-[34rem]`）—— 你打的字是「说了一句话」，
+               * 不该和角色那边整段正文一样宽；`ml-auto` 把它推回右边。
+               */
+              blocks ? "" : `w-fit ${mine ? "ml-auto max-w-[34rem]" : ""}`
+            } ${
               turn.hidden ? "border-dashed border-line opacity-55" : "border-line"
             } ${mine ? "bg-sunken" : "bg-paper"}`}
           >
