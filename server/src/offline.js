@@ -20,11 +20,16 @@
  *
  *  - **生成参数用预设里的那一份**（`built.params`），不像协助模式那样传 `{}`。
  *    协助模式图的是稳（诊断要可复现），线下剧情图的是有变化。
- *  - **存档里存的是「模型下一轮会看到的那份」**（过了 `toHistory` 正则），
- *    发给人看的那份（过 `toUser`）在出口现算。用户拿正则渲染 HTML 状态栏
- *    正是 `toUser` 那一路 —— 那堆 `<div>` 绝对不能进上下文，否则模型下一轮
- *    会开始模仿自己吐 HTML。现算的另一个好处：用户改了渲染正则，整条剧情
- *    立刻跟着变，不用回去重写存档。
+ *  - **存档里存模型原文**，两份都在出口现算：发给人看的那份过 `toUser`，
+ *    发给模型的那份过 `toHistory`（在 `prompt.js:filterHistory`，拼提示词时才跑）。
+ *    用户拿正则渲染 HTML 状态栏正是 `toUser` 那一路 —— 那堆 `<div>` 绝对不能
+ *    进上下文，否则模型下一轮会开始模仿自己吐 HTML，所以过滤照旧要做，只是
+ *    挪到了拼提示词那一刻（和 `imessage.js` 那条链同一个做法）。
+ *
+ *    以前这儿存的是过完 `toHistory` 的那份，后果是**状态栏只能看一次**：
+ *    `不对Ai发送多余内容` 那类删除规则会把 `<状态面板>` 整段从存档里剥掉，
+ *    重新打开剧情时 `toUser` 再宽容也没有原料可抓，那一栏就永远空着。
+ *    存原文之后「改了渲染正则整条剧情立刻跟着变」才真正成立。
  *  - **总结失败不影响这一轮**。剧情正文已经落盘了，总结只是附加动作。
  *    这跟记忆库那条铁律是一个意思：宁可总结晚一点，也绝不弄丢正文。
  */
@@ -69,9 +74,31 @@ function turnLine(turn, charName, userName) {
   return `[${who}] ${turn.content}`;
 }
 
-function turnsText(turns, charName, userName) {
+/**
+ * 总结材料。
+ *
+ * 助手那侧先过一遍 `toHistory` —— 存档里现在是模型原文（含 `<状态面板>` 那
+ * 几千字），原样喂给总结等于让它去读一堆坐标和服装字段，还白烧 token。
+ * 走的是和拼提示词同一套规则，所以「模型看不见的东西」在总结里也看不见。
+ */
+function turnsText(turns, charName, userName, rules = [], vars = {}) {
+  const clean = turns.map((t) =>
+    t.role === "assistant" && rules.length
+      ? {
+          ...t,
+          content: applyRules(t.content, rules, {
+            target: "aiOutput",
+            field: "toHistory",
+            vars,
+          }).text,
+        }
+      : t
+  );
   return pendingText(
-    turns.map((t) => turnLine(t, charName, userName)).join("\n\n"),
+    clean
+      .filter((t) => String(t.content ?? "").trim())
+      .map((t) => turnLine(t, charName, userName))
+      .join("\n\n"),
     MAX_SUMMARY_INPUT
   );
 }
@@ -303,7 +330,7 @@ function historyOf(story) {
  * @returns {Promise<{turn: object, display: string, options: string[],
  *   story: object, usedFallback: boolean, summary: object|null}>}
  *   `display` 是过了 `toUser` 正则的那份（发气泡 / 网页上显示用），
- *   `turn.content` 是存档里那份（过的是 `toHistory`）
+ *   `turn.content` 是存档里那份 —— **模型原文**，`toHistory` 留到拼提示词时才跑
  * @throws {Error} 没有在演的剧情、没配模型、模型返回空、两条 API 都挂 —— 都抛
  */
 export async function runOfflineTurn(config, role, user, opts = {}) {
@@ -439,12 +466,13 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
     logWarn(SCOPE, "这轮没摘到用户选项（模型没按格式吐），只当这轮没选项");
   }
 
-  const forHistory = applyAndLog(
-    cut.body,
-    built.preset.regex,
-    { target: "aiOutput", field: "toHistory", vars },
-    "线下回复（存进剧情）"
-  ).text;
+  /*
+   * 存档存原文，只算「给人看」这一路。
+   *
+   * `toHistory` 那一路**不在这里跑** —— 挪到了 `prompt.js:filterHistory`，
+   * 下一轮拼提示词时才执行（`buildPrompt` 已经在调，见 historyOf 那条路）。
+   * 所以模型看到的上文照旧是滤过的，没有 HTML 泄进去。
+   */
   const display = applyAndLog(
     cut.body,
     built.preset.regex,
@@ -454,7 +482,7 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
 
   const turn = appendTurn(roleKey, {
     role: "assistant",
-    content: forHistory,
+    content: cut.body,
     options: cut.options,
   });
   if (!turn) throw new Error("这轮回复存不下来（剧情文件写失败）");
@@ -520,6 +548,8 @@ async function makeSummary(config, role, story, kind) {
   const charName = role?.name ?? "";
   const userName = user?.name ?? "";
   const vars = { char: charName, user: userName, sep: "" };
+  // 存档是模型原文，喂给总结之前得过一遍 toHistory（见 turnsText）
+  const rules = resolvePreset(config, role, "offline").regex ?? [];
 
   let material = "";
   let from = 0;
@@ -528,7 +558,7 @@ async function makeSummary(config, role, story, kind) {
   if (kind === "small") {
     const turns = uncoveredTurns(story);
     if (!turns.length) return null;
-    material = turnsText(turns, charName, userName);
+    material = turnsText(turns, charName, userName, rules, vars);
     from = smallCoverage(story);
   } else {
     const smalls = uncoveredSmalls(story);
@@ -539,7 +569,7 @@ async function makeSummary(config, role, story, kind) {
     } else {
       // 一份小总结都没有就直接读正文 —— 手动点「大总结」的短剧情会走到这儿
       if (!story.turns.length) return null;
-      material = turnsText(story.turns, charName, userName);
+      material = turnsText(story.turns, charName, userName, rules, vars);
     }
   }
   if (!material.trim()) return null;
