@@ -25,6 +25,33 @@ export const HTML_TAG =
   /<(?:div|span|table|tr|td|th|thead|tbody|p|ul|ol|li|h[1-6]|section|article|style|img|br|hr|b|i|u|strong|em|code|pre|blockquote|progress|meter|details|summary|font|center|dl|dt|dd)\b[^>]*>/i;
 
 /**
+ * 界面上不该出现的**纯控制标记**。
+ *
+ * 存档改存模型原文之后冒出来的问题（1.0.3）。这类预设里常有一条
+ * 「不对 AI 发送多余内容」的 `toHistory` 删除规则，一口气认好几种标签；以前
+ * 落盘存的就是过完 `toHistory` 的文本，于是这些标签在**界面上也**跟着消失了
+ * —— 靠的是副作用，不是有人真的决定要这么显示。现在存原文，`toUser` 那一路
+ * 没有对应渲染规则的就原样露出来。
+ *
+ * 这里是一张**短黑名单**，不是「白名单之外全收」。差别很要紧：模型吐出
+ * `<Chronicle>` 这种标签时，它里面是**正文**（小说题头的章节名），只是碰巧
+ * 这份预设没开渲染规则 —— 那用户该看到原始标记，才知道去开哪条规则；收走
+ * 等于内容凭空少了一段。所以只收那些**里面的东西本身就不是给人读的**：
+ *
+ *  - `<snow>` / `<Drama>`：给渲染器用的舞台指示，没规则接手时是噪音。
+ *  - `[[伏笔]]…[[/]]`：作者给 AI 的埋线标注，本来就不打算显示。
+ *
+ * 拿不准的一律不收 —— 少收一个的代价是界面上多一行标记，多收一个的代价是
+ * 用户的正文没了。
+ */
+const STRAY = /<(snow|Drama)\b[^>]*>[\s\S]*?<\/\1\s*>|\[\[[^\]\n]+\]\][\s\S]*?\[\[\/\]\]/gi;
+
+/** 纯控制标记整段收走。其余一个字不动。 */
+export function dropStray(text) {
+  return String(text ?? "").replace(STRAY, "");
+}
+
+/**
  * 「一整份网页」的两种写法：``` ```html 围栏 ``` 里的，和裸的
  * `<!doctype html>…</html>`。围栏是预设作者的习惯（在 SillyTavern 里靠它触发
  * 渲染），到了这儿围栏标记本身不该当正文显示出来。
@@ -113,6 +140,10 @@ function splitNodes(chunk, out) {
  * `doc` 用块自带的那份文档当 srcdoc（连它自己的 `<head>` 一起），
  * `html` 包进我们那份 srcdoc 骨架，`text` 回到页面上走 React。
  *
+ * 最后一步把散文块里的纯控制标记收掉（见 `dropStray`），收空了的块整个不要
+ * —— 留个空气泡比留个标记更莫名其妙。调用方多半已经收过一遍了
+ * （`offline.jsx` 在算 `text` 时就收），这儿再收一道是为了别的调用方。
+ *
  * @returns {{kind: "doc"|"html"|"text", text: string}[]}
  */
 export function splitRich(text) {
@@ -121,5 +152,7 @@ export function splitRich(text) {
     if (part.kind === "doc") out.push({ kind: "doc", text: part.text });
     else splitNodes(part.text, out);
   }
-  return out;
+  return out
+    .map((b) => (b.kind === "text" ? { ...b, text: dropStray(b.text).trim() } : b))
+    .filter((b) => b.kind !== "text" || b.text);
 }

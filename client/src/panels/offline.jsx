@@ -47,7 +47,7 @@ import {
 } from "lucide-react";
 
 import { roleLabel } from "../labels.js";
-import { HTML_TAG, splitRich } from "../offlinehtml.js";
+import { HTML_TAG, dropStray, splitRich } from "../offlinehtml.js";
 import { offlineMediaUrl } from "../offlinemedia.js";
 import { useSection } from "../section.jsx";
 import { api, useConfig } from "../store.jsx";
@@ -721,7 +721,18 @@ const Bubble = memo(function Bubble({
   auto,
   onVoiceError,
 }) {
-  const text = turn.display ?? turn.content ?? "";
+  /*
+   * 角色那侧先把没人接手的自造标记收掉（见 `offlinehtml.js:dropStray`）——
+   * 在这儿收而不是只在 splitRich 里收，是因为一条**纯散文**回复里混着
+   * `<snow>…</snow>` 时 `HTML_TAG` 认不出 HTML，`blocks` 是 null，
+   * 走的是下面那条不切块的老路，光靠 splitRich 兜不住。
+   *
+   * 你自己打的字不动：那是人写的，尖括号里是什么由你说了算。
+   */
+  const text = useMemo(() => {
+    const raw = turn.display ?? turn.content ?? "";
+    return mine ? raw : dropStray(raw).trim();
+  }, [mine, turn.display, turn.content]);
   const isHtml = !mine && HTML_TAG.test(text);
   // 台词的播放键只在**角色**那侧挂 —— 你自己打的那条，念它没有意义
   const spoken = !mine;
