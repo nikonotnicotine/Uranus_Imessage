@@ -1,5 +1,14 @@
 /*
  * 外壳：60px 导航轨 + 260px 条目面板 + 主内容区，以及顶部错误条。
+ *
+ * 手机上（<768px）三层全变：导航轨和条目面板都收起来，各自从顶栏的按钮点开成
+ * 覆盖层，主内容区独占整个宽度。桌面端一个像素都没动 —— 所有变化都在 `md:`
+ * 断点以下，`md:` 以上的类名和原来逐字一致。
+ *
+ * 为什么不是「只把 260px 那栏收起来」：那栏本来就已经收着了（`hidden md:block`），
+ * 375px 的屏上真正被吃掉的是**别的三样** —— 常驻的 60px 导航轨、被压成 0 宽
+ * 竖排的标题（flex 里 `min-w-0` 撞上右边 `shrink-0` 的按钮组）、以及左右各
+ * 24px 的内容区留白。少了任何一样，剩下的还是挤。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from "react";
@@ -38,7 +47,7 @@ import { GroupLabel, ListItem, Modal, Reveal, UranusBadge, fmtStamp } from "./ui
  * 只有换分区那一下用得上；同一个分区里点侧栏锚点是当场就找得着的。
  */
 const ANCHOR_TRIES = 30;
-import { Plus, X } from "lucide-react";
+import { List, Menu, Plus, X } from "lucide-react";
 
 /**
  * 60px 导航轨里的一格。
@@ -231,8 +240,10 @@ export function AppShell() {
   const [live, setLive] = useState([]);
   // 各面板注册的保存提示，显示在全局保存条上
   const [hint, setHint] = useState("");
-  // 移动端：260px 那栏平时收着，从导航轨点开
+  // 移动端：260px 那栏平时收着，从顶栏的「列表」键点开
   const [drawer, setDrawer] = useState(false);
+  // 移动端：60px 导航轨也收着，从顶栏的汉堡键点开（桌面端常驻，这个值用不上）
+  const [rail, setRail] = useState(false);
   // 只轮询一次，角色面板 / iMessage 面板共用这一份
   const bridge = useBridgeStatus();
   // 壁纸只该有一份状态 —— 这个 hook 会往 <html> 上写 CSS 变量，调两次会互相盖
@@ -241,19 +252,22 @@ export function AppShell() {
 
   const section = sectionById(tab);
 
-  // 抽屉开着时按 ESC 关掉（和 Modal 一个手感）
+  // 两个抽屉开着时按 ESC 关掉（和 Modal 一个手感）
   useEffect(() => {
-    if (!drawer) return;
+    if (!drawer && !rail) return;
     const onKey = (e) => {
-      if (e.key === "Escape") setDrawer(false);
+      if (e.key !== "Escape") return;
+      setDrawer(false);
+      setRail(false);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [drawer]);
+  }, [drawer, rail]);
 
   const goto = useCallback((id) => {
     setTab(id);
     setDrawer(false);
+    setRail(false);
     /*
      * 上报的列表清空：现在有两个分区会 publish（上下文 / 图库），
      * 不清的话切过去的那一瞬间，260px 那栏画的是上一个分区留下的条目。
@@ -268,6 +282,7 @@ export function AppShell() {
     (id) => {
       setPicked((p) => ({ ...p, [tab]: id ?? "" }));
       setDrawer(false);
+      setRail(false);
       if (mainRef.current) mainRef.current.scrollTop = 0;
     },
     [tab],
@@ -282,6 +297,7 @@ export function AppShell() {
     const el = box?.querySelector(`[data-anchor="${CSS.escape(name)}"]`);
     el?.scrollIntoView({ behavior: "smooth", block: "start" });
     setDrawer(false);
+    setRail(false);
     return Boolean(el);
   }, []);
 
@@ -380,29 +396,42 @@ export function AppShell() {
     />
   );
 
+  /*
+   * 桌面端那条 60px 导航轨的内容：只有 20px 图标，认不出来就 hover 出 title。
+   *
+   * 手机上那份**没有复用它**，是另一套带文字的按钮（见下面 `rail &&` 那段）。
+   * 本来想共用，但共用不了：手机上没有 hover，十三个纯图标方块认不出是什么，
+   * 必须带标签；而桌面端那条硬规则是「仅 20px 纯色 SVG 图标」（见 RailButton）。
+   * 两种形态差的不是几个类名，是要不要有文字。
+   */
+  const railInner = (
+    <>
+      <div className="flex w-full flex-col items-center gap-1">
+        {NAV.map((n) => (
+          <RailButton
+            key={n.id}
+            icon={n.icon}
+            label={n.label}
+            active={tab === n.id}
+            onClick={() => goto(n.id)}
+          />
+        ))}
+      </div>
+      <UranusBadge size={32} />
+    </>
+  );
+
   return (
     <SectionCtx.Provider value={sectionValue}>
       <SaveHintCtx.Provider value={saveHintValue}>
         {/* 100vh + overflow hidden：整页不滚，只有 260px 那栏和主内容区各自滚 */}
         <div className="flex h-screen overflow-hidden">
-          {/* 一层：60px 导航轨。上下 flex 分布，底部一个圆形头像 */}
-          <nav className="flex w-[60px] shrink-0 flex-col items-center justify-between border-r border-line py-4">
-            <div className="flex w-full flex-col items-center gap-1">
-              {NAV.map((n) => (
-                <RailButton
-                  key={n.id}
-                  icon={n.icon}
-                  label={n.label}
-                  active={tab === n.id}
-                  onClick={() => {
-                    goto(n.id);
-                    // 移动端 260px 那栏是收着的，点导航轨顺手展开
-                    if (window.innerWidth < 768) setDrawer(true);
-                  }}
-                />
-              ))}
-            </div>
-            <UranusBadge size={32} />
+          {/*
+            一层：60px 导航轨。上下 flex 分布，底部一个圆形头像。
+            手机上收起来（`hidden md:flex`），从顶栏的汉堡键点开成覆盖层。
+          */}
+          <nav className="hidden w-[60px] shrink-0 flex-col items-center justify-between border-r border-line py-4 md:flex">
+            {railInner}
           </nav>
 
           {/* 二层：260px 条目面板。独立滚动，右边一条 1px 实线 */}
@@ -412,11 +441,52 @@ export function AppShell() {
 
           {/* 三层：主内容区。独立滚动，底部贴一条全局保存条 */}
           <div className="flex min-w-0 flex-1 flex-col">
-            <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto px-6 lg:px-10">
+            {/*
+              手机专属顶栏。桌面端 `md:hidden` 整条不存在 —— 那边导航轨和条目栏
+              都常驻，没有可点开的东西。
+              `shrink-0`：它是 flex 列里的固定一行，不给的话内容一多就被压扁。
+            */}
+            <div className="flex shrink-0 items-center gap-1 border-b border-line px-2 py-2 md:hidden">
+              <button
+                type="button"
+                onClick={() => setRail(true)}
+                aria-label="打开分区"
+                title="打开分区"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-item text-ink-faint transition-colors duration-150 hover:bg-sunken hover:text-ink"
+              >
+                <Menu size={20} strokeWidth={1.75} />
+              </button>
+              {/*
+                当前位置。`truncate` + `min-w-0`：角色名长的时候截断，
+                而不是把右边那个键挤出屏幕。
+              */}
+              <span className="min-w-0 flex-1 truncate text-ui text-ink">
+                {current ? current.label : section.label}
+              </span>
+              {/* 章节锚点分区（发送节奏 / 控制台）也有列表可看，所以不按分区隐藏 */}
+              <button
+                type="button"
+                onClick={() => setDrawer(true)}
+                aria-label={`${section.label}的列表`}
+                title={`${section.label}的列表`}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-item text-ink-faint transition-colors duration-150 hover:bg-sunken hover:text-ink"
+              >
+                <List size={20} strokeWidth={1.75} />
+              </button>
+            </div>
+
+            {/* 手机上左右留白收到 16px：375px 的屏上 24px×2 是实打实的一行字 */}
+            <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6 lg:px-10">
               <div className="mx-auto max-w-content py-rhythm-sm lg:py-rhythm">
                 {/* 分区标题：72px（移动端 40px），整页只有这一处这么大 */}
                 <header className="mb-rhythm-sm lg:mb-rhythm">
-                  <div className="flex items-start justify-between gap-4">
+                  {/*
+                    手机上改成上下两行（`flex-col`）。原来横排时标题挂着 `min-w-0`、
+                    右边按钮组挂着 `shrink-0`，375px 的屏上标题被压到 **0 宽**，
+                    「角色」两个字只能靠 CJK 逐字换行竖着排下来。
+                    DOM 顺序照旧是「标题 → 按钮组」，竖排时正好是标题在上。
+                  */}
+                  <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
                     {/* min-w-0：标题长的时候让它自己折行，别把右上角那两个挤出去 */}
                     <Reveal
                       as="h1"
@@ -428,7 +498,7 @@ export function AppShell() {
                       * 搜索、指令表和壁纸都是全局的东西、不属于任何分区，
                       * 所以一起挂在标题这一行的右上角
                       */}
-                    <div className="mt-2 flex shrink-0 items-center gap-2">
+                    <div className="flex shrink-0 items-center gap-2 sm:mt-2">
                       <GlobalSearch config={config} onJump={gotoItem} />
                       <SetupButton onOpen={() => setSetupOpen(true)} />
                       <CommandsButton onGoto={gotoItem} />
@@ -485,6 +555,66 @@ export function AppShell() {
             <GlobalSaveBar hint={hint} />
           </div>
         </div>
+
+        {/*
+          移动端：60px 导航轨改成覆盖层滑出。
+          z-50 压在条目抽屉（z-40）之上 —— 两个都开着时该看到的是「换分区」这一层。
+        */}
+        {rail && (
+          <div
+            className="fixed inset-0 z-50 bg-ink/20 md:hidden"
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) setRail(false);
+            }}
+          >
+            <div className="flex h-full w-[240px] max-w-[80vw] flex-col overflow-y-auto border-r border-line bg-paper">
+              <div className="flex items-center justify-between gap-2 border-b border-line px-2 py-3">
+                <span className="pl-2 text-eyebrow uppercase text-ink-faint">分区</span>
+                <button
+                  type="button"
+                  onClick={() => setRail(false)}
+                  aria-label="关闭分区"
+                  className="flex h-11 w-11 items-center justify-center text-ink-faint transition-colors duration-150 hover:text-ink"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+              {/*
+                手机上这一层**带文字**，不像桌面端那条只有 20px 图标。
+                导航轨靠 hover 出 title 才知道每格是什么，手机上没有 hover ——
+                十三个只有图标的方块认不出来。
+              */}
+              <div className="grid grid-cols-1 gap-1 px-2 py-2">
+                {NAV.map((n) => {
+                  const Icon = n.icon;
+                  const active = tab === n.id;
+                  return (
+                    <button
+                      key={n.id}
+                      type="button"
+                      onClick={() => {
+                        goto(n.id);
+                        setDrawer(true);
+                      }}
+                      aria-current={active ? "page" : undefined}
+                      className={`flex h-11 items-center gap-3 rounded-item px-2 text-left text-ui transition-colors duration-150 ${
+                        active
+                          ? "bg-sunken text-ink"
+                          : "text-ink-soft hover:bg-sunken hover:text-ink"
+                      }`}
+                    >
+                      <Icon size={18} strokeWidth={1.75} className="shrink-0" />
+                      <span className="min-w-0 truncate">{n.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="mt-auto flex justify-center border-t border-line py-4">
+                <UranusBadge size={32} />
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* 移动端：260px 那栏改成覆盖层滑出 */}
         {drawer && (
