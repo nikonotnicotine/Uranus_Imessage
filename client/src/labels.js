@@ -492,7 +492,12 @@ export function regexActionText(rule) {
   if (action === "delete") return "删除";
   const alts = regexAlternatives(rule);
   if (!alts.length) return "替换成（空）";
-  return alts.length === 1 ? `换成「${alts[0]}」` : `${alts.length} 个说法里挑一个`;
+  if (alts.length > 1) return `${alts.length} 个说法里挑一个`;
+  // 替换词可能是一整段 HTML（酒馆转过来的状态栏规则就是这个块头），角标里
+  // 放不下会把整行撑到卡片外面去。截个意思，全文点编辑看。
+  const one = alts[0];
+  const flat = one.replace(/\s+/g, " ").trim();
+  return flat.length > 24 ? `换成「${flat.slice(0, 24)}…」` : `换成「${flat}」`;
 }
 
 /** 这条规则作用在哪几路文本，说成人话。 */

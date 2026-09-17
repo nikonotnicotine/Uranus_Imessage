@@ -750,7 +750,7 @@ export function PresetRegexFold({ preset }) {
               >
                 {regexLabel(r)}
               </span>
-              <span className="shrink-0 rounded-item bg-sunken px-1.5 py-0.5 text-meta text-ink-faint">
+              <span className="min-w-0 max-w-full truncate rounded-item bg-sunken px-1.5 py-0.5 text-meta text-ink-faint">
                 {regexActionText(r)}
               </span>
             </div>

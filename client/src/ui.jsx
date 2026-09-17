@@ -398,6 +398,46 @@ export function Fold({ title, desc, defaultOpen = false, children, badge }) {
  */
 export const DragHandleCtx = createContext(null);
 
+/*
+ * 原生拖放还有个让人骂娘的老毛病：按住拖的时候滚轮不滚 —— wheel 事件照发，
+ * 但浏览器把「滚」这个默认动作吞了（Chromium 多年如此）。拖着一条长列表想
+ * 走远路，只能拖到屏幕边上干等，滚轮成了摆设。
+ *
+ * 这里挂全局补丁：只在拖动期间接管 wheel，从事件目标往上爬，找最近一个
+ * 「声明了滚动且真有得滚」的容器手动滚它。监听走 capture 是因为 dragend
+ * 不冒泡，capture 才保证收得到（拖到哪松手都得把开关关上）；wheel 要
+ * preventDefault，所以 passive:false。
+ */
+if (typeof window !== "undefined" && !window.__uranusDragWheelPatch) {
+  window.__uranusDragWheelPatch = true; // 热更新会重跑模块，守着别把监听装两份
+  let dragActive = false;
+
+  function wheelScrollBox(el) {
+    for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+      const overflow = getComputedStyle(n).overflowY;
+      if ((overflow === "auto" || overflow === "scroll") && n.scrollHeight > n.clientHeight) {
+        return n;
+      }
+    }
+    return document.scrollingElement;
+  }
+
+  window.addEventListener("dragstart", () => (dragActive = true), true);
+  window.addEventListener("dragend", () => (dragActive = false), true);
+  window.addEventListener("drop", () => (dragActive = false), true);
+  window.addEventListener(
+    "wheel",
+    (e) => {
+      if (!dragActive) return;
+      const box = wheelScrollBox(e.target);
+      // Firefox 的滚轮一格按「行」报，换算成像素
+      box.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      e.preventDefault();
+    },
+    { passive: false, capture: true }
+  );
+}
+
 export function DragRow({ index, id, onReorder, children, className = "" }) {
   const [over, setOver] = useState(false);
 

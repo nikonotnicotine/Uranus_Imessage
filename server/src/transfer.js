@@ -152,6 +152,33 @@ export function exportPreset(preset) {
 }
 
 /**
+ * 导入认两种文件：
+ *
+ *  1. 「导出」按钮产出的信封格式（app / kind / version 包着 preset）；
+ *  2. **裸的预设本体** —— data/presets/ 里一份一个文件的那种。用户从备份里
+ *     翻出一份直接拖进导入是最顺手的动作，没理由被「这不是导出的文件」
+ *     拦在门外。判别用预设独有的字段（mode / regex / params）：世界书的
+ *     存储文件也长着 entries，光看那个会认错人。
+ *
+ * 顺手认一下 SillyTavern 的预设（prompts + prompt_order）—— 这是导入失败
+ * 最常见的来路，明说「两边格式不同」比一句笼统的报错有用。
+ */
+function unwrapPresetFile(raw) {
+  if (raw && typeof raw === "object" && !Array.isArray(raw) && raw.app === undefined) {
+    if (Array.isArray(raw.prompts) && Array.isArray(raw.prompt_order)) {
+      throw new Error("这是 SillyTavern 的预设文件，两边格式不同，导不进来");
+    }
+    const presetShaped =
+      raw.mode === "online" ||
+      raw.mode === "offline" ||
+      Array.isArray(raw.regex) ||
+      (raw.params && typeof raw.params === "object" && !Array.isArray(raw.params));
+    if (presetShaped) return raw;
+  }
+  return openBundle(raw, KIND.preset).preset;
+}
+
+/**
  * 读一份预设出来，**只解析不落盘**，返回规范化之后的对象（已经带好新 id）。
  *
  * 借 `normalizePresets` 顺手发 id：把待导入的这份挂在现有列表末尾走一遍，
@@ -159,7 +186,7 @@ export function exportPreset(preset) {
  * 全项目只有一份实现，不会有第二套在这儿慢慢走样。
  */
 export function importPreset(bundle, current) {
-  const raw = openBundle(bundle, KIND.preset).preset;
+  const raw = unwrapPresetFile(bundle);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("文件里没有 preset 这一块，内容不完整");
   }

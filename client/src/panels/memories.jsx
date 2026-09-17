@@ -1271,8 +1271,8 @@ function todayKey() {
 /**
  * 日记页：一个月历。
  *
- * 有日记的那天是实心方块（多篇的角上标条数），点一下下面就展开那天的正文，
- * 能改也能删。**日历比一列文件名好懂**：日记本来就是按天写的，
+ * 有日记的那天是实心方块（多篇的角上标条数），点一下就弹出那天的弹窗，
+ * 在弹窗里改也能删。**日历比一列文件名好懂**：日记本来就是按天写的，
  * 空了几天、哪天写了两篇，看一眼月历就知道。
  *
  * 两件事界面上要分清：
@@ -1511,10 +1511,17 @@ function MonthGrid({ view, byDay, picked, onPick }) {
 }
 
 /**
- * 选中那天的日记：正文直接展开，能改能删。
+ * 选中那天的日记：一个弹窗，在里头看、改、删。
  *
- * **不做成弹窗**：日记是长文，弹窗里改到一半按下 ESC 就全丢了。
- * 展开在日历下面，改动一直在，走开也不会没。
+ * 用户要的形态：点日历上的一天直接弹出弹窗，不再在日历下面展开一大块。
+ * 弹窗就是共用的 `Modal` —— 它**只压暗、不模糊**，这正是「不掉帧」的关键：
+ * 全屏 backdrop-blur 会逼合成器在弹窗里每敲一个字、每滚一行时，把底下
+ * background-attachment: fixed 的壁纸整幅重新模糊一遍（长注释见 ui.jsx）。
+ * 正文状态全在组件自己身上，打字只重渲这一个弹窗，日历动都不动。
+ *
+ * 旧版「不做成弹窗」唯一站得住的理由是丢稿 —— 在这儿消化掉：
+ * 有没写盘的改动时，关弹窗（ESC / 点遮罩 / 右上角 ×）先拦下来问一句，
+ * 确认了才真的关。
  */
 function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
   const [open, setOpen] = useState(files[0]?.file ?? "");
@@ -1522,7 +1529,8 @@ function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
   const [remote, setRemote] = useState("");
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [confirming, setConfirming] = useState("");
+  const [confirmDrop, setConfirmDrop] = useState(false); // 「删掉这篇」的确认弹窗开着没有
+  const [confirmDiscard, setConfirmDiscard] = useState(false); // 有没写盘的改动时还要关弹窗的确认
 
   // 换了天/换了篇就重新拉正文。列表接口不给正文（几百篇一次发完太重）
   useEffect(() => {
@@ -1553,6 +1561,23 @@ function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
 
   const dirty = text !== remote;
 
+  /*
+   * 关弹窗的统一入口（ESC / 点遮罩 / 右上角 ×）：有没写盘的改动时先拦下来
+   * 问一句，确认了才真的关。删掉那步成功后走的是直连的 onClose，不过这道闸。
+   *
+   * 两个确认弹窗开着的时候这里要**让路**：Modal 的 ESC 是各自挂在 document
+   * 上的（ui.jsx），一按两层都收得到 —— 不让路的话，按一下 ESC 会把确认
+   * 弹窗和外面这层一起关掉，「留下来继续改」就成了摆设。
+   */
+  function requestClose() {
+    if (confirmDrop || confirmDiscard) return;
+    if (dirty) {
+      setConfirmDiscard(true);
+    } else {
+      onClose();
+    }
+  }
+
   async function save() {
     setBusy(true);
     try {
@@ -1576,7 +1601,7 @@ function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
       await api(`/api/memories/${encodeURIComponent(memKey)}/diary/${encodeURIComponent(open)}`, {
         method: "DELETE",
       });
-      setConfirming("");
+      setConfirmDrop(false);
       onClose();
       await reload();
     } catch (e) {
@@ -1587,20 +1612,38 @@ function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
   }
 
   return (
-    <div className="border-t border-line pt-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <p className="font-serif text-h3 text-ink">{day}</p>
-          <p className="mt-1 text-meta text-ink-faint">
-            {files.length > 1 ? `这天写了 ${files.length} 篇` : "这天的日记"} ·{" "}
-            <span className="font-mono">{open}</span>
-          </p>
-        </div>
-        <Button variant="ghost" onClick={onClose}>
-          <X size={14} /> 收起
-        </Button>
-      </div>
-
+    <>
+      <Modal
+        title={day}
+        desc={
+          (files.length > 1 ? `这天写了 ${files.length} 篇` : "这天的日记") +
+          ` · ${open}`
+        }
+        maxWidth="max-w-3xl"
+        onClose={requestClose}
+        footer={
+          <>
+            <p className="mr-auto min-w-0 text-meta leading-relaxed text-ink-faint">
+              {dirty
+                ? `改了 ${text.length} 字还没写盘。`
+                : saved
+                ? "已经写盘了。"
+                : `${text.length} 字。程序永远不会自动删日记，只有在这儿手动删才会掉。`}
+            </p>
+            <Button
+              variant="outline"
+              onClick={() => setConfirmDrop(true)}
+              disabled={busy || !open}
+            >
+              <Trash2 size={14} /> 删掉这篇
+            </Button>
+            <Button onClick={save} disabled={busy || !dirty}>
+              {busy ? <RefreshCw size={14} className="animate-spin" /> : <Check size={14} />}
+              {busy ? "写入中…" : "写入磁盘"}
+            </Button>
+          </>
+        }
+      >
       {files.length > 1 && (
         <div className="mt-4 flex flex-wrap gap-2">
           {files.map((f) => (
@@ -1634,33 +1677,14 @@ function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
         </Field>
       </div>
 
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-        <p className="min-w-0 max-w-[62ch] text-meta leading-relaxed text-ink-faint">
-          {dirty
-            ? `改了 ${text.length} 字还没写盘。`
-            : saved
-            ? "已经写盘了。"
-            : `${text.length} 字。程序永远不会自动删日记，只有在这儿手动删才会掉。`}
-        </p>
-        <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <Button variant="outline" onClick={() => setConfirming(open)} disabled={busy || !open}>
-            <Trash2 size={14} /> 删掉这篇
-          </Button>
-          <Button onClick={save} disabled={busy || !dirty}>
-            {busy ? <RefreshCw size={14} className="animate-spin" /> : <Check size={14} />}
-            {busy ? "写入中…" : "写入磁盘"}
-          </Button>
-        </div>
-      </div>
-
-      {confirming && (
+      {confirmDrop && (
         <Modal
           title="删掉这篇日记？"
-          desc={`${confirming} · 删了就没了，磁盘上不留备份`}
-          onClose={() => setConfirming("")}
+          desc={`${open} · 删了就没了，磁盘上不留备份`}
+          onClose={() => setConfirmDrop(false)}
           footer={
             <>
-              <Button variant="ghost" onClick={() => setConfirming("")} disabled={busy}>
+              <Button variant="ghost" onClick={() => setConfirmDrop(false)} disabled={busy}>
                 取消
               </Button>
               <Button onClick={drop} disabled={busy}>
@@ -1675,7 +1699,31 @@ function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
           </p>
         </Modal>
       )}
-    </div>
+
+      {confirmDiscard && (
+        <Modal
+          title="还没写盘就关？"
+          desc={`${day} · ${open}`}
+          onClose={() => setConfirmDiscard(false)}
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setConfirmDiscard(false)} disabled={busy}>
+                留下来继续改
+              </Button>
+              <Button onClick={onClose} disabled={busy}>
+                不存了，直接关
+              </Button>
+            </>
+          }
+        >
+          <p className="text-body leading-relaxed text-ink-soft">
+            改动还没写到磁盘上，现在关掉这部分就没了。想留下就先「写入磁盘」，或者点
+            「留下来继续改」接着写。
+          </p>
+        </Modal>
+      )}
+      </Modal>
+    </>
   );
 }
 
@@ -1684,8 +1732,8 @@ function DayDiaries({ memKey, day, files, onClose, reload, onError }) {
  *
  * 用户要的「增加日记的选项」：不打模型、不看流水，日期加正文自己填。
  *
- * 为什么单独一页而不是弹窗：和 `DayDiaries` 一个理由 —— 日记是长文，
- * 弹窗里写到一半按下 ESC 就全丢了。
+ * 为什么是整页而不是弹窗：它是从「自己写一篇」按钮进来的独立动作，要填日期、
+ * 写正文，整页舒展；弹窗留给「点日历上的一天」看 / 改已有的日记（DayDiaries）。
  *
  * 落盘走的是后端的 `writeDiary`，和模型生成的那条路**同一个函数**，
  * 所以：同一天已经有一篇时这篇自动叫 `-2`（不覆盖），并且和生成的那些

@@ -178,6 +178,36 @@ function describeUpstream(status, text, data) {
   return `返回 ${status}${detail ? `：${detail}` : ""}`;
 }
 
+/** 我们会往请求体里塞的生成参数，按「被拒了就脱掉」的顺序列。 */
+const TUNABLE_FIELDS = ["temperature", "top_p", "frequency_penalty", "presence_penalty"];
+
+/**
+ * 上游是不是在说「你发的某个生成参数我不收」，是的话返回那个字段名。
+ *
+ * 起因是一批用户的报错：
+ *   `400 Unsupported value: 'temperature' does not support 0.7 with this
+ *    model. Only the default (1) value is supported.`
+ *
+ * 新一代的推理型模型（OpenAI 的 o / GPT-5 系、以及跟着学的几家）把采样参数
+ * 锁死在默认值上，发了就整轮 400。而预设的 DEFAULT_PARAMS 里 temperature
+ * 是 0.7、topP 是 1 —— normalizeParams 保证这几项**永远是数字**，所以
+ * 「没配的就别发」那套判断在这里根本不成立，我们是无条件发的，撞上这类模型
+ * 必废，而且 400 不属于可重试，副 API 也只是拿同一份参数再废一次。
+ *
+ * 按模型名维护一张黑名单（GEMINI_STRICT 那种）在这里不管用：中转站的模型名
+ * 五花八门，新模型每周都有。改成认**上游的抱怨**——它指名道姓说哪个字段不行，
+ * 就把哪个字段脱掉重打一次，脱到能过为止。管你是今天的哪家、明天的哪个。
+ */
+function rejectedParamField(status, text) {
+  if (status !== 400) return null;
+  const s = String(text ?? "");
+  // 先确认这是一句「不支持」，免得把正文里碰巧出现 temperature 的错误也算上
+  if (!/unsupported|not support|unrecognized|invalid[_ ]?(value|parameter|argument)/i.test(s)) {
+    return null;
+  }
+  return TUNABLE_FIELDS.find((f) => new RegExp(`\\b${f}\\b`, "i").test(s)) ?? null;
+}
+
 /**
  * 上游报错时把**完整的响应体**记进日志。
  *
@@ -333,7 +363,13 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
 
   const startedAt = Date.now();
   let result;
-  for (let attempt = 0; ; attempt += 1) {
+  /*
+   * attempt 只数「因为网络抖动 / 上游 5xx 重打」的次数，它决定下次等多久。
+   * 下面「脱参数重打」那条路**不算**在里面：那不是碰运气再试一次，是换了个
+   * 请求体，既不该占抖动的重试额度，也没有等的必要。
+   */
+  let attempt = 0;
+  for (;;) {
     const retryIn = delays[attempt];
     try {
       result = await requestJson(`${base}/chat/completions`, {
@@ -345,6 +381,7 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
       const why = describeNetworkError(e);
       if (retryIn !== undefined && isTransient(null, e)) {
         logWarn(label, `第 ${attempt + 1} 次请求失败，${retryIn}ms 后重试`, why);
+        attempt += 1;
         await wait(retryIn);
         continue;
       }
@@ -356,9 +393,20 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
     const why = describeUpstream(result.status, result.text, result.data);
     if (retryIn !== undefined && isTransient(result.status, null)) {
       logWarn(label, `第 ${attempt + 1} 次${why}，${retryIn}ms 后重试`);
+      attempt += 1;
       await wait(retryIn);
       continue;
     }
+
+    // 上游点名说某个生成参数它不收（见 rejectedParamField）：脱掉立刻重打。
+    // 一轮只脱一个，脱掉的字段下一轮已经不在 body 里了，所以最多转几圈就收敛。
+    const dropped = rejectedParamField(result.status, result.text);
+    if (dropped && body[dropped] !== undefined) {
+      delete body[dropped];
+      logWarn(label, `${model} 不收 ${dropped}，去掉这个参数重打一次`, why);
+      continue;
+    }
+
     // 摘要那句会被截断（要发成短信），全文只在日志里 —— 这是最后一次机会
     logUpstreamFailure(label, result.status, result.text, body);
     throw new Error(`${label} ${why}`);
@@ -415,9 +463,18 @@ export async function chatWithFallback(primary, fallback, messages, params = {})
     const primaryMsg = String(primaryError?.message ?? primaryError);
 
     if (!endpointUsable(fallback)) {
+      /*
+       * 括号里这句是**补充说明**，不是失败原因。
+       *
+       * 原文是「副 API 没启用或引用的模型已失效」，跟在一句 401 / 503 后面读起来
+       * 像在说「因为副 API 没开所以这轮废了」—— 收到的用户反馈全是跑去折腾副
+       * API、连换好几家模型，换一圈还是同样的报错，因为真正的原因一直摆在
+       * 前半句里（密钥无效 / 上游容量不够）。所以这里明说两件事：前面那句是
+       * 谁回的，以及我们为什么没换线。
+       */
       const why = !fallback
-        ? "副 API 没启用或引用的模型已失效"
-        : "副 API 信息不全（地址/密钥/模型缺一项）";
+        ? "这是模型服务商回的；副 API 没开着，换不了线"
+        : "这是模型服务商回的；副 API 信息不全（地址/密钥/模型缺一项），换不了线";
       logError("LLM", `主 API 失败，且${why}`, primaryMsg);
       throw new Error(`${primaryMsg}（${why}）`);
     }
