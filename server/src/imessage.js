@@ -1,7 +1,8 @@
 import { cardHintFor, isCardUrl, mapsUrlFor, renderMapsLinks } from "./card.js";
 import { watchChatBackground } from "./chatbg.js";
 import { normalizeForHistory, splitBubbles, sleep } from "./delay.js";
-import { chatWithFallback, describeImage, transcribeAudio } from "./llm.js";
+import { checkLineRegistered, watchDelivery } from "./delivery.js";
+import { chatWithFallback, describeImage, faultAdvice, transcribeAudio } from "./llm.js";
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import {
   projectLabel,
@@ -242,6 +243,11 @@ function createRunner(projectRefId) {
     imageCount: 0,
     audioCount: 0,
     fingerprint: "", // 凭据/模式指纹，变了才需要重连
+    // 云端模式的项目凭据。存一份在 runner 上是为了投递检测（delivery.js）——
+    // 它挂在 noteSent 里，而那条路上只有 runner 和 ctx，够不到 project。
+    // 本地 Mac 模式留空串：那边没有 Photon 可问（见 startRunner）
+    projectId: "",
+    projectSecret: "",
     history: new Map(), // spaceId -> [{role, content}]
     seen: new Set(), // 消息 id 去重
     pending: new Map(), // spaceId -> { texts, images, timer, space }
@@ -599,10 +605,23 @@ function ringOf(map, spaceId) {
  *
  * 发送方法本来就可能返回 undefined（平台不支持时 SDK 会警告并跳过），
  * 那种情况不记 —— 记进去等于在环里埋一条撤不掉的占位，把 N 数错。
+ *
+ * 顺带挂投递检测。选这儿是因为**所有**出站消息都从这一个口子过（文字、图片、
+ * 语音、卡片、引用回复各有各的发送路径，但都要来这儿登记），挂在别处必定漏。
+ * watchDelivery 自己是攒批 + 延时的，这里只是登记，不花时间、不抛错。
  */
 function noteSent(runner, ctx, message) {
   const spaceId = ctx?.spaceId;
   if (spaceId && message) pushRing(runner.outbox, spaceId, { message, at: Date.now() });
+  if (message?.id && ctx?.peer) {
+    watchDelivery({
+      projectId: runner.projectId,
+      projectSecret: runner.projectSecret,
+      label: scopeOf(runner, "投递"),
+      guid: String(message.id),
+      peer: ctx.peer,
+    });
+  }
   return message;
 }
 
@@ -1125,7 +1144,22 @@ async function notifyFailure(runner, space, what, err) {
   // 去掉「主 API（xxx · 模型名）」这种前缀里的模型名 —— 对方是普通用户，
   // 不需要知道你用的是哪个中转站的哪个模型，但要知道是网络还是配置问题
   const clean = reason.replace(/^(主|副|视觉)\s*API(（[^）]*）)?\s*/g, "").trim();
-  const text = `⚠️ ${what}：${clean || "未知错误"}`;
+  /*
+   * 补一句「这是谁的错、该找谁」。
+   *
+   * 这是所有失败通知的**唯一出口**（聊天、看图、听语音、协助模式都走这儿），
+   * 所以那句归因挂在这里而不是各个抛错的地方 —— 新加一条失败路径自动带上。
+   *
+   * 起因是一批反馈：对方收到的是一句光秃秃的「返回 503」，既不知道这串数字
+   * 什么意思，也不知道该找谁，于是一律当成 Uranus 坏了。llm.js:faultAdvice
+   * 按错误的归属（上游 / 网络 / 内容审核 / 本地配置没填全）各给一句话。
+   *
+   * 传进来的 `err` 是字符串时（空回那几条自己写好了全文）不加 —— 那些话里
+   * 已经把该说的说完了，再缀一句会重复。
+   */
+  const advice = typeof err === "object" && err ? faultAdvice(err) : "";
+  const body = advice ? `${clean || "未知错误"}（${advice}）` : clean || "未知错误";
+  const text = `⚠️ ${what}：${body}`;
 
   try {
     if (await sendSystem(runner, space, text, { what: "出错原因" })) {
@@ -2641,17 +2675,38 @@ async function handleTurn(
    * 本来就该是空的。那不是失败，别弹「这条没能生成正文」。
    */
   if (!forUser.trim() && !igDone) {
+    /*
+     * 四种空回，**责任方各不相同** —— 所以每种都要点出该去动哪儿。
+     *
+     * 以前四句话都只描述现象（「返回的是空内容」「被正则过滤掉了」），
+     * 读的人只能得出一个结论：Uranus 坏了。而实际上第一种是上游的事
+     * （模型服务商收了 token、回了个 200、正文一个字没有，这我们改不了），
+     * 后三种是这台机器上的预设/模型选择的事。指错了方向比不说更费时间。
+     */
     const why = !reply.trim()
-      ? "模型这轮返回的是空内容。"
+      ? // 最常见、也最容易被误判成 Uranus 的一种：HTTP 200 + 空正文。
+        // token 照扣。多见于推理型模型（思维链吃满了输出长度，正文没写出来）
+        // 和中转站的空响应。说清楚是上游回的，并给一条自己能动的路
+        "模型服务商返回了成功，但正文是空的（这一轮的 token 照样会扣）。" +
+        "这是上游返回的结果，与 Uranus 无关 —— 常见于推理型模型把输出长度全用在" +
+        "思维链上，或者中转站回了空响应。可以换个模型再试，或者把这句话发给你的 API 服务商。"
       : stripSearchTags(reply) === ""
-        ? "模型这轮只写了 [搜索:…] 标记，没写给对方看的正文。"
+        ? "模型这轮只写了 [搜索:…] 标记，没写给对方看的正文。换个更听话的模型会好一些。"
         : // 查岗只查一轮，所以第二次回复里再写标签是没用的 —— 那种回复剥完就空了。
           // 单独说清楚，不然用户看到的是「被正则过滤掉了」，去翻正则规则白费功夫
           stripSpyTags(reply) === ""
           ? "模型这轮只写了查岗标签，没写给对方看的正文（查岗一轮只查一次，" +
             "第二次回复里再写标签不会再查）。"
-          : "模型这轮的输出被预设里的正则规则全部过滤掉了（大概只输出了思维链，没写正文）。";
-    logWarn(scope, "过滤后没有可发送的正文，这轮不发气泡", `原文 ${reply.length} 字：${reply}`);
+          : "模型这轮写的东西被预设里的正则规则全部删掉了（大概只输出了思维链，没写正文）。" +
+            "这一条不是上游的问题，去「预设 → 正则」里看看哪条规则吃掉了整段。";
+    /*
+     * 空回按 error 记，不再是 warn。
+     *
+     * 前端控制台默认只看 info 及以上，warn 本来也能看到 —— 但一屏几十条
+     * warn 里混着这一条，等于没有。空回是「花了钱没拿到东西」，和上游报错
+     * 同一个量级，理应和它们排在一起。
+     */
+    logError(scope, "这一轮没有可发送的正文（token 已消耗）", `原文 ${reply.length} 字：${reply}`);
     await space.responding(() => notifyFailure(runner, space, "这条没能生成正文", why));
     return;
   }
@@ -2728,6 +2783,8 @@ async function handleTurn(
       eps,
       // 引用和撤回要按 spaceId 去查两个环形缓冲（见 sendBubbles 的注释）
       spaceId,
+      // 投递检测要拿它去查「这条到底送到没有」，以及探这个地址支不支持 iMessage
+      peer,
     });
 
     /*
@@ -2889,6 +2946,7 @@ async function commitIgTurn(getConfig, runner, role, outcome) {
           eps: resolveRoleEndpoints(config, fresh),
           // 引用和撤回要按 spaceId 去查两个环形缓冲（见 sendBubbles 的注释）
           spaceId,
+          peer,
         });
         if (!sent) {
           logWarn(scope, "Instagram 顺带的那条短信一条都没能发出去（多半是生成图片失败了）");
@@ -3556,6 +3614,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
       eps,
       // 引用和撤回要按 spaceId 去查两个环形缓冲（见 sendBubbles 的注释）
       spaceId,
+      peer,
     });
     if (!sent) {
       logWarn(scope, "这条主动消息一条都没能发出去（多半是生成图片失败了）");
@@ -4291,6 +4350,9 @@ async function startRunner(getConfig, project, meta, retries = 0) {
   runner.mode = project.mode === "local" ? "local" : "cloud";
   runner.fingerprint = fingerprintOf(project);
   runner.linePhone = project.linePhone ?? "";
+  // 投递检测要拿它去开 gRPC。本地 Mac 模式没有铸币流程，留空 = 那边不做检测
+  runner.projectId = runner.mode === "cloud" ? (project.projectId ?? "") : "";
+  runner.projectSecret = runner.mode === "cloud" ? (project.projectSecret ?? "") : "";
   runner.status = "connecting";
   runner.startedAt = new Date().toISOString();
   runner.retries = retries;
@@ -4348,6 +4410,23 @@ async function startRunner(getConfig, project, meta, retries = 0) {
     );
 
     startBgWatcher(getConfig, runner, project, scope);
+
+    /*
+     * 探一下这条线路的号码有没有真的注册成 iMessage。
+     *
+     * 「连上了但收不到消息」里最隐蔽的一种就在这儿 —— 号码分配了、连接也起来了，
+     * 但它没在 iMessage 上激活，于是对方发的是绿色短信、根本不进这条线路。
+     * 光看「已连接」是看不出来的，所以连上就问一句，把它变成控制台里的一行。
+     *
+     * 不 await：探活要走一次 gRPC，不该拖住消息循环开始接消息。
+     * 里面自己兜住所有异常，探不出来只记 debug。
+     */
+    void checkLineRegistered({
+      projectId: runner.projectId,
+      projectSecret: runner.projectSecret,
+      label: scopeOf(runner, "投递"),
+      linePhone: project.linePhone ?? "",
+    });
 
     // 重启前排着的主动消息接着数 —— 这一步就是「关机不清计时器」
     rehydrateProactive(getConfig, runner);

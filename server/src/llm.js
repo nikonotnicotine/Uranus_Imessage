@@ -181,6 +181,37 @@ function moveModelTail(messages, label) {
  * 记进日志的 detail 里（见 chatCompletion），前端控制台展开那一行就能看到、
  * 「复制」也会带上。
  */
+/**
+ * HTTP 状态码翻译成一句人话。
+ *
+ * 用户反馈里最常见的一类是「我收到一串数字，不知道是什么意思」—— 光一个
+ * `返回 503` 对着聊天的人毫无信息量，他既不知道这是谁家的错，也不知道该
+ * 找谁。于是默认归因给 Uranus，一路问上来。
+ *
+ * 所以每个码后面缀一句「这个码通常意味着什么」。措辞刻意短：这句话最终要
+ * 发成一条 iMessage，跟在它后面的还有上游原文和「找服务商」那半句。
+ *
+ * 只写**最常见**的那个成因，不写「也可能是 A 也可能是 B」—— 拿不准的时候
+ * 上游原文（detail）比我们的猜测准，多说一种可能只会挤掉那段原文。
+ * 表里没有的码就不猜，光报数字。
+ */
+const STATUS_HINTS = {
+  400: "上游不收这个请求",
+  401: "密钥不对或已失效",
+  402: "账户余额不够了",
+  403: "这把密钥没有用这个模型的权限",
+  404: "上游没有这个模型，或者接口地址填错了",
+  408: "上游自己超时了",
+  413: "这一轮要发的内容太长，上游不收",
+  422: "上游不收这个请求里的某个字段",
+  429: "打得太频繁，或者额度/余额用完了",
+  500: "上游服务器内部出错",
+  502: "上游网关不通",
+  503: "上游这会儿没有可用的渠道",
+  504: "上游超时没回",
+  529: "上游过载了",
+};
+
 function describeUpstream(status, text, data) {
   const detail =
     data?.error?.message ??
@@ -188,9 +219,59 @@ function describeUpstream(status, text, data) {
     data?.message ??
     (typeof data?.error === "string" ? data.error : null) ??
     (text ? text.slice(0, UPSTREAM_DETAIL_MAX) : "");
+  const hint = STATUS_HINTS[status];
   // 不带「API」二字：调用方会在前面拼 label（「主 API」「视觉 API」），
   // 否则会拼出「视觉 API API 返回 429」这种叠字
-  return `返回 ${status}${detail ? `：${detail}` : ""}`;
+  return `返回 ${status}${hint ? `（${hint}）` : ""}${detail ? `：${detail}` : ""}`;
+}
+
+/**
+ * 一次失败该由谁负责，以及那句「该找谁」怎么说。
+ *
+ * 为什么需要这句话：聊天失败的错误会**原样发进用户的 iMessage**
+ * （imessage.js:notifyFailure）。那条短信的读者不是机主，是正在和角色聊天
+ * 的人 —— 他看到一句光秃秃的「返回 503：分组下无可用渠道」，第一反应是
+ * 「Uranus 坏了」，于是来问机主，机主再来问项目。链条上每个人都在查错的地方。
+ *
+ * 分四档而不是一律说「上游的问题」：`401 密钥不对` 和「没填密钥」的解决方式
+ * 完全相反，前者要找服务商、后者自己去界面里补一栏。都推给服务商的话，一半
+ * 的人会带着一个 Uranus 侧的配置问题去找客服，客服查半天也查不出东西。
+ */
+const FAULT_ADVICE = {
+  // 上游收到了请求、明确回了个错误码。Uranus 改不了它
+  upstream: "这是模型服务商回的错，不是 Uranus 的问题，请把上面这句话发给你的 API 服务商",
+  // 请求压根没到上游。可能是本机出不了网，也可能是那家站点挂了/域名填错了
+  network: "这一步没能连上模型服务商，先看网络和代理通不通、接口地址有没有填错",
+  // 内容安全。也在上游那一侧，但解决办法是换说法/换模型，不是找客服要额度
+  blocked: "这是模型服务商的内容审核拦下的，不是 Uranus 的问题，换个说法或换个模型再试",
+  // 这一档是我们自己的事，别往外推
+  config: "这是 Uranus 里还没填全的配置，去「连接」或「角色」里补上就行",
+};
+
+/** 在错误上盖一个归属标记，`faultAdvice` 靠它挑那句「该找谁」。 */
+function faultKind(err, kind) {
+  err.faultKind = kind;
+  return err;
+}
+
+/**
+ * 这个错误该配哪句「找谁解决」。
+ *
+ * 由 imessage.js:notifyFailure 在**真要发给对方**的那一刻调 —— 不在抛出的地方
+ * 拼死。两个理由：
+ *
+ *  - 日志里只要原因，缀一句「请联系服务商」纯属噪音，而且中途还要经过重试和
+ *    换线，提前定死措辞会让最后成功的那一轮也带着一句道歉；
+ *  - 发给对方的路不止聊天一条（看图、听语音也会失败），advice 挂在那个共同的
+ *    出口上，新加的失败路径自动带上，不会漏。
+ *
+ * 没标过的按 upstream 算：走到用户面前的失败，绝大多数是上游回的状态码。
+ *
+ * @returns {string} 那句建议；`faultNote` 有的话拼在它前面
+ */
+export function faultAdvice(err) {
+  const kind = err?.faultKind ?? (err?.blocked ? "blocked" : "upstream");
+  return [err?.faultNote, FAULT_ADVICE[kind] ?? FAULT_ADVICE.upstream].filter(Boolean).join("；");
 }
 
 /** 我们会往请求体里塞的生成参数，按「被拒了就脱掉」的顺序列。 */
@@ -678,9 +759,11 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
   const key = endpoint?.key ?? "";
   const model = endpoint?.model ?? "";
 
-  if (!base) throw new Error(`${label} 没填接口地址`);
-  if (!key) throw new Error(`${label} 没填密钥`);
-  if (!model) throw new Error(`${label} 没填模型名`);
+  // 这三条是 Uranus 侧的配置没填全，不是上游的错 —— 标成 config，
+  // 免得用户拿着「没填密钥」去问服务商客服
+  if (!base) throw faultKind(new Error(`${label} 没填接口地址`), "config");
+  if (!key) throw faultKind(new Error(`${label} 没填密钥`), "config");
+  if (!model) throw faultKind(new Error(`${label} 没填模型名`), "config");
 
   // Gemini 3.7 / 3.8 的两条硬规矩，见 GEMINI_STRICT
   const strict = GEMINI_STRICT.test(model);
@@ -800,7 +883,9 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
         await wait(retryIn);
         continue;
       }
-      throw new Error(`${label} 请求失败：${why}`);
+      // 请求没能到上游：可能是这台机器出不了网/要代理，也可能是那家站点自己挂了。
+      // 两边都有可能，所以建议是「先看网络和地址」而不是「去找服务商」
+      throw faultKind(new Error(`${label} 请求失败：${why}`), "network");
     }
 
     if (result.ok) {
@@ -869,13 +954,20 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
 
     // 摘要那句会被截断（要发成短信），全文只在日志里 —— 这是最后一次机会
     logUpstreamFailure(label, result.status, result.text, body);
-    throw blockedIf(
-      new Error(
-        refusalTries
-          ? `${label} 连着 ${refusalTries + 1} 次被内容安全拦下：${why}`
-          : `${label} ${why}`
+    const contentBlocked = isContentBlocked(result.status, result.text);
+    throw faultKind(
+      blockedIf(
+        new Error(
+          refusalTries
+            ? `${label} 连着 ${refusalTries + 1} 次被内容安全拦下：${why}`
+            : `${label} ${why}`
+        ),
+        refusalTries && contentBlocked
       ),
-      refusalTries && isContentBlocked(result.status, result.text)
+      // 内容审核也在上游那一侧，但办法是换说法/换模型，不是找客服要额度 ——
+      // 所以和普通的状态码错误分开标。`blocked` 那个标记管的是重试策略，
+      // 这里管的是「跟对方怎么说」，两件事各走各的
+      contentBlocked ? "blocked" : "upstream"
     );
   }
 
@@ -957,19 +1049,26 @@ export async function chatWithFallback(primary, fallback, messages, params = {},
 
     if (!endpointUsable(fallback)) {
       /*
-       * 括号里这句是**补充说明**，不是失败原因。
+       * 主 API 挂了、副 API 没配 —— 这条路上**一个「副 API」都不许出现**。
        *
-       * 原文是「副 API 没启用或引用的模型已失效」，跟在一句 401 / 503 后面读起来
-       * 像在说「因为副 API 没开所以这轮废了」—— 收到的用户反馈全是跑去折腾副
-       * API、连换好几家模型，换一圈还是同样的报错，因为真正的原因一直摆在
-       * 前半句里（密钥无效 / 上游容量不够）。所以这里明说两件事：前面那句是
-       * 谁回的，以及我们为什么没换线。
+       * 原来这里会在错误后面缀一句「副 API 没开着，换不了线」，本意是解释
+       * 「我们为什么没换线」。实际效果是所有人都以为「没接副 API」才是这轮
+       * 失败的原因，于是跑去接副 API、连换好几家模型 —— 换一圈还是同样的
+       * 报错，因为真正的原因从头到尾就摆在前半句里（密钥错、余额空、
+       * 上游容量不够）。副 API 是个可选的容灾开关，不是能不能跑的前提。
+       *
+       * 所以现在只说两件事：这句话是**谁**说的（模型服务商，不是 Uranus），
+       * 以及该**找谁**（服务商，不是这个项目）。把话说到这个份上，用户
+       * 转述给服务商客服时也不用再解释一遍。
+       *
+       * 日志里保留「副 API 没开着」那一句 —— 排查的人需要知道为什么没换线，
+       * 而日志只有机主自己看得到，不会被当成待办事项。
        */
-      const why = !fallback
-        ? "这是模型服务商回的；副 API 没开着，换不了线"
-        : "这是模型服务商回的；副 API 信息不全（地址/密钥/模型缺一项），换不了线";
-      logError("LLM", `主 API 失败，且${why}`, primaryMsg);
-      throw new Error(`${primaryMsg}（${why}）`);
+      const noFallback = !fallback
+        ? "副 API 没开着，所以没换线"
+        : "副 API 信息不全（地址/密钥/模型缺一项），所以没换线";
+      logError("LLM", `主 API 失败，${noFallback}`, primaryMsg);
+      throw primaryError;
     }
 
     logWarn("LLM", "主 API 失败，改用副 API", primaryMsg);
@@ -1004,7 +1103,19 @@ export async function chatWithFallback(primary, fallback, messages, params = {},
       if (fallbackError?.aborted || opts.signal?.aborted) throw fallbackError;
       const fallbackMsg = String(fallbackError?.message ?? fallbackError);
       logError("LLM", "主副两条 API 都失败", `主：${primaryMsg}\n副：${fallbackMsg}`);
-      throw new Error(`主副都失败 —— 主：${primaryMsg}；副：${fallbackMsg}`);
+      /*
+       * 两条都配了、两条都挂了。这一路**可以**提副 API —— 用户确实开着它，
+       * 说「两条线都不通」是在陈述事实，不会让人以为该去接一条没接的线。
+       *
+       * 但两句原因都带上就太长了（发到 iMessage 是一条短信），而且多半是
+       * 同一个原因说两遍（同一个中转站的两个模型、同一把密钥）。所以摘要
+       * 只留主 API 那句，副 API 那句留在日志的 detail 里。
+       *
+       * `faultNote` 由 faultAdvice 拼进那句建议 —— 抛的还是主 API 那个错误
+       * 对象本身，措辞照旧在 notifyFailure 那一刻才定。
+       */
+      primaryError.faultNote = "副 API 也试过了，同样没通";
+      throw primaryError;
     }
   }
 }
@@ -1127,7 +1238,13 @@ export async function describeImage(endpoint, prompt, image) {
     timeout: VISION_TIMEOUT,
   });
   const text = content.trim();
-  if (!text) throw new Error("视觉 API 返回了空描述");
+  // 200 + 空正文：模型收了钱、什么都没说。和聊天那边的空回是同一件事
+  if (!text) {
+    throw faultKind(
+      new Error("视觉 API 返回了成功，但描述是空的（这一轮的 token 照样会扣）"),
+      "upstream"
+    );
+  }
   return text;
 }
 
@@ -1202,10 +1319,11 @@ export async function transcribeAudio(endpoint, prompt, audio) {
   const key = endpoint?.key ?? "";
   const model = endpoint?.model ?? "";
 
-  if (!base) throw new Error(`${label} 没填接口地址`);
-  if (!key) throw new Error(`${label} 没填密钥`);
-  if (!model) throw new Error(`${label} 没填模型名`);
-  if (!audio?.base64) throw new Error(`${label} 拿到的是一段空音频`);
+  // 前三条是配置没填全（Uranus 侧的事），第四条是这边把音频取坏了，都别推给服务商
+  if (!base) throw faultKind(new Error(`${label} 没填接口地址`), "config");
+  if (!key) throw faultKind(new Error(`${label} 没填密钥`), "config");
+  if (!model) throw faultKind(new Error(`${label} 没填模型名`), "config");
+  if (!audio?.base64) throw faultKind(new Error(`${label} 拿到的是一段空音频`), "config");
 
   const usePrompt = String(prompt ?? "").trim() || DEFAULT_AUDIO_PROMPT;
   const mimeType = audio.mimeType || "audio/mpeg";
@@ -1257,7 +1375,7 @@ export async function transcribeAudio(endpoint, prompt, audio) {
         await wait(retryIn);
         continue;
       }
-      throw new Error(`${label} 请求失败：${why}`);
+      throw faultKind(new Error(`${label} 请求失败：${why}`), "network");
     }
 
     if (result.ok) break;
@@ -1275,7 +1393,10 @@ export async function transcribeAudio(endpoint, prompt, audio) {
       `上游返回 ${result.status}，完整响应体如下`,
       `请求：${model}，音频 ${kb}KB / ${mimeType}\n响应：${result.text || "（空响应体）"}`
     );
-    throw new Error(`${label} ${why}`);
+    throw faultKind(
+      new Error(`${label} ${why}`),
+      isContentBlocked(result.status, result.text) ? "blocked" : "upstream"
+    );
   }
 
   const ms = Date.now() - startedAt;
@@ -1304,8 +1425,12 @@ export async function transcribeAudio(endpoint, prompt, audio) {
      * 把它带上，比一句「返回了空描述」有用得多。
      */
     const reason = candidate?.finishReason ?? result.data?.promptFeedback?.blockReason;
-    throw new Error(
-      `${label} 返回了空结果${reason ? `（${reason}）` : ""}：${result.text.slice(0, 300)}`
+    throw faultKind(
+      new Error(
+        `${label} 返回了空结果${reason ? `（${reason}）` : ""}：${result.text.slice(0, 300)}`
+      ),
+      // SAFETY / RECITATION / PROHIBITED_CONTENT 都是审核拦的，办法是换说法不是找客服
+      /safety|recitation|prohibited|blocked/i.test(String(reason ?? "")) ? "blocked" : "upstream"
     );
   }
 

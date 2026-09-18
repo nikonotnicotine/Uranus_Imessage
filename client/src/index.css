@@ -48,6 +48,36 @@ body,
   height: 100%;
 }
 
+/*
+ * 「一屏高」。手写而不是用 Tailwind 的 h-screen。
+ *
+ * h-screen 是 100vh，而手机浏览器的 100vh **不是看得见的那一屏** ——
+ * 它按「地址栏收起后」的高度算，地址栏和底部工具条是盖在上面的。
+ * 于是 `flex h-screen overflow-hidden` 这套三栏布局里，贴在底部的全局保存条
+ * 正好落在地址栏底下，而整页又是 overflow-hidden、滚不过去 ——
+ * 只能双指缩小整页才看得见「保存」。
+ *
+ * 100dvh 是「当前实际可见」的那一屏，会随地址栏收放变化，正是这里要的。
+ * 两行一起写是为了顺序确定：老浏览器只认第一行，认得 dvh 的用第二行覆盖。
+ * 用 Tailwind 的 `h-screen h-[100dvh]` 也能生成这两条，但它们的先后由
+ * Tailwind 自己的排序决定、不由 class 顺序决定，压不住。
+ */
+.h-viewport {
+  height: 100vh;
+  height: 100dvh;
+}
+
+/*
+ * 贴底元素的下内边距，把 iPhone 底部小黑条（home indicator）让出来。
+ *
+ * index.html 上写了 viewport-fit=cover，页面会铺到安全区之外；dvh 管的是
+ * 浏览器工具条，管不了这条。0.75rem 是原来的 py-3，不加就等于把保存按钮
+ * 压在小黑条底下 —— 点得到，但看着像被截了一截。
+ */
+.pb-safe {
+  padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+}
+
 body {
   /* 正文是 #616161，标题才用 #18181b —— 所以默认色是 soft 那一档 */
   @apply bg-paper text-ink-soft antialiased;

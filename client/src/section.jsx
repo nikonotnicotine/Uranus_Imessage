@@ -68,7 +68,17 @@ export function GlobalSaveBar({ hint }) {
   if (!dirty && !busy && !failed) return null;
 
   return (
-    <div className="shrink-0 border-t border-line bg-paper px-6 py-3 lg:px-10">
+    /*
+     * pb-safe 顶掉下边的 py-3：iPhone 上页面铺到安全区之外（viewport-fit=cover），
+     * 不让出底部那条小黑条的话，「保存」看着像被屏幕边缘啃了一口。
+     * 具体值见 index.css，它就是 0.75rem + 安全区。
+     *
+     * pr-20 只在手机上给：右下角那个客服气泡是 fixed bottom-5 right-5 的 48px 圆钮，
+     * z-30 压在这条之上。375px 的屏上这条是靠右对齐的，「保存」正好钻到气泡底下 ——
+     * 右半边点不着。把右内边距留到 80px，让按钮从气泡下面挪出来（气泡占到右边 68px）。
+     * 桌面端不需要：那儿内容居中在 max-w-content 里，离窗口右边还远着。
+     */
+    <div className="shrink-0 border-t border-line bg-paper px-6 pb-safe pr-20 pt-3 md:pr-6 lg:px-10">
       <div className="mx-auto flex max-w-content flex-wrap items-center justify-end gap-x-6 gap-y-2">
         <div className="mr-auto min-w-0 text-meta leading-relaxed">
           {failed ? (

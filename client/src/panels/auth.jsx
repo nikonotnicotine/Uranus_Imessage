@@ -100,7 +100,9 @@ export function AuthGate({ children }) {
   if (stage === "ready") return children;
 
   return (
-    <div className="flex h-screen items-center justify-center overflow-y-auto px-6 py-10" data-scroll>
+    // h-viewport 而不是 h-screen：手机上 100vh 比看得见的那一屏高，
+    // 居中之后整块往下偏，密码框和按钮会压在地址栏底下（见 index.css）
+    <div className="flex h-viewport items-center justify-center overflow-y-auto px-6 py-10" data-scroll>
       <div className="w-full max-w-sm">
         <div className="mb-8 flex items-center gap-3">
           <UranusBadge size={36} />

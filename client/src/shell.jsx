@@ -47,31 +47,73 @@ import { GroupLabel, ListItem, Modal, Reveal, UranusBadge, fmtStamp } from "./ui
  * 只有换分区那一下用得上；同一个分区里点侧栏锚点是当场就找得着的。
  */
 const ANCHOR_TRIES = 30;
-import { List, Menu, Plus, X } from "lucide-react";
+import { List, Menu, PanelLeftClose, Pin, PinOff, Plus, X } from "lucide-react";
 
 /**
  * 60px 导航轨里的一格。
  *
- * 只有 20px 图标，没有底色（硬规则：导航轨「仅 20px 纯色 SVG 图标」）——
- * 激活态靠字色从 #787878 转到 #18181b 加左边一条 2px 竖线表示，
- * 不刷色块。文字标签放 title 和 aria-label 里，鼠标停一下就能看到。
+ * 收起时只有 20px 图标，没有底色（硬规则：导航轨「仅 20px 纯色 SVG 图标」）——
+ * 激活态靠字色从 #787878 转到 #18181b 加左边一条 2px 竖线表示，不刷色块。
+ * 收起时文字标签放 title 和 aria-label 里，鼠标停一下就能看到。
+ *
+ * `expanded` 为真时（用户点了展开键）在图标右边补上文字。那条「仅图标」的规则
+ * 管的是**默认形态** —— 展开是用户自己按出来的，他要的正是那几个字。
+ * 展开后仍然不刷底色，激活态照旧是字色 + 左边那条竖线，和收起时一套语言。
  */
-export function RailButton({ icon: Icon, label, active, onClick }) {
+export function RailButton({ icon: Icon, label, active, expanded, onClick }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      title={label}
+      // 展开时文字就在眼前，title 再冒一遍是噪音
+      title={expanded ? undefined : label}
       aria-label={label}
       aria-current={active ? "page" : undefined}
-      className={`relative flex h-11 w-full items-center justify-center transition-colors duration-150 ${
-        active ? "text-ink" : "text-ink-faint hover:text-ink"
-      }`}
+      className={`relative flex h-11 w-full items-center transition-colors duration-150 ${
+        expanded ? "gap-3 px-4" : "justify-center"
+      } ${active ? "text-ink" : "text-ink-faint hover:text-ink"}`}
     >
       {active && <span className="absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 bg-ink" />}
-      <Icon size={20} strokeWidth={1.75} />
+      <Icon size={20} strokeWidth={1.75} className="shrink-0" />
+      {expanded && <span className="min-w-0 truncate text-ui">{label}</span>}
     </button>
   );
+}
+
+/** 导航轨展开/固定状态的 localStorage 键。带版本号，以后改形态可以换键重来。 */
+const RAIL_PIN_KEY = "uranus.rail.pinned.v1";
+
+/**
+ * 「导航轨固定展开」这个偏好。
+ *
+ * 记在 localStorage 而不是 config：它是**这台机器上这个浏览器**的显示偏好，
+ * 和「配置」不是一回事 —— 写进 config 会跟着备份、跟着云同步跑到别人机器上，
+ * 还会让一次纯视觉的点击把整份配置标成「有未保存的改动」。
+ *
+ * 读不到就当没固定（收起）—— 那是原来的形态，不会让人措手不及。
+ */
+function useRailPin() {
+  const [pinned, setPinned] = useState(() => {
+    try {
+      return window.localStorage.getItem(RAIL_PIN_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+
+  const toggle = useCallback(() => {
+    setPinned((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(RAIL_PIN_KEY, next ? "1" : "0");
+      } catch {
+        // 隐身模式 / 禁了存储：这一次照样展开，只是刷新后记不住
+      }
+      return next;
+    });
+  }, []);
+
+  return [pinned, toggle];
 }
 
 /**
@@ -244,6 +286,37 @@ export function AppShell() {
   const [drawer, setDrawer] = useState(false);
   // 移动端：60px 导航轨也收着，从顶栏的汉堡键点开（桌面端常驻，这个值用不上）
   const [rail, setRail] = useState(false);
+  /*
+   * 桌面端导航轨的展开状态。两个值，不是一个：
+   *
+   *  - `railPinned`：图钉按下的，记在 localStorage 里、刷新后还在；
+   *  - `railOpen`：这一次点开的，切走分区就收回去。
+   *
+   * 分开是因为它们的生命周期不一样。合成一个布尔量的话，要么点一次就永久固定
+   * （那图钉没意义），要么固定态也会被「选完一个分区自动收起」那条逻辑收掉
+   * （那固定就固定不住）。
+   *
+   * 展开 = 两者任一为真。刻意**不做 hover 展开** —— 鼠标路过侧栏时整个布局
+   * 跟着抽动，是用户明确否掉的那种。
+   */
+  const [railPinned, toggleRailPin] = useRailPin();
+  const [railOpen, setRailOpen] = useState(false);
+  const railWide = railPinned || railOpen;
+
+  /*
+   * 展开键。收起时点开，展开时收起 —— 但「展开」可能是图钉撑着的，
+   * 这时候光把 railOpen 关掉没用（railWide 是两者取或，图钉那一路还是真）,
+   * 表现就是按钮点了没反应。所以收起的时候顺手把图钉也松开：
+   * 按那个收起箭头本来就是「我不要它一直摊着」的意思。
+   */
+  const toggleRail = useCallback(() => {
+    if (railWide) {
+      setRailOpen(false);
+      if (railPinned) toggleRailPin();
+      return;
+    }
+    setRailOpen(true);
+  }, [railWide, railPinned, toggleRailPin]);
   // 只轮询一次，角色面板 / iMessage 面板共用这一份
   const bridge = useBridgeStatus();
   // 壁纸只该有一份状态 —— 这个 hook 会往 <html> 上写 CSS 变量，调两次会互相盖
@@ -252,22 +325,32 @@ export function AppShell() {
 
   const section = sectionById(tab);
 
-  // 两个抽屉开着时按 ESC 关掉（和 Modal 一个手感）
+  /*
+   * 两个抽屉开着时按 ESC 关掉（和 Modal 一个手感）。
+   * 桌面端临时展开的导航轨也收在这条里 —— 展开之后不想选了，ESC 是最顺手的退路。
+   * 图钉按着的不动：那是持久偏好，不是「一个开着的东西」。
+   */
   useEffect(() => {
-    if (!drawer && !rail) return;
+    if (!drawer && !rail && !railOpen) return;
     const onKey = (e) => {
       if (e.key !== "Escape") return;
       setDrawer(false);
       setRail(false);
+      setRailOpen(false);
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [drawer, rail]);
+  }, [drawer, rail, railOpen]);
 
   const goto = useCallback((id) => {
     setTab(id);
     setDrawer(false);
     setRail(false);
+    /*
+     * 桌面端那条临时展开的轨道，选完分区就收回去 —— 展开是为了「找到要去哪儿」，
+     * 到了就该把宽度还给内容。图钉按着的不收（那是用户说的「一直开着」）。
+     */
+    setRailOpen(false);
     /*
      * 上报的列表清空：现在有两个分区会 publish（上下文 / 图库），
      * 不清的话切过去的那一瞬间，260px 那栏画的是上一个分区留下的条目。
@@ -407,12 +490,53 @@ export function AppShell() {
   const railInner = (
     <>
       <div className="flex w-full flex-col items-center gap-1">
+        {/*
+          展开键 + 图钉。排在十三个分区之前 —— 它管的是「这条轨道怎么显示」，
+          不是一个分区，混在中间会被当成第十四个分区。
+          下面那条 1px 线把「控制」和「分区」分开，也是这个意思。
+        */}
+        <div
+          className={`flex w-full items-center ${railWide ? "justify-between gap-1 px-2" : "flex-col gap-1"}`}
+        >
+          <button
+            type="button"
+            onClick={toggleRail}
+            aria-label={railWide ? "收起分区名称" : "展开分区名称"}
+            title={railWide ? "收起分区名称" : "展开分区名称"}
+            aria-expanded={railWide}
+            className="flex h-11 w-11 shrink-0 items-center justify-center text-ink-faint transition-colors duration-150 hover:text-ink"
+          >
+            {railWide ? <PanelLeftClose size={20} strokeWidth={1.75} /> : <Menu size={20} strokeWidth={1.75} />}
+          </button>
+          {/*
+            图钉只在展开时出现：收起状态下「固定」没有可固定的东西，
+            而且 60px 宽里塞两个键会把那条「一列 20px 图标」的节奏打乱。
+            按下时字色转到 --ink（和激活的分区同一个信号），不刷底色。
+          */}
+          {railWide && (
+            <button
+              type="button"
+              onClick={toggleRailPin}
+              aria-label={railPinned ? "取消固定" : "固定展开"}
+              title={railPinned ? "取消固定（刷新后收起）" : "固定展开（刷新后还在）"}
+              aria-pressed={railPinned}
+              className={`flex h-11 w-11 shrink-0 items-center justify-center transition-colors duration-150 ${
+                railPinned ? "text-ink" : "text-ink-faint hover:text-ink"
+              }`}
+            >
+              {railPinned ? <Pin size={16} strokeWidth={2} /> : <PinOff size={16} strokeWidth={1.75} />}
+            </button>
+          )}
+        </div>
+        <div className="my-1 h-px w-full bg-line" />
+
         {NAV.map((n) => (
           <RailButton
             key={n.id}
             icon={n.icon}
             label={n.label}
             active={tab === n.id}
+            expanded={railWide}
             onClick={() => goto(n.id)}
           />
         ))}
@@ -424,13 +548,27 @@ export function AppShell() {
   return (
     <SectionCtx.Provider value={sectionValue}>
       <SaveHintCtx.Provider value={saveHintValue}>
-        {/* 100vh + overflow hidden：整页不滚，只有 260px 那栏和主内容区各自滚 */}
-        <div className="flex h-screen overflow-hidden">
+        {/*
+          一屏高 + overflow hidden：整页不滚，只有 260px 那栏和主内容区各自滚。
+
+          高度用 `.h-viewport`（100dvh，回落 100vh）而不是 h-screen ——
+          手机上 100vh 比看得见的那一屏高，底部的保存条会被地址栏盖住、
+          而整页又滚不动，只能缩放才找得到「保存」。说明见 index.css。
+        */}
+        <div className="flex h-viewport overflow-hidden">
           {/*
-            一层：60px 导航轨。上下 flex 分布，底部一个圆形头像。
-            手机上收起来（`hidden md:flex`），从顶栏的汉堡键点开成覆盖层。
+            一层：导航轨。收起 60px 只有图标，展开 200px 带分区名。
+            上下 flex 分布，底部一个圆形头像。
+            手机上整条收起来（`hidden md:flex`），从顶栏的汉堡键点开成覆盖层。
+
+            只过渡 width，不过渡别的：轨道变宽的同时右边两栏要跟着挪，
+            `transition-all` 会把里面图标的字色变化也拖成 150ms，反而显得黏。
           */}
-          <nav className="hidden w-[60px] shrink-0 flex-col items-center justify-between border-r border-line py-4 md:flex">
+          <nav
+            className={`hidden shrink-0 flex-col items-center justify-between overflow-hidden border-r border-line py-4 transition-[width] duration-150 md:flex ${
+              railWide ? "w-[200px]" : "w-[60px]"
+            }`}
+          >
             {railInner}
           </nav>
 
