@@ -234,7 +234,7 @@ export function GlobalSearch({ config, onJump }) {
       </div>
 
       {showList && (
-        <div className="absolute right-0 top-full z-30 mt-1 max-h-[60vh] w-[min(20rem,80vw)] overflow-y-auto border border-line bg-paper py-1 shadow-sm">
+        <div className="absolute right-0 top-full z-30 mt-1 max-h-[60vh] w-[min(20rem,80vw)] overflow-y-auto border border-line bg-paper py-1 shadow-sm" data-scroll>
           {hits.length === 0 && (
             <p className="px-3 py-3 text-meta leading-relaxed text-ink-meta">
               没找到「{q.trim()}」。会话记录和表情包标签要进对应分区里搜。

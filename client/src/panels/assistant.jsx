@@ -183,7 +183,7 @@ function AssistantPanel({ onClose }) {
       </div>
 
       {/* 身：对话。独立滚动 */}
-      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4" data-scroll>
         {turns.length === 0 && (
           <Opening
             hello={hello?.hello ?? DEFAULT_HELLO}

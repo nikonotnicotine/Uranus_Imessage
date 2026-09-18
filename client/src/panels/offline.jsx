@@ -23,7 +23,7 @@
  * 界面上必须立刻看见它，这样点一下「重 roll」就能重来，不用重打一遍。
  */
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   CircleAlert,
@@ -59,13 +59,21 @@ import { LastPromptBody, useLastPrompt } from "./context.jsx";
 const MAX_TURN_CHARS = 20000;
 
 /**
- * 一进来先画多少轮。
+ * 一进来先画多少轮，以及每次往上看再补多少轮。
  *
  * 剧情是从上往下读的，真正在看的永远是末尾那几轮。但一条 HTML 回复就是一个
- * iframe，几十轮一起挂着页面会明显发涩 —— 所以只画最近这些，上面留一个
- * 按钮把更早的一次展开（和「相册」那边「显示全部 N 张」一个做法）。
+ * iframe，几百轮一起挂着页面会明显发涩 —— 所以先画最近这些。
+ *
+ * 早先这里是「一次性展开」：上面挂一个按钮，点了才把更早的全铺出来。问题是
+ * 划到顶之后**什么都看不见** —— 那批更早的轮次根本不在 DOM 里，按钮又只有
+ * 豆大一个，一下划过去就以为「聊天记录没了」。现在改成往上滚就自动补：
+ * 滚到接近顶端时按 TURN_CHUNK 一轮一轮往回加载，滚到哪看到哪。
  */
 const SHOW_TURNS = 20;
+const TURN_CHUNK = 20;
+
+/** 离顶还有这么多像素就开始往回补 —— 别等真贴到顶，那样一定会先看见一截空白。 */
+const NEAR_TOP_PX = 600;
 
 /**
  * 一个渲染块最高画多少 —— 超了里面自己滚，旁边多一个「放高一点」放到 TALL_H。
@@ -220,11 +228,57 @@ const SIZE_SCRIPT = `(function(){
   setTimeout(tell, 120); setTimeout(tell, 600); setTimeout(tell, 2000);
 })();`;
 
-/** 框子里要挂的那两段脚本（播放键 + 报高度），带上认人用的 token。 */
+/**
+ * 给框子垫一份**不抛的** localStorage / sessionStorage。
+ *
+ * 沙箱框子没有 `allow-same-origin`，于是**光是读 `window.localStorage` 这个
+ * 属性**就当场抛 `SecurityError`（不是 getItem 抛，是取属性就抛）。而酒馆那边
+ * 的 widget 拿 localStorage 当主题总线是常规写法 —— 「喵喵选择器」开头就是
+ * `applyTheme()`，里面裸调 `localStorage.getItem('mortal_theme_color')`，
+ * 没人接。一抛，整段 `<script>` 就地终止，**后面渲染选项的代码再也跑不到**：
+ * 外壳（`<details>` 和「剧情分支」那行字）是静态 HTML 所以照样画出来，
+ * 里面一个选项都没有。看着就像「框子出来了但没字」。
+ *
+ * 这里在 widget 自己的脚本之前先用 `Object.defineProperty` 把这两个属性盖成
+ * 一份内存实现。为什么不是 try/catch 兜 —— 兜不了，那是**别人写的** widget，
+ * 我们不改它一个字节（预设是拿来互相分享的，改了下次导入又是原样）。
+ *
+ * 存的东西**活不过这个框子**：每次重挂就是一份新的空存储。这正合适 ——
+ * widget 想记的是「用户选的主题色」这类偏好，拿不到就走它自己的默认值；
+ * 而真让它写进本页面的 localStorage 反倒是污染，几十个框子抢同一个键。
+ */
+const STORAGE_SHIM = `(function(){
+  function make(){
+    var m = Object.create(null);
+    var api = {
+      getItem: function(k){ k = String(k); return k in m ? m[k] : null; },
+      setItem: function(k, v){ m[String(k)] = String(v); },
+      removeItem: function(k){ delete m[String(k)]; },
+      clear: function(){ m = Object.create(null); },
+      key: function(i){ var ks = Object.keys(m); return i >= 0 && i < ks.length ? ks[i] : null; }
+    };
+    Object.defineProperty(api, "length", { get: function(){ return Object.keys(m).length; } });
+    return api;
+  }
+  ["localStorage", "sessionStorage"].forEach(function(name){
+    /* 读一下就知道这个框子拦不拦；不拦（将来真开了 same-origin）就别多事 */
+    try { void window[name]; return; } catch (e) {}
+    try {
+      Object.defineProperty(window, name, { value: make(), configurable: true });
+    } catch (e) {}
+  });
+})();`;
+
+/**
+ * 框子里要挂的脚本（存储替身 + 播放键 + 报高度），带上认人用的 token。
+ *
+ * `STORAGE_SHIM` 必须排在最前面，而且这份 hooks 得插在 widget 自己的
+ * `<script>` **之前** —— 它要垫的就是那些脚本。
+ */
 function hooks(token) {
   return `<script>window.__OFFLINE_VOICE_TOKEN__=${JSON.stringify(
     token
-  )};${VOICE_SCRIPT}${SIZE_SCRIPT}</script>`;
+  )};${STORAGE_SHIM}${VOICE_SCRIPT}${SIZE_SCRIPT}</script>`;
 }
 
 /**
@@ -266,7 +320,28 @@ function docWithHooks(doc, token = "") {
     token
   )}`;
   const at = doc.toLowerCase().lastIndexOf("</body>");
-  return at === -1 ? doc + extra : doc.slice(0, at) + extra + doc.slice(at);
+  const tail = at === -1 ? doc + extra : doc.slice(0, at) + extra + doc.slice(at);
+  return withShim(tail);
+}
+
+/**
+ * 存储替身插到**文档最前面**。
+ *
+ * `hooks()` 那一份是挂在 `</body>` 前的 —— 播放键要等 DOM 齐了才好挂、高度也
+ * 得等内容画完才好量，所以它必须靠后。可存储替身要垫的正是 widget 自己那些
+ * `<script>`，插晚了就白垫：脚本早在它之前跑完（并且已经抛完了）。
+ *
+ * 插在 `<head>` 后面第一个位置。没有 `<head>` 就退到 `<html>` 之后，
+ * 连 `<html>` 都没有（不该发生，进这儿的都是完整文档）就直接顶在最前面 ——
+ * 顶在 doctype 前会让文档掉进 quirks mode，所以那种情况宁可不插。
+ */
+function withShim(doc) {
+  const shim = `<script>${STORAGE_SHIM}</script>`;
+  const head = doc.match(/<head\b[^>]*>/i);
+  if (head) return doc.slice(0, head.index + head[0].length) + shim + doc.slice(head.index + head[0].length);
+  const html = doc.match(/<html\b[^>]*>/i);
+  if (html) return doc.slice(0, html.index + html[0].length) + shim + doc.slice(html.index + html[0].length);
+  return doc;
 }
 
 /**
@@ -1278,10 +1353,21 @@ export function OfflinePanel({ onGoto }) {
   const [manual, setManual] = useState("");
   const [showSummary, setShowSummary] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
-  // 上面那批更早的轮次展开了没有
-  const [showAll, setShowAll] = useState(false);
+  // 往上补了多少轮（只算「更早的那批」，不含 SHOW_TURNS 那份基数）
+  const [loadedMore, setLoadedMore] = useState(0);
+  /*
+   * 「往上补一批」和「补完把滚动位置钉回去」之间传的两样东西。
+   *
+   * `anchor` 一直指着当前画出来的第一条（由下面那个 callback ref 写）。
+   * `nearTop` 只在「这次重渲染是往上补触发的」时才是 {box, mark}，别的原因
+   * （换剧情、发了一句、刷新）都是 null —— 那时候不该动滚动位置。
+   */
+  const nearTop = useRef(null);
+  const anchor = useRef(null);
 
   const bottom = useRef(null);
+  // 列表最上面那个空哨兵：滚到它就说明该往回补了
+  const topSentinel = useRef(null);
 
   const refreshRows = useCallback(async () => {
     try {
@@ -1333,7 +1419,7 @@ export function OfflinePanel({ onGoto }) {
     setEditKey("");
     setMenuKey("");
     setInput("");
-    setShowAll(false);
+    setLoadedMore(0);
     setShowSummary(false);
     setShowPrompt(false);
     if (!itemId) return undefined;
@@ -1428,15 +1514,90 @@ export function OfflinePanel({ onGoto }) {
   const sid = state?.currentId ?? "";
   const q = sid ? `?storyId=${encodeURIComponent(sid)}` : "";
 
-  /* 换了一条剧情就收回去，别把上一条展开的几十轮带过来 */
+  /*
+   * 只画最近这些，更早的那批靠往上滚一批一批补出来。
+   *
+   * 这里是**计算**而不是 state：`shown` 的条数完全由 `turns.length` 和
+   * `loadedMore` 决定，多存一份只会多一个对不上的机会。
+   * 封顶在 `turns.length` 上，所以「补到底了」不需要另开一个标志位。
+   *
+   * 位置必须在下面那几个 effect **之前** —— `skipped` 是 `const`，它在
+   * 副作用里被读到时还没初始化的话，整个面板会白屏（TDZ，不是 undefined）。
+   */
+  const skipped = Math.max(0, turns.length - SHOW_TURNS - loadedMore);
+  const shown = skipped ? turns.slice(skipped) : turns;
+
+  /* 换了一条剧情就收回去，别把上一条补出来的几十轮带过来 */
   useEffect(() => {
-    setShowAll(false);
+    setLoadedMore(0);
+    anchor.current = null;
   }, [sid]);
 
   // 新一轮落地之后滚到底。剧情是从上往下读的，不像 iMessage 那种倒序
   useEffect(() => {
     if (turns.length) bottom.current?.scrollIntoView({ block: "nearest" });
   }, [turns.length]);
+
+  /*
+   * 往上滚到头就再补一批更早的。
+   *
+   * 听的是 `<main>` 的 scroll —— 这一页自己不滚，整页都挂在壳子那个
+   * `[data-scroll]` 容器上（shell.jsx），所以从哨兵往上找到它。
+   * 用 scroll 而不是 IntersectionObserver：IO 在后台标签页里根本不回调，
+   * 而 scroll 只要用户真的在滚就一定到。
+   *
+   * 补进去的轮次是插在列表**开头**的，浏览器会把剩下的内容整体往下推 ——
+   * 用户正盯着的那一条会突然跳走。所以动手之前先量下「那一条离容器顶多远」，
+   * 补完用 useLayoutEffect 把这个距离还原（绘制之前改，看不见跳动）。
+   *
+   * `skipped <= 0` 就整个不挂 —— 补到底之后这套自动停摆，不用另开标志位。
+   */
+  useEffect(() => {
+    if (skipped <= 0) return undefined;
+    const box = topSentinel.current?.closest("[data-scroll]");
+    if (!box) return undefined;
+    const onScroll = () => {
+      if (box.scrollTop > NEAR_TOP_PX) return;
+      const mark = anchor.current;
+      /*
+       * 记的是「这一条离容器顶多远」，不是它的绝对位置 —— 补完要还原的是这个
+       * 距离。只把它推回容器顶的话，画面会整段跳掉这段距离（实测 552px）。
+       */
+      nearTop.current = mark
+        ? { box, mark, offset: mark.getBoundingClientRect().top - box.getBoundingClientRect().top }
+        : null;
+      setLoadedMore((n) => n + TURN_CHUNK);
+    };
+    /*
+     * 只听真事件，不在挂上的那一刻主动判一次 —— 那样会依赖上面「滚到底」那个
+     * effect 先跑完，顺序一变就会在刚进页面时连锁补满 90 轮。
+     *
+     * 「补完还在顶上」这一种也不用自己管：还原滚动位置本身会再发一次 scroll，
+     * 于是还差就继续补，够了就停。补到底时 `skipped` 归零，这个 effect 直接
+     * 不挂，所以连不上死循环。
+     */
+    box.addEventListener("scroll", onScroll, { passive: true });
+    return () => box.removeEventListener("scroll", onScroll);
+  }, [skipped]);
+
+  /*
+   * 补完把锚点钉回去。
+   *
+   * 锚点取的是**补之前**的 `shown[0]`：补完之后它往后挪了 TURN_CHUNK 位，
+   * 按同一个下标取就是另一条了 —— 所以位置在 `setLoadedMore` 之前就量好
+   * （就是上面那个 onScroll 里干的事），这里只负责把差值加回 scrollTop。
+   *
+   * null 表示「这次不是往上补触发的」（换剧情、刷新、发了一句），那就别动
+   * 滚动位置，交给上面滚到底那个 effect。
+   */
+  useLayoutEffect(() => {
+    const at = nearTop.current;
+    nearTop.current = null;
+    if (!at) return;
+    /* 让那一条回到补之前的位置：现在的距离 − 补之前的距离，就是要补的滚动量 */
+    const now = at.mark.getBoundingClientRect().top - at.box.getBoundingClientRect().top;
+    at.box.scrollTop += now - at.offset;
+  }, [loadedMore]);
 
   /*
    * 自动朗读的开关和失败提示。
@@ -1573,9 +1734,6 @@ export function OfflinePanel({ onGoto }) {
 
   const gateOff = row ? !row.gate : false;
   const summaries = story?.summaries ?? [];
-  // 只画最近这些，更早的那批用上面一个按钮一次展开
-  const skipped = showAll ? 0 : Math.max(0, turns.length - SHOW_TURNS);
-  const shown = skipped ? turns.slice(skipped) : turns;
 
   return (
     <div className="grid grid-cols-1 gap-rhythm-sm lg:gap-rhythm">
@@ -1755,16 +1913,29 @@ export function OfflinePanel({ onGoto }) {
                 </p>
               ) : (
                 <div className="grid grid-cols-1 gap-6">
+                  {/*
+                    * 顶上的哨兵 + 提示。
+                    *
+                    * 哨兵是那个空 div，滚到它就自动补一批。提示那行是给人看的 ——
+                    * 划到顶看见「上面还有 N 轮」比看见一片空白强得多，而且没有
+                    * IntersectionObserver（或者它被关掉了）的时候，按钮还能手点。
+                    */}
                   {skipped > 0 && (
                     <div>
-                      <Button variant="ghost" onClick={() => setShowAll(true)}>
-                        <MoreHorizontal size={14} /> 往上看更早的 {skipped} 轮
+                      <div ref={topSentinel} aria-hidden="true" />
+                      <Button variant="ghost" onClick={() => setLoadedMore((n) => n + TURN_CHUNK)}>
+                        <MoreHorizontal size={14} /> 上面还有 {skipped} 轮 —— 继续往上滚
                       </Button>
                     </div>
                   )}
 
-                  {shown.map((t) => (
-                    <div key={t.id} className="grid grid-cols-1 gap-3">
+                  {shown.map((t, i) => (
+                    <div
+                      key={t.id}
+                      /* 补更早那批之前，把这一条的位置记下来当锚点 */
+                      ref={i === 0 ? (el) => { if (el) anchor.current = el; } : undefined}
+                      className="grid grid-cols-1 gap-3"
+                    >
                       <Bubble
                         turn={t}
                         mine={t.role === "user"}

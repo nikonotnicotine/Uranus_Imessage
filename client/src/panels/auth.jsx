@@ -100,7 +100,7 @@ export function AuthGate({ children }) {
   if (stage === "ready") return children;
 
   return (
-    <div className="flex h-screen items-center justify-center overflow-y-auto px-6 py-10">
+    <div className="flex h-screen items-center justify-center overflow-y-auto px-6 py-10" data-scroll>
       <div className="w-full max-w-sm">
         <div className="mb-8 flex items-center gap-3">
           <UranusBadge size={36} />

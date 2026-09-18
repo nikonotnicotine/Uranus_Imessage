@@ -1,6 +1,6 @@
 import { cardHintFor, isCardUrl, mapsUrlFor, renderMapsLinks } from "./card.js";
 import { watchChatBackground } from "./chatbg.js";
-import { splitBubbles, sleep } from "./delay.js";
+import { normalizeForHistory, splitBubbles, sleep } from "./delay.js";
 import { chatWithFallback, describeImage, transcribeAudio } from "./llm.js";
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import {
@@ -2631,10 +2631,18 @@ async function handleTurn(
     return;
   }
 
-  // 记下助手回复进历史：存**原文**，过滤是 prompt.js 拼提示词时的事。
-  // （唯一的例外是上面那一轮发了 IG —— recorded 里的标签换成了人话，理由见那儿）
+  /*
+   * 记下助手回复进历史：存**原文**，过滤是 prompt.js 拼提示词时的事。
+   * （例外之一是上面那一轮发了 IG —— recorded 里的标签换成了人话，理由见那儿）
+   *
+   * 例外之二是开了强制分隔：那时候存的是按 `$` 改写过的那一份。发出去的是
+   * 七条气泡、历史里却躺着一整段「你好呀，我刚刚订到…」的话，模型下一轮照着
+   * 上文学，只会更不肯自己分段 —— 关掉开关立刻退回大段文字就是这么来的。
+   * 见 delay.js:normalizeForHistory。
+   */
+  const forHist = normalizeForHistory(recorded, freshConfig.chat);
   const hist = runner.history.get(sessionId) ?? [];
-  hist.push({ role: "assistant", content: recorded });
+  hist.push({ role: "assistant", content: forHist });
   runner.history.set(sessionId, hist);
 
   // 落盘存档：完整记录，不受上下文限制影响。写失败不该让这轮回复发不出去
@@ -2645,7 +2653,7 @@ async function handleTurn(
       [
         { role: "user", content: combined },
         // 和内存历史用同一个变量，否则存档和上文会不一致
-        { role: "assistant", content: recorded },
+        { role: "assistant", content: forHist },
       ],
       (msg) => logWarn(scope, msg)
     );
@@ -2665,7 +2673,7 @@ async function handleTurn(
    * 比留一版旧回复糟得多。用户真在意的话，待总结那几个 txt 随时能手改。
    */
   if (!isReroll) {
-    afterTurn(runner, space, freshConfig, freshRole, { user: combined, assistant: recorded });
+    afterTurn(runner, space, freshConfig, freshRole, { user: combined, assistant: forHist });
   }
 
   /*
@@ -2804,7 +2812,18 @@ async function commitIgTurn(getConfig, runner, role, outcome) {
         );
       }
 
-      const assistant = [outcome.commentLine, canSend ? outcome.dm : ""]
+      /*
+       * 只有那条短信按 `$` 改写，`commentLine` 不动。
+       *
+       * 改写是为了让上文和**真发出去的那几条气泡**对得上（见
+       * delay.js:normalizeForHistory），而 commentLine 是我们自己写给模型看的
+       * 一句旁白（`[Instagram 评论] …`），它压根没走 sendBubbles。
+       * 一起切了的话上下文里会多出一堆假装是气泡的碎句。
+       */
+      const assistant = [
+        outcome.commentLine,
+        canSend ? normalizeForHistory(outcome.dm, config.chat) : "",
+      ]
         .filter((s) => String(s ?? "").trim())
         .join("\n");
       // 评论也没有、短信也发不了 —— 这一轮什么都没发生，别往上下文里塞空壳
@@ -3419,9 +3438,14 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
     return;
   }
 
-  // 助手那条进历史。IG 那一轮存的是 publishLines 那几句人话，别的都存原文
+  /*
+   * 助手那条进历史。IG 那一轮存的是 publishLines 那几句人话，别的都存原文 ——
+   * 开了强制分隔时是按 `$` 改写过的那一份，和正常轮次同一个道理
+   * （见上面那处 forHist 的注释，以及 delay.js:normalizeForHistory）。
+   */
+  const forHist = normalizeForHistory(recorded, freshConfig.chat);
   const hist = runner.history.get(sessionId) ?? [];
-  hist.push({ role: "assistant", content: recorded });
+  hist.push({ role: "assistant", content: forHist });
   runner.history.set(sessionId, hist);
 
   try {
@@ -3431,7 +3455,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
       [
         // 存档里同样只留占位符，和内存历史一致
         { role: "user", content: forHistory },
-        { role: "assistant", content: recorded },
+        { role: "assistant", content: forHist },
       ],
       (msg) => logWarn(scope, msg)
     );
@@ -3440,7 +3464,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
   }
 
   // 主动消息也算聊了一轮，记忆库照记（不 await，见 afterTurn）
-  afterTurn(runner, space, config, role, { user: forHistory, assistant: recorded });
+  afterTurn(runner, space, config, role, { user: forHistory, assistant: forHist });
 
   /*
    * 只发了 IG、没有短信正文的那一轮到此为止 —— 和正常轮次那条同一个道理

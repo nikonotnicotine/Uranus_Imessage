@@ -285,6 +285,8 @@ export const DEFAULT_CONFIG = {
   // 发送节奏是全局的：几个角色打字的手感一致
   chat: {
     separator: "$", // 气泡分隔符
+    // 强制分隔：不认 $，改按逗号句号换行空格切。和 separator 是互斥的两条路
+    forceSeparator: false,
     queueWait: 8, // 收到消息后合并等待时间（秒）
     delay: {
       typingSpeed: 0.2, // 打字速度
@@ -2322,6 +2324,8 @@ export function normalizeConfig(input) {
   if (input.chat) {
     base.chat = {
       separator: input.chat.separator ?? base.chat.separator,
+      // 认布尔，也认它的字符串形态（手机上改过、或从 JSON 捞回来的）
+      forceSeparator: [true, "true", 1, "1"].includes(input.chat.forceSeparator),
       queueWait:
         typeof input.chat.queueWait === "number"
           ? input.chat.queueWait

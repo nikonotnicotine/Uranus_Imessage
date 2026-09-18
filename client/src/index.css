@@ -128,13 +128,69 @@ input[type="range"]::-moz-range-thumb {
   @apply h-2.5 w-2.5 rounded-none border-0 bg-ink;
 }
 
-/* 滚动条整个隐藏（无障碍与性能那条）。滚动本身照旧，只是不画那根槽 */
-* {
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+/*
+ * 滚动条：桌面端常驻细条，移动端仍然整根藏掉。
+ *
+ * 之前是全局 `display: none` —— 手机上没问题（手指直接拖内容），
+ * 桌面上就是灾难：一百多个条目的预设列表，滚轮甩半天不知道自己在第几屏，
+ * 也抓不住那根槽往回拖。
+ *
+ * 细到什么程度：8px 槽 + 圆角滑块。滑块用 --ink 的 32% 透明度而不是实心灰 ——
+ * 换算到纯白上是 #c6c6c8，比 --line(#d8d8d8) 深一档，扫一眼能看见、
+ * 又不至于在纸张上跳出个黑条。悬停 48%、按住 62%，这样「我抓到了」有反馈。
+ *
+ * 起点试过 22%（#d1d1d1），比边框线还浅 —— 缩略图里基本看不见，
+ * 等于没修，所以停在 32%。
+ *
+ * 槽本身留透明：只在滑块和纸张之间做明度差，不额外画一条 8px 的边，
+ * 否则整页右侧会多出一道灰边，破坏「只靠 1px 线分层」的规矩。
+ *
+ * 用 [data-scroll] 而不是 `*`：全局一条 `::-webkit-scrollbar` 规则本身是可以的，
+ * 但 `*` 选择器上的 `scrollbar-width` 会连带把 textarea 等元素也改掉 ——
+ * 显式挂到标了 data-scroll 的滚动容器上，谁要滚动条谁自己声明。
+ */
+@media (pointer: fine) {
+  [data-scroll] {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--ink) / 0.32) transparent;
+  }
+  [data-scroll]::-webkit-scrollbar {
+    display: block;
+    width: 8px;
+    height: 8px;
+  }
+  [data-scroll]::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  [data-scroll]::-webkit-scrollbar-thumb {
+    background-color: rgb(var(--ink) / 0.32);
+    border-radius: 999px;
+  }
+  [data-scroll]::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(var(--ink) / 0.48);
+  }
+  [data-scroll]::-webkit-scrollbar-thumb:active {
+    background-color: rgb(var(--ink) / 0.62);
+  }
+  /* 右下角那个小方块：纸张上不该有灰点 */
+  [data-scroll]::-webkit-scrollbar-corner {
+    background: transparent;
+  }
 }
-::-webkit-scrollbar {
-  display: none;
+
+/*
+ * 触屏上照旧全藏。`pointer: coarse` 而不是宽度断点 ——
+ * 一台 1280 宽的平板该藏，一台 800 宽的鼠标笔记本该显示，
+ * 决定的从来不是屏有多宽，而是有没有那根滚轮。
+ */
+@media (pointer: coarse) {
+  [data-scroll] {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  [data-scroll]::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 /*

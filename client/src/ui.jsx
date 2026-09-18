@@ -346,7 +346,7 @@ export function Modal({ title, desc, onClose, children, footer, maxWidth = "max-
             <X size={18} />
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">{children}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5" data-scroll>{children}</div>
         {footer && (
           <div className="flex flex-wrap items-center justify-end gap-3 border-t border-line px-6 py-3">
             {footer}
@@ -398,90 +398,212 @@ export function Fold({ title, desc, defaultOpen = false, children, badge }) {
  */
 export const DragHandleCtx = createContext(null);
 
-/*
- * 原生拖放还有个让人骂娘的老毛病：按住拖的时候滚轮不滚 —— wheel 事件照发，
- * 但浏览器把「滚」这个默认动作吞了（Chromium 多年如此）。拖着一条长列表想
- * 走远路，只能拖到屏幕边上干等，滚轮成了摆设。
- *
- * 这里挂全局补丁：只在拖动期间接管 wheel，从事件目标往上爬，找最近一个
- * 「声明了滚动且真有得滚」的容器手动滚它。监听走 capture 是因为 dragend
- * 不冒泡，capture 才保证收得到（拖到哪松手都得把开关关上）；wheel 要
- * preventDefault，所以 passive:false。
- */
-if (typeof window !== "undefined" && !window.__uranusDragWheelPatch) {
-  window.__uranusDragWheelPatch = true; // 热更新会重跑模块，守着别把监听装两份
-  let dragActive = false;
-
-  function wheelScrollBox(el) {
-    for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
-      const overflow = getComputedStyle(n).overflowY;
-      if ((overflow === "auto" || overflow === "scroll") && n.scrollHeight > n.clientHeight) {
-        return n;
-      }
+/** 从某个元素往上爬，找最近一个真能竖着滚的祖先。找不到就是整页。 */
+function scrollParent(el) {
+  for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+    const overflow = getComputedStyle(n).overflowY;
+    if ((overflow === "auto" || overflow === "scroll") && n.scrollHeight > n.clientHeight) {
+      return n;
     }
-    return document.scrollingElement;
   }
-
-  window.addEventListener("dragstart", () => (dragActive = true), true);
-  window.addEventListener("dragend", () => (dragActive = false), true);
-  window.addEventListener("drop", () => (dragActive = false), true);
-  window.addEventListener(
-    "wheel",
-    (e) => {
-      if (!dragActive) return;
-      const box = wheelScrollBox(e.target);
-      // Firefox 的滚轮一格按「行」报，换算成像素
-      box.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
-      e.preventDefault();
-    },
-    { passive: false, capture: true }
-  );
+  return document.scrollingElement ?? document.documentElement;
 }
 
+/**
+ * 一行可拖动的条目。**指针拖动，不是原生 HTML5 拖放。**
+ *
+ * 为什么换掉原生拖放：拖动期间滚轮彻底失灵。曾经挂过一个全局补丁想接管
+ * `wheel` 自己滚，但那个补丁的前提是错的 —— 原生拖放一开始，Chromium 就
+ * 进了拖拽控制器自己的事件循环，`wheel` **根本不派发给页面**（只剩贴到
+ * 视口边缘时的自动滚动）。补丁的监听装得再准也收不到事件，从写出来那天
+ * 起就没生效过。一百多条条目的预设里，把一条从末尾拖到开头要「拖到边上
+ * 干等 → 松手 → 滚轮 → 再按住」重复好几轮。
+ *
+ * 换成 `pointerdown` + `setPointerCapture` 之后，拖动只是我们自己在记
+ * 坐标，浏览器没有进任何特殊模式，于是 `wheel` 是一个普通事件 —— 滚轮
+ * 直接就能用，不需要任何补丁。捕获指针是关键：后续的 `pointermove` /
+ * `pointerup` 全都定向到握把上，拖到列表外面、拖出窗口都不会丢掉事件
+ * （原生拖放那套的 `dragend` 在某些路径上压根不来，状态就卡在「正在拖」）。
+ *
+ * 落点靠实时命中判定：每次 `pointermove` 拿指针的 y 和**同一个列表里**
+ * 每一行的中线比，压过谁的中线就落在谁那个下标。为什么用中线而不是
+ * 「进入元素范围」：行高不一（条目展开着编辑器时有几百像素），按范围算
+ * 的话拖过一条高行时落点会在它的头和尾之间反复跳。
+ *
+ * 触屏保持原样交给 ↑/↓ 按钮：`touch-none` 只加在握把上，按住握把不会
+ * 触发页面滚动，但列表其余地方照旧能用手指滑。
+ */
 export function DragRow({ index, id, onReorder, children, className = "" }) {
-  const [over, setOver] = useState(false);
+  const rowRef = useRef(null);
+
+  /*
+   * 整个拖动过程一次 setState 都不做，全靠直接改 DOM 的类名。
+   *
+   * 这不是抠性能抠出来的 —— pointermove 一秒几十次，每次都要在别的行上
+   * 换落点提示。走 state 的话提示得由每一行自己订阅「现在落点是几」，
+   * 于是每次移动都是一次全列表重渲染；一百多条条目、其中还有展开着
+   * CodeArea 的，拖起来直接卡成幻灯片。改 className 影响的只有两个元素。
+   */
+  const drag = useRef(null);
 
   const handle = useMemo(
     () => ({
-      draggable: true,
-      onDragStart: (e) => {
-        e.dataTransfer.setData("text/plain", id);
-        e.dataTransfer.effectAllowed = "move";
+      onPointerDown: (e) => {
+        // 只认左键 / 单指；右键和中键交给浏览器
+        if (e.button !== 0) return;
+        const row = rowRef.current;
+        const list = row?.parentElement;
+        if (!list) return;
+
+        e.preventDefault(); // 别让它顺带选中文字
+
+        drag.current = {
+          pointerId: e.pointerId,
+          list,
+          box: scrollParent(row),
+          from: index,
+          to: index,
+          moved: false,
+          startY: e.clientY,
+        };
+        row.classList.add("opacity-40");
+
+        /*
+         * 指针捕获放在状态初始化**之后**，而且包在 try 里。
+         *
+         * 捕获是为了拖出列表、拖出窗口也不丢 pointermove，但它会抛 ——
+         * 指针 id 已经不活动、或者环境对捕获有别的限制时就是 NotFoundError。
+         * 排在前面的话一抛就把初始化和下面那行透明度全带走了，现象是
+         * 「按下去毫无反应」，而真正的原因（捕获失败）藏在一句异常里。
+         * 拿不到捕获只是退化：不捕获照样能拖，只是指针移出握把后事件
+         * 按正常冒泡走，仍然落在我们自己的 onPointerMove 上。
+         */
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {}
+      },
+      onPointerMove: (e) => {
+        const d = drag.current;
+        if (!d || e.pointerId !== d.pointerId) return;
+        // 手抖不算拖动：走够 4px 才开始算落点，免得单击变成一次原地重排
+        if (!d.moved && Math.abs(e.clientY - d.startY) < 4) return;
+        d.moved = true;
+        paintDrop(d, dropIndexAt(d.list, e.clientY, d.from));
+      },
+      onPointerUp: (e) => {
+        const d = drag.current;
+        if (!d || e.pointerId !== d.pointerId) return;
+        endDrag(d, rowRef.current);
+        drag.current = null;
+        if (!d.moved || d.to === d.from) return;
+
+        /*
+         * 落点是**还没把被拖那行摘出去**时的下标，而 onReorder 底下那层
+         * （reorderList）是「先 splice 摘掉，再 splice 插进 toIndex」。
+         * 摘掉之后，原位后面每一行都往前挪了一格，所以往下拖时目标下标得
+         * 减一才是同一道缝。
+         *
+         * 不减会怎样：拖一格等于原地不动（3 → 8 减回去还是 8，插在
+         * 「原来的 9 号前面」，也就是自己原来那格的后面一格 —— 看上去完全
+         * 没反应），连拖两格才动一格。往上拖方向相反，同样差一格。
+         */
+        onReorder(id, d.to > d.from ? d.to - 1 : d.to);
+      },
+      onPointerCancel: () => {
+        const d = drag.current;
+        if (!d) return;
+        endDrag(d, rowRef.current);
+        drag.current = null;
+      },
+      /*
+       * 滚轮：拖动期间自己滚那个容器。
+       *
+       * 指针被捕获在握把上，所以 wheel 也定向到这里 —— 页面默认不会滚，
+       * 得我们动手。滚完顺手重算一次落点：内容滚过去了，指针底下已经是
+       * 另一行，不重算的话落点会停在滚动前那条上。
+       */
+      onWheel: (e) => {
+        const d = drag.current;
+        if (!d) return;
+        e.preventDefault();
+        // Firefox 的滚轮一格按「行」报，换算成像素
+        d.box.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+        d.moved = true;
+        paintDrop(d, dropIndexAt(d.list, e.clientY, d.from));
       },
     }),
-    [id]
+    [id, index, onReorder]
   );
 
   return (
     <DragHandleCtx.Provider value={handle}>
-      <div
-        onDragOver={(e) => {
-          e.preventDefault();
-          setOver(true);
-        }}
-        onDragLeave={() => setOver(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setOver(false);
-          const dragged = e.dataTransfer.getData("text/plain");
-          if (dragged && dragged !== id) onReorder(dragged, index);
-        }}
-        className={`${className} ${over ? "border-ink" : ""}`}
-      >
+      <div ref={rowRef} className={className}>
         {children}
       </div>
     </DragHandleCtx.Provider>
   );
 }
 
-/** DragRow 里唯一能拖的那一小块。放在行首，视觉上就是个握把。 */
+/** 落点提示用的类名。往下拖画在目标行下边，往上拖画在上边。 */
+const DROP_BELOW = "shadow-[inset_0_-2px_0_0_rgb(var(--ink))]";
+const DROP_ABOVE = "shadow-[inset_0_2px_0_0_rgb(var(--ink))]";
+
+/**
+ * 把落点提示挪到第 to 行。
+ *
+ * 不做占位空槽 —— 那得在拖动期间改列表结构，一百多行每动一次都要重排。
+ * 一条 2px 的内阴影线足够说明「松手会落在这儿」，而且不占布局。
+ */
+function paintDrop(d, to) {
+  if (to === d.to) return;
+  clearDrop(d);
+  d.to = to;
+  if (to === d.from) return; // 回到原位就不画了
+  const target = d.list.children[to];
+  target?.classList.add(to > d.from ? DROP_BELOW : DROP_ABOVE);
+}
+
+function clearDrop(d) {
+  for (const el of d.list.children) el.classList.remove(DROP_BELOW, DROP_ABOVE);
+}
+
+function endDrag(d, row) {
+  clearDrop(d);
+  row?.classList.remove("opacity-40");
+}
+
+/**
+ * 指针在 y 这个高度上，该落到第几个下标。
+ *
+ * 只看**同一个父容器下**的 `[data-drag-row]`（`list.children` 就是那一组），
+ * 所以两个列表挨着放也不会互相串。压过某行中线就算落在它那儿；指针在
+ * 整列之上就是 0，之下就是最后一个。
+ */
+function dropIndexAt(list, y, fallback) {
+  if (!list) return fallback;
+  const rows = [...list.children];
+  if (!rows.length) return fallback;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i].getBoundingClientRect();
+    if (y < r.top + r.height / 2) return i;
+  }
+  return rows.length - 1;
+}
+
+/**
+ * DragRow 里唯一能拖的那一小块。放在行首，视觉上就是个握把。
+ *
+ * `touch-none` 是必须的：不关掉这一小块上的默认触摸动作，手指按住握把
+ * 会被浏览器当成「要滚页面」，pointermove 直接变成 pointercancel。只加在
+ * 握把上，列表其余地方照旧能用手指滑。
+ */
 export function DragHandle({ className = "" }) {
   const handle = useContext(DragHandleCtx);
   return (
     <span
       {...handle}
       aria-hidden
-      className={`cursor-grab active:cursor-grabbing ${className}`}
+      className={`cursor-grab touch-none select-none active:cursor-grabbing ${className}`}
     >
       <GripVertical size={15} />
     </span>
@@ -553,7 +675,7 @@ export function CodeBlock({ code }) {
 
   return (
     <div className="relative">
-      <pre className="overflow-x-auto border border-line bg-paper px-3.5 py-3 pr-12 text-meta leading-relaxed text-ink-soft">
+      <pre className="overflow-x-auto border border-line bg-paper px-3.5 py-3 pr-12 text-meta leading-relaxed text-ink-soft" data-scroll>
         <code>{code}</code>
       </pre>
       <button

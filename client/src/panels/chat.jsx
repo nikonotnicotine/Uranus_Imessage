@@ -4,11 +4,13 @@ import { splitBubbles } from "../delay.js";
 import { SaveBar } from "../section.jsx";
 import { useConfig } from "../store.jsx";
 import { Button, Card, Field, NumberField, ResultNote, Slider, Switch, inputCls } from "../ui.jsx";
-import { AlertTriangle, EyeOff, Play, RotateCcw } from "lucide-react";
+import { AlertTriangle, EyeOff, Play, RotateCcw, Scissors } from "lucide-react";
 
 export function ChatPanel() {
   const { config, updateChat, updateDelay } = useConfig();
   const d = config.chat.delay;
+  // 老配置里没有这个字段（前端也没有默认值镜像），所以按假处理
+  const force = Boolean(config.chat.forceSeparator);
 
   return (
     <Card title="发送节奏" desc="所有角色共用的收发节奏：气泡怎么拆、连发怎么合并">
@@ -31,6 +33,61 @@ export function ChatPanel() {
             onChange={(v) => updateChat({ queueWait: v })}
             hint="合并用户连发消息"
             suffix="秒"
+          />
+        </div>
+
+        {/*
+          强制分隔。有些角色写提示词就是不吐 `$`，改用逗号句号、或者拿
+          `\n\n\n\n` 当段间隔 —— 结果整段话挤成一条巨型气泡，或者一条气泡里
+          全是空白。提示词是模型自己写的、它不总照做，所以给一个从输出侧
+          兜底的开关，别去跟模型较劲。
+        */}
+        <div className="flex items-start justify-between gap-6">
+          <div className="min-w-0 max-w-[62ch]">
+            <p className="flex items-center gap-2 text-ui text-ink">
+              <Scissors size={14} className="shrink-0 text-ink-faint" />
+              强制分隔
+            </p>
+            <p className="mt-1 text-meta leading-relaxed text-ink-faint">
+              {force
+                ? "现在是开着的。上面那个分隔符不生效了，改成按标点和空白切 —— 逗号、句号、问号、叹号（中英两套）、分号冒号顿号、省略号、任意个换行、任意个空格。"
+                : "现在是关着的。只按上面的分隔符切，模型怎么给就怎么发。角色要是老不分段、或者拿空行当间隔，开这个。"}
+            </p>
+            {force && (
+              /*
+               * 写回历史这件事得单独说：它是「开着的时候顺手把上下文也治好」，
+               * 不是又一条切法。用户的原话是「免得关了之后污染上下文」。
+               */
+              <p className="mt-2 text-meta leading-relaxed text-ink-faint">
+                存进聊天记录的也是切好的那一份 —— 按
+                <code className="mx-1 font-mono text-ink-soft">
+                  {config.chat.separator || "$"}
+                </code>
+                拼回去。这样模型下一轮看到的上文就是「我说话是用分隔符断句的」，
+                关掉开关之后它也更容易接着这么写。
+              </p>
+            )}
+            {force && (
+              /*
+               * 把话说透：这是「强制」而不是「更聪明」。英文句点一并切，
+               * 3.14 会变成两条气泡。与其让用户事后纳闷，不如开的时候就讲明白。
+               */
+              <p className="mt-2 border-l-2 border-line py-1 pl-3 text-meta leading-relaxed text-ink-faint">
+                切成的是「短句」不是「段落」—— 一个句号就断一条气泡。代价是英文句点也切，
+                所以 <code className="font-mono text-ink-soft">3.14</code> 会断成两条，
+                聊天记录里也跟着是
+                <code className="mx-1 font-mono text-ink-soft">
+                  3{config.chat.separator || "$"}14
+                </code>
+                。方括号里的内容不切（语音、图片、卡片那些标记是整条，里面的逗号是台词）。
+                不想被切就别开。
+              </p>
+            )}
+          </div>
+          <Switch
+            checked={force}
+            onChange={(v) => updateChat({ forceSeparator: v })}
+            label="强制分隔"
           />
         </div>
 

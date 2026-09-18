@@ -479,7 +479,7 @@ function FailNote({ fails, lastError, at, modelRef }) {
         上次没成功{fails ? `（连着 ${fails} 次）` : ""}
         {at ? ` · ${fmtStamp(at)}` : ""}：
       </p>
-      <p className="my-1 max-h-40 select-all overflow-y-auto whitespace-pre-wrap break-all font-mono">
+      <p className="my-1 max-h-40 select-all overflow-y-auto whitespace-pre-wrap break-all font-mono" data-scroll>
         {lastError}
       </p>
       <p>

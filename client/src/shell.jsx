@@ -435,7 +435,7 @@ export function AppShell() {
           </nav>
 
           {/* 二层：260px 条目面板。独立滚动，右边一条 1px 实线 */}
-          <aside className="hidden w-[260px] shrink-0 overflow-y-auto border-r border-line md:block">
+          <aside className="hidden w-[260px] shrink-0 overflow-y-auto border-r border-line md:block" data-scroll>
             {listPanel}
           </aside>
 
@@ -476,7 +476,7 @@ export function AppShell() {
             </div>
 
             {/* 手机上左右留白收到 16px：375px 的屏上 24px×2 是实打实的一行字 */}
-            <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6 lg:px-10">
+            <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6 lg:px-10" data-scroll>
               <div className="mx-auto max-w-content py-rhythm-sm lg:py-rhythm">
                 {/* 分区标题：72px（移动端 40px），整页只有这一处这么大 */}
                 <header className="mb-rhythm-sm lg:mb-rhythm">
@@ -567,7 +567,7 @@ export function AppShell() {
               if (e.target === e.currentTarget) setRail(false);
             }}
           >
-            <div className="flex h-full w-[240px] max-w-[80vw] flex-col overflow-y-auto border-r border-line bg-paper">
+            <div className="flex h-full w-[240px] max-w-[80vw] flex-col overflow-y-auto border-r border-line bg-paper" data-scroll>
               <div className="flex items-center justify-between gap-2 border-b border-line px-2 py-3">
                 <span className="pl-2 text-eyebrow uppercase text-ink-faint">分区</span>
                 <button
@@ -624,7 +624,7 @@ export function AppShell() {
               if (e.target === e.currentTarget) setDrawer(false);
             }}
           >
-            <div className="flex h-full w-[280px] max-w-[85vw] flex-col overflow-y-auto border-r border-line bg-paper">
+            <div className="flex h-full w-[280px] max-w-[85vw] flex-col overflow-y-auto border-r border-line bg-paper" data-scroll>
               <div className="flex items-center justify-between gap-2 border-b border-line px-2 py-3">
                 <span className="pl-2 text-eyebrow uppercase text-ink-faint">{section.label}</span>
                 <button

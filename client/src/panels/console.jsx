@@ -108,7 +108,7 @@ export function LogRow({ entry }) {
         </button>
       </div>
       {open && hasDetail && (
-        <pre className="mt-1.5 max-h-64 overflow-auto bg-sunken px-3 py-2 text-meta leading-relaxed text-ink-soft">
+        <pre className="mt-1.5 max-h-64 overflow-auto bg-sunken px-3 py-2 text-meta leading-relaxed text-ink-soft" data-scroll>
           <code>{entry.detail}</code>
         </pre>
       )}
@@ -284,7 +284,7 @@ export function ConsolePanel() {
           <div
             ref={boxRef}
             onScroll={onScroll}
-            className="h-[420px] overflow-y-auto border border-line lg:h-[540px]"
+            className="h-[420px] overflow-y-auto border border-line lg:h-[540px]" data-scroll
           >
             {filtered.length === 0 ? (
               <div className="flex h-full items-center justify-center px-6">
@@ -645,7 +645,7 @@ function UpdateBlock() {
             ，要更新吗？
           </p>
           {info.notes && (
-            <div className="max-h-52 overflow-y-auto bg-sunken px-3 py-2">
+            <div className="max-h-52 overflow-y-auto bg-sunken px-3 py-2" data-scroll>
               <p className="whitespace-pre-wrap break-words text-meta leading-relaxed text-ink-soft">
                 {info.notes}
               </p>
