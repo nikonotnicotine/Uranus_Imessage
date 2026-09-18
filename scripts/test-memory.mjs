@@ -643,7 +643,8 @@ function fakeLLM(reply, opts = {}) {
     const body = JSON.parse(init.body);
     sentBodies.push({ url: String(url), body });
     if (opts.status) {
-      return new Response(JSON.stringify({ error: { message: "炸了" } }), {
+      // opts.error 是给「内容安全拦截」那组用的：那条路认的是措辞，不是状态码
+      return new Response(JSON.stringify({ error: { message: opts.error ?? "炸了" } }), {
         status: opts.status,
       });
     }
@@ -1060,6 +1061,149 @@ const logFileC = store.diaryLogPath(CK);
   }
   checkThat("日记：流水空的时候不打接口，直接说没有聊天记录", err.includes("没有聊天记录"));
   check("日记：一次接口都没打", sentBodies.length, 0);
+}
+
+/*
+ * ================= 14.5 内容安全被拦：换说法重试 =================
+ *
+ * 用户报的两种真实失败：
+ *  - 上游明着拦（`Prohibited Use policy`），以前重试 0 次直接失败；
+ *  - 模型**答应了但回一句道歉**，以前那句道歉会被当成合格的总结 ——
+ *    而备忘录是整份覆盖的，一句「很抱歉」能把攒了几个月的清单冲干净。
+ *
+ * 这一节盯死三件事：重试真的发生了、换的说法真的进了请求体、用尽之后**算失败**
+ * （pending 不清、备忘录不动）。
+ */
+console.log("\n=== 14.5 内容安全被拦：换说法重试 ===");
+
+const BLOCK_MSG =
+  "The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy.";
+const REFUSAL_MSG = "很抱歉，我无法协助处理这个请求。";
+
+// ---- 上游拦一次，换个说法就过了 ----
+{
+  const cfg = chainConfig();
+  store.appendPending("memory", CK, { user: "会被拦的一轮", assistant: "嗯" });
+  const memBefore = store.readMemories(CK).length;
+  let n = 0;
+  globalThis.fetch = async (url, init) => {
+    sentBodies.push({ url: String(url), body: JSON.parse(init.body) });
+    n += 1;
+    if (n === 1) {
+      return new Response(JSON.stringify({ error: { message: BLOCK_MSG } }), { status: 400 });
+    }
+    return new Response(
+      JSON.stringify({ choices: [{ message: { content: "第二次过了，这是总结。" } }] }),
+      { status: 200 }
+    );
+  };
+  sentBodies = [];
+  const out = await chains.summarizeMemory(cfg, chainRole(cfg), CK);
+  check("被拦一次后重试成功，存的是第二次那段", out.content, "第二次过了，这是总结。");
+  check("一共打了两发", sentBodies.length, 2);
+  check("第一发就是原来那一条消息，没被动过", sentBodies[0].body.messages.length, 1);
+  check("第二发多追加了一条", sentBodies[1].body.messages.length, 2);
+  checkThat(
+    "追加的是 user 角色（中转站对 system 的处理不一，而末尾 user 一定被看到）",
+    sentBodies[1].body.messages.at(-1).role === "user"
+  );
+  checkThat(
+    "追加的话点明「上一次因内容安全被拒」并要求中立摘要",
+    /内容安全被拒/.test(sentBodies[1].body.messages.at(-1).content) &&
+      /第三人称/.test(sentBodies[1].body.messages.at(-1).content)
+  );
+  check("成功了，记忆真落了一条", store.readMemories(CK).length, memBefore + 1);
+  check("成功了，待总结才清空", store.readPending("memory", CK).lines, 0);
+}
+
+// ---- 一直被拦：算失败，pending 一个字节都不少 ----
+{
+  const cfg = chainConfig();
+  store.appendPending("memory", CK, { user: "一直会被拦", assistant: "嗯" });
+  const before = bytesOf(pendFileC);
+  const memBefore = store.readMemories(CK).length;
+  fakeLLM("", { status: 400, error: BLOCK_MSG });
+  let err = "";
+  try {
+    await chains.summarizeMemory(cfg, chainRole(cfg), CK);
+  } catch (e) {
+    err = e.message;
+  }
+  check("一共打了 4 发（1 + 3 次换说法）", sentBodies.length, 4);
+  checkThat("错误里说清连着几次被拦", /连着 4 次被内容安全拦下/.test(err), err.slice(0, 80));
+  check("失败后待总结文件字节数一个没变", bytesOf(pendFileC), before);
+  check("失败后没有凭空多出一条记忆", store.readMemories(CK).length, memBefore);
+  checkThat(
+    "三次换的说法不一样（原样重打三次没意义）",
+    new Set(sentBodies.slice(1).map((s) => s.body.messages.at(-1).content)).size === 3
+  );
+  checkThat(
+    "劝导语是替换不是往上堆（每发都只多一条）",
+    sentBodies.slice(1).every((s) => s.body.messages.length === 2)
+  );
+}
+
+// ---- 备忘录：模型回的是一句道歉，绝不能覆盖旧的那份 ----
+{
+  const cfg = chainConfig();
+  store.appendPending("memo", CK, { user: "会被道歉打回的一轮", assistant: "嗯" });
+  const memoBefore = store.readMemo(CK);
+  const before = bytesOf(memoPendC);
+  fakeLLM(REFUSAL_MSG);
+  let err = "";
+  try {
+    await chains.summarizeMemo(cfg, chainRole(cfg), CK);
+  } catch (e) {
+    err = e.message;
+  }
+  check("道歉也要重试满（1 + 3 发）", sentBodies.length, 4);
+  checkThat("错误里说清「只回了道歉」", /连着 4 次只回了道歉/.test(err), err.slice(0, 80));
+  checkThat("那句道歉不会出现在错误之外的地方 —— 旧备忘录一字未动", store.readMemo(CK) === memoBefore);
+  checkThat("旧备忘录里不含那句道歉（用户最怕的那件事）", !store.readMemo(CK).includes("很抱歉"));
+  check("失败后待总结文件字节数没变", bytesOf(memoPendC), before);
+}
+
+// ---- 先道歉、后给正文：换说法之后成功 ----
+{
+  const cfg = chainConfig();
+  store.appendPending("memo", CK, { user: "第二次就好了", assistant: "嗯" });
+  fakeLLM((n) => (n === 1 ? REFUSAL_MSG : "这是一份正常的备忘录清单。"));
+  const out = await chains.summarizeMemo(cfg, chainRole(cfg), CK);
+  check("第二次给出正文就收下", out.content, "这是一份正常的备忘录清单。");
+  check("只打了两发，没白打第三第四次", sentBodies.length, 2);
+  check("写进去的是正文，不是道歉", store.readMemo(CK), "这是一份正常的备忘录清单。");
+}
+
+// ---- 503 那种上游故障走的还是原来的退避，不吃换说法的额度 ----
+{
+  const cfg = chainConfig();
+  store.appendPending("memory", CK, { user: "503 那一轮", assistant: "嗯" });
+  fakeLLM("", { status: 503, error: "分组【gemini】Pro按次 下模型 无可用渠道（distributor）" });
+  let err = "";
+  try {
+    await chains.summarizeMemory(cfg, chainRole(cfg), CK);
+  } catch (e) {
+    err = e.message;
+  }
+  checkThat("503 还是照 RETRY_DELAYS 退避（4 发：1 + 3 次重试）", sentBodies.length === 4, `${sentBodies.length} 发`);
+  checkThat("503 不算内容拦截，不提「被内容安全拦下」", !/内容安全/.test(err), err.slice(0, 80));
+  checkThat(
+    "503 那条路一条劝导语都不追加",
+    sentBodies.every((s) => s.body.messages.length === 1)
+  );
+}
+
+// ---- 正常聊天那条路刻意不带这个开关：道歉就是台词，原样收下 ----
+{
+  const { chatCompletion } = await import("../server/src/llm.js");
+  fakeLLM("抱歉，我不能这样做。");
+  const out = await chatCompletion(
+    { url: "https://api.test/v1", key: "sk-test", model: "gpt-x" },
+    [{ role: "user", content: "演一段" }],
+    { retries: 0 }
+  );
+  check("不传 retryOnRefusal 时，道歉原样返回（角色台词不该被拦）", out, "抱歉，我不能这样做。");
+  check("也不会多打一发", sentBodies.length, 1);
 }
 
 /*

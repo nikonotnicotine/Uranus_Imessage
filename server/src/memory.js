@@ -466,6 +466,22 @@ export const SUMMARY_PARAMS = { temperature: 0.6, topP: 1 };
 export const SUMMARY_TIMEOUT = 600000;
 
 /**
+ * 被内容安全拦下时换几次说法再试。见 llm.js 的 SAFETY_NUDGES。
+ *
+ * 只有这四条总结链传这个（三条在这个文件里，线下那条在 offline.js）。正常聊天
+ * **刻意不传**：角色在剧情里说「抱歉，我不能这样」是台词，不是拒答。
+ *
+ * 为什么总结这条路值得重试：喂进去的是几万字的聊天流水，里面有什么内容不由我们
+ * 决定，而模型的安全阈值又飘 —— 同一份材料换个说法（「这是客观的第三人称事实
+ * 摘要，不要复述敏感细节」）经常就过去了。而失败的代价很实在：这一轮白花，
+ * 流水继续攒着，下次输入更长、更容易再被拦，滚雪球。
+ *
+ * 用尽还不行就是失败 —— llm.js 会抛，这边的 markFail 接住，pending 一个字节
+ * 都不清、备忘录一个字都不改。绝不把那句道歉当成合格的总结写进去。
+ */
+export const SUMMARY_REFUSAL_RETRIES = 3;
+
+/**
  * 解析三条链各自的模型。没配 / 引用失效都抛错 —— 调用方接住记 markFail。
  * 抛的话里带上是哪一条链，用户在日志里一眼能看出该去配哪个。
  */
@@ -534,6 +550,7 @@ export async function summarizeMemory(config, role, key) {
     label: endpoint.label ? `记忆总结（${endpoint.label}）` : "记忆总结",
     params: SUMMARY_PARAMS,
     timeout: SUMMARY_TIMEOUT,
+    retryOnRefusal: SUMMARY_REFUSAL_RETRIES,
   });
   const content = raw.trim();
   if (!content) throw new Error("模型返回了空的总结");
@@ -626,6 +643,9 @@ export async function summarizeMemo(config, role, key, now = new Date()) {
     label: endpoint.label ? `备忘录（${endpoint.label}）` : "备忘录",
     params: SUMMARY_PARAMS,
     timeout: SUMMARY_TIMEOUT,
+    // 备忘录是**整份覆盖**的，一句道歉能把用户攒了几个月的清单冲干净。
+    // 这条是四条链里最不能容忍「把拒答当成结果」的一条
+    retryOnRefusal: SUMMARY_REFUSAL_RETRIES,
   });
   const text = raw.trim();
   if (!text) throw new Error("模型返回了空的备忘录");
@@ -781,6 +801,7 @@ export async function generateDiary(config, role, key, opts = {}) {
       label,
       params: SUMMARY_PARAMS,
       timeout: SUMMARY_TIMEOUT,
+      retryOnRefusal: SUMMARY_REFUSAL_RETRIES,
     });
     text = raw.trim();
     if (!text) throw new Error("模型返回了空的日记");
