@@ -79,11 +79,36 @@ export const DEFAULT_PROACTIVE_PROMPT =
  *
  * 里面的 {Focus_time_start} / {Focus_time_end} 是**单花括号**，
  * 不走 applyVars（那个只认双花括号的四个变量），由 proactive.js 单独替换。
+ *
+ * 这一段会被 proactive.js **发两遍**（最顶上一条 system、最底下一条 user）。
+ * 中间那条 system 才是材料。所以这里写的每一句都要经得起重复，别写
+ * 「上面说过」「如下」这种指位置的话。
+ *
+ * 判断依据写得比原来细：原来那版只说「根据上下文与人设判断」，模型拿到
+ * 一句空话就只能瞎猜，给出来的小时数毫无章法。
  */
 export const DEFAULT_PROACTIVE_TIME_PROMPT =
+  "你是{{char}}。判断从现在起过多久，由你主动给{{user}}发一条消息最自然。\n" +
+  "判断依据：{{char}}的人设和作息（熬夜还是早睡、在上班上学还是空着）、" +
+  "上一段对话停在什么气氛上（聊得正起劲就短一点，刚互道晚安或刚吵完就长一点）、" +
+  "现在几点、你们已经多久没说话了、" +
+  "以及{{user}}的勿扰时段 {Focus_time_start}-{Focus_time_end}" +
+  "（算出来的时间点要是落在勿扰里，就往后挪到勿扰结束之后）。\n" +
+  "输出要求：只回一个数字，表示小时数，可以是小数（0.5 就是半小时）。" +
+  "范围 0.05 到 24。不要写单位，不要解释，不要写任何别的字。";
+
+/**
+ * 历史上用过的时间判断提示词。
+ *
+ * 存着的值**一字不差**等于其中一条时，normalizeProactive 会静默换成新的默认值
+ * ——这些角色从来没被人动过这一栏，留着旧话只会继续judge不准；而用户自己改过
+ * 的（哪怕只多一个空格）不在这份名单里，原样保留。
+ */
+const LEGACY_PROACTIVE_TIME_PROMPTS = [
   "请根据当前对话上下文与人设，判断多久之后主动发消息比较合适。" +
-  "用户的勿扰模式在：{Focus_time_start}-{Focus_time_end}，请在勿扰模式后发送信息，" +
-  "请直接返回一个数字（单位：小时，可以是小数，如0.5表示半小时）。只返回数字，不要其他内容。";
+    "用户的勿扰模式在：{Focus_time_start}-{Focus_time_end}，请在勿扰模式后发送信息，" +
+    "请直接返回一个数字（单位：小时，可以是小数，如0.5表示半小时）。只返回数字，不要其他内容。",
+];
 
 /**
  * 提示词协助模式的默认提示词 —— 发过去的**第一条** system 消息。
@@ -297,6 +322,27 @@ export const DEFAULT_CONFIG = {
     },
   },
   /*
+   * 要不要边生成边看（流式）。全局一份，现在只有**线下模式**读它。
+   *
+   * ── 为什么只有线下模式 ──
+   *
+   * iMessage 那条路压根没有「边看」这回事：模型吐完整段才能按 `$` 切成几条气泡、
+   * 才能算打字延迟、才能发出去。半截文本没法发短信。而线下模式是网页里的一块
+   * 正文，一轮几百上千字，不流式就得干等几十秒对着一个转圈。
+   *
+   * ── 三档的意思 ──
+   *
+   *  - `auto`（默认，「跟随模型」）：按流式发请求，但上游回的**不是**
+   *    `text/event-stream` 就当整段收下。自己部署的反代和一些中转站会回一个
+   *    普通 JSON（或者先吐一段假的流式前缀），这一档下它们照样能用。
+   *  - `on`：强制流式。
+   *  - `off`：完全走原来那条非流式的路。
+   *
+   * 默认 auto 而不是 on：坏掉的时候要能自己退回去。而默认 off 又白瞎了 ——
+   * 绝大多数中转站是支持的，用户不该为了「本来就该有」的体验去翻设置。
+   */
+  stream: { mode: "auto" },
+  /*
    * 定时维护：隔一阵子自己重启一次 / 清一次缓存。
    *
    * 两个都**默认关**。重启会把所有桥接顶掉几十秒，清缓存会让下一轮消息
@@ -504,7 +550,8 @@ export const DEFAULT_CONFIG = {
   // 三家都没开 = 角色就算打开了「发语音」也发不出来，退化成文字，见 media.js
   ttsApi: {
     minimax: { enabled: false, key: "", groupId: "", model: "speech-02-hd", host: "" },
-    elevenlabs: { enabled: false, key: "", model: "eleven_multilingual_v2", stability: 0.5, similarityBoost: 0.75 },
+    // style（风格夸张度）默认 0 = 关：大于 0 才会发给上游，见 media.js:ttsElevenLabs
+    elevenlabs: { enabled: false, key: "", model: "eleven_multilingual_v2", stability: 0.5, similarityBoost: 0.75, style: 0 },
     // 本地部署的 GPT-SoVITS，没有密钥，但地址和参考音频路径也只存密钥文件
     // （地址里可能带内网信息，不该进能分享出去的那份）
     sovits: {
@@ -1112,6 +1159,15 @@ function normalizeProactive(input) {
   // 提示词留空 = 恢复默认，和 normalizeMemories 里那套一个写法
   const prompt = (v, fallback) => (str(v).trim() ? str(v) : fallback);
 
+  // 时间判断提示词多一道：存的还是某个历史默认值就自动换成新的，见
+  // LEGACY_PROACTIVE_TIME_PROMPTS。改过的（差一个字都算）原样留着
+  const timePrompt = (v) => {
+    const kept = prompt(v, DEFAULT_PROACTIVE_TIME_PROMPT);
+    return LEGACY_PROACTIVE_TIME_PROMPTS.includes(kept.trim())
+      ? DEFAULT_PROACTIVE_TIME_PROMPT
+      : kept;
+  };
+
   /*
    * 两头反着填（最小 3 小时、最大 1 小时）不当成错：取小的当下限、大的当上限。
    * 直接照抄的话 random() 会落在一个倒着的区间上，等于永远按 minHours 发。
@@ -1126,7 +1182,7 @@ function normalizeProactive(input) {
     auto: {
       minWaitMinutes: clampInt(input?.auto?.minWaitMinutes, 60, 1, 1440),
       model: normalizeModelRef(input?.auto?.model),
-      prompt: prompt(input?.auto?.prompt, DEFAULT_PROACTIVE_TIME_PROMPT),
+      prompt: timePrompt(input?.auto?.prompt),
     },
     prompt: prompt(input?.prompt, DEFAULT_PROACTIVE_PROMPT),
     // 主动消息带多少条上文给模型。0 = 一条不带（冷启动式的自言自语）
@@ -1751,6 +1807,20 @@ function normalizeMaintenance(input) {
 }
 
 /**
+ * 流式开关（见 DEFAULT_CONFIG.stream 上面那段）。
+ *
+ * 认不出的一律退回 `auto`，和 normalizeCloudBackup 的 provider 同一条道理：
+ * 配置可能是手改坏的、或者是更新版本写下来的值，原样留着会让界面上三个单选
+ * 一个都不亮。退回 auto 而不是 off —— auto 是三档里最不容易出事的那个。
+ */
+const STREAM_MODES = ["auto", "on", "off"];
+
+function normalizeStream(input) {
+  const mode = str(input?.mode).trim().toLowerCase();
+  return { mode: STREAM_MODES.includes(mode) ? mode : "auto" };
+}
+
+/**
  * 云备份（见 DEFAULT_CONFIG.cloudBackup 上面那段）。
  *
  * provider 认不出的一律退回 `s3` 而不是原样留着：配置可能是手改坏的，
@@ -1955,6 +2025,7 @@ function normalizeTtsApi(input) {
       model: str(eleven.model).trim() || "eleven_multilingual_v2",
       stability: clampNum(eleven.stability, 0.5, 0, 1),
       similarityBoost: clampNum(eleven.similarityBoost, 0.75, 0, 1),
+      style: clampNum(eleven.style, 0, 0, 1),
     },
     sovits: {
       enabled: Boolean(sovits.enabled),
@@ -2337,6 +2408,7 @@ export function normalizeConfig(input) {
   const roster = normalizeRoster(input, base, legacy);
   base.projects = roster.projects;
   base.roles = roster.roles;
+  base.stream = normalizeStream(input.stream);
   base.maintenance = normalizeMaintenance(input.maintenance);
   base.cloudBackup = normalizeCloudBackup(input.cloudBackup);
   base.privacy = normalizePrivacy(input.privacy);

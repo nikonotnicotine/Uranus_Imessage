@@ -39,7 +39,13 @@ import { buildEnv } from "./env.js";
 import { notePrompt } from "./lastprompt.js";
 import { chatCompletion, chatWithFallback } from "./llm.js";
 import { logError, logInfo, logWarn } from "./logs.js";
-import { SUMMARY_PARAMS, SUMMARY_TIMEOUT, pendingText, summaryMessages } from "./memory.js";
+import {
+  SUMMARY_PARAMS,
+  SUMMARY_REFUSAL_RETRIES,
+  SUMMARY_TIMEOUT,
+  pendingText,
+  summaryMessages,
+} from "./memory.js";
 import { appendPending, memoryKeyFor } from "./memorystore.js";
 import {
   CHOICE_COUNT,
@@ -327,6 +333,12 @@ function historyOf(story) {
  * @param {AbortSignal} [opts.signal] 用户按「停下」用的。中止时上游那个 fetch
  *        当场断开，抛出来的错带 `aborted = true`；**用户那句已经落盘了**，
  *        所以点一下「再来一次」就能按同一份上文重来
+ * @param {(text: string) => void} [opts.onDelta] 有它就按流式生成，每收到一小块
+ *        正文调一次。**只影响「边生成边看」**：落盘、正则、摘选项那几步和非流式
+ *        一模一样（存档存的照旧是模型原文）。是不是要传由路由层按
+ *        `config.stream.mode` 决定 —— 这个函数不读那份配置
+ * @param {() => void} [opts.onRestart] 换到副 API 之前调一次，让前端把已经显示
+ *        出来的半截清掉（副 API 会从头再说一遍）
  * @returns {Promise<{turn: object, display: string, options: string[],
  *   story: object, usedFallback: boolean, summary: object|null}>}
  *   `display` 是过了 `toUser` 正则的那份（发气泡 / 网页上显示用），
@@ -341,6 +353,8 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
     storyId = "",
     reroll = false,
     signal = undefined,
+    onDelta = undefined,
+    onRestart = undefined,
   } = opts ?? {};
 
   if (storyId && readIndex(roleKey).currentId !== storyId) setCurrent(roleKey, storyId);
@@ -444,6 +458,8 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
     // params 用预设那一份：线下要的就是有变化，这是和协助模式最大的区别
     const out = await chatWithFallback(endpoint, fallback, built.messages, built.params, {
       signal,
+      onDelta,
+      onRestart,
     });
     reply = out.content;
     usedFallback = out.usedFallback;
@@ -592,6 +608,7 @@ async function makeSummary(config, role, story, kind) {
     label: endpoint.label ? `线下${what}（${endpoint.label}）` : `线下${what}`,
     params: SUMMARY_PARAMS,
     timeout: SUMMARY_TIMEOUT,
+    retryOnRefusal: SUMMARY_REFUSAL_RETRIES,
   });
   const content = String(raw ?? "").trim();
   if (!content) throw new Error(`模型返回了空的${what}`);

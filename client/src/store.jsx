@@ -55,6 +55,101 @@ async function api(path, options = {}) {
 }
 
 /**
+ * 边收边处理的 POST（SSE）。
+ *
+ * 为什么不用 `EventSource`：那东西只能发 GET，而线下模式一轮要把整段上下文
+ * （几十 KB 的消息数组）发上去，只能 POST。所以自己读 `res.body`。
+ *
+ * 事件格式和 /api/logs/stream 那条一致：`event: xxx\ndata: {...}`，事件之间
+ * 一个空行。`onEvent(name, payload)` 每来一条叫一次；`payload` 解不出 JSON
+ * 就给 `null`（心跳注释之类）。
+ *
+ * 401 的处理和上面 `api()` 对齐 —— 流式接口一样会撞上会话过期，那时候要把
+ * 界面整个切回登录页，而不是在线下面板里干等一条永远不来的 `done`。
+ *
+ * @param {string} path
+ * @param {{body?: unknown, signal?: AbortSignal, onEvent: (name: string, payload: unknown) => void}} opts
+ */
+export async function apiStream(path, { body, signal, onEvent } = {}) {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
+  });
+
+  // 头就没过：后端还没开始写事件，这时候错误体是普通 JSON，照 api() 那套报
+  if (!res.ok) {
+    let detail = "";
+    let data = null;
+    try {
+      data = await res.json();
+      detail = data?.error ?? "";
+    } catch {
+      /* 非 JSON 就算了 */
+    }
+    if (res.status === 401 || data?.needLogin || data?.mustChange) {
+      onSessionLost?.(res.status === 401 ? "login" : "change");
+    }
+    throw new Error(detail || `请求失败 (${res.status})`);
+  }
+
+  // 后端在「开关是 off」「客户端没要流」这两种情况下回的是普通 JSON。
+  // 那就当一条 done 事件交出去，调用方两条路共用一套处理
+  if (!(res.headers.get("Content-Type") ?? "").includes("event-stream")) {
+    onEvent?.("done", await res.json());
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+
+  /** 切出来的一条（可能是多行）交给上面。 */
+  const emit = (raw) => {
+    const chunk = raw.trim();
+    if (!chunk) return;
+    let name = "message";
+    const lines = [];
+    for (const line of chunk.split(/\r?\n/)) {
+      if (line.startsWith(":")) continue; // 心跳注释
+      if (line.startsWith("event:")) name = line.slice(6).trim();
+      else if (line.startsWith("data:")) lines.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (!lines.length) return;
+    let payload = null;
+    try {
+      payload = JSON.parse(lines.join("\n"));
+    } catch {
+      /* 解不出就给 null，调用方自己判 */
+    }
+    onEvent?.(name, payload);
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      // stream: true 让多字节字符被 TCP 切在半个汉字上也能等到下一块
+      buf += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+      let cut;
+      while ((cut = buf.search(/\r?\n\r?\n/)) !== -1) {
+        const raw = buf.slice(0, cut);
+        buf = buf.slice(cut + /^\r?\n\r?\n/.exec(buf.slice(cut))[0].length);
+        emit(raw);
+      }
+      if (done) break;
+    }
+    emit(buf); // 最后一帧没有尾随空行的情况
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* 已经读完了就无所谓 */
+    }
+  }
+}
+
+/**
  * 从 Content-Disposition 里取文件名。
  *
  * **先认 `filename*`**：文件名里带角色名、预设名，多半是中文，后端按
@@ -1077,6 +1172,16 @@ export function ConfigProvider({ children }) {
     [updateConfig]
   );
   /**
+   * 「输出方式」—— 线下模式是边生成边看还是整段等完（auto / on / off）。
+   *
+   * **全局一份**，和 TTS 同理：这描述的是「你这条网络到上游那段管子能不能
+   * 流」，不是某个角色的性格。同一个中转站换个角色也照样不给流。
+   */
+  const updateStream = useCallback(
+    (patch) => updateConfig((c) => ({ ...c, stream: { ...c.stream, ...patch } })),
+    [updateConfig]
+  );
+  /**
    * 记忆库的**设置**（三个模型引用、轮数、四段提示词、日记的定时和字数…）。
    * 同样**全局一份**，角色那边只有三个开关。
    *
@@ -1888,10 +1993,16 @@ export function ConfigProvider({ children }) {
   /**
    * 关键词是分隔符隔开的一行字，存的是数组，这里做转换。
    *
-   * 分隔符要连顿号一起收 —— 界面上回显用的就是「、」（`keys.join("、")`），
-   * 输入框的 placeholder 也写着「王都、阿瓦隆」。只认逗号的话，用户照着提示
-   * 打出来的一串会被存成**一个**关键词，而且界面回显看着一模一样，根本发现
-   * 不了。分号也一起收，中英文都收。
+   * **正式的分隔符只有英文逗号** —— 界面上回显用的就是它（`keys.join(", ")`），
+   * placeholder、hint 说的也是它。一个符号一件事，不给用户猜的空间。
+   *
+   * 另外那几个（顿号、中文逗号、分号、换行）仍然照切，但那是**单向的收旧账**：
+   * 老条目是按顿号存的，而且从酒馆那边导进来的世界书什么分隔符都有。切开之后
+   * 下一次回显就变成英文逗号了，等于顺手迁移过来；不切的话用户会看见一整串
+   * 「王都、阿瓦隆」被当成一个关键词，而且界面上看不出哪里不对。
+   *
+   * 关键词里本来就带逗号的（`Smith, Jr.`）没法表达 —— 但那种词用整词匹配也
+   * 匹配不到，世界书的关键词本来就是短词，不为它把分隔符做成可配置的。
    */
   const setWorldEntryKeys = useCallback(
     (bookId, entryId, field, raw) =>
@@ -1996,6 +2107,7 @@ export function ConfigProvider({ children }) {
         updateSearchApi,
         updateSpyApi,
         updateTtsApi,
+        updateStream,
         updateMemories,
         // 备份
         exportBackup,

@@ -224,6 +224,131 @@ function rejectedParamField(status, text) {
 }
 
 /**
+ * 上游是不是在说「我不收 stream 这个字段」。
+ *
+ * 和 rejectedParamField 同一个路子（认上游的抱怨，不维护模型黑名单），单独一个
+ * 函数是因为处理不一样：脱掉 `stream` 还得把**读法**也换回非流式，见调用点。
+ *
+ * 认得比那边松一点，允许 `stream is not supported` / `streaming is disabled`
+ * 这类没有 `unsupported` 字样的说法 —— 自建反代的报错措辞比正规厂商随意得多。
+ */
+function rejectsStream(status, text) {
+  if (status !== 400 && status !== 422 && status !== 501) return false;
+  const s = String(text ?? "");
+  if (!/\bstream(ing)?\b/i.test(s)) return false;
+  return /unsupported|not\s+support|unrecognized|invalid|disabled|not\s+allowed|cannot|can't/i.test(s);
+}
+
+/* ================= 内容安全那一类失败 ================= */
+
+/**
+ * 上游是不是在说「这段内容我不做」。
+ *
+ * 起因是记忆库总结的两条真实报错：
+ *   `The prompt could not be submitted. The prompt contains sensitive words
+ *    that violate Google's Generative AI Prohibited Use policy.`
+ * 以及 Gemini 那边的 `PROHIBITED_CONTENT` / `SAFETY`。
+ *
+ * 这类失败和别的不一样：它**不是**网络抖动（重打一模一样的没用），也不是配置
+ * 错（换个模型可能就过了，但那得用户动手）。它是「同一份请求体换个说法可能就
+ * 过得去」—— 总结这件事本来就该是中立的第三人称摘要，把这一点在提示词里说死，
+ * 成功率会完全不同。所以单独认出来，交给 retryOnRefusal 那套换说法重试。
+ *
+ * 状态码卡在这几个上，是为了不把 503「分组下无可用渠道」这类误判成内容拦截 ——
+ * 那种要重试的是**同一份请求**，走 isTransient 那条路。
+ */
+const BLOCK_PATTERNS = [
+  /prohibited[_ ]?(use|content)/i,
+  /sensitive\s+words?/i,
+  /content[_ ]?filter/i,
+  /safety[_ ]?(settings?|filters?|polic|block)/i,
+  /blocked\s+by/i,
+  /\bRECITATION\b/,
+  /违规|敏感词|内容(安全|审核|政策)/,
+];
+
+export function isContentBlocked(status, text) {
+  // 0/undefined = 不是上游回的（比如正文被判成拒答），那就只看措辞
+  if (status && ![400, 403, 422, 451].includes(status)) return false;
+  const s = String(text ?? "");
+  return BLOCK_PATTERNS.some((re) => re.test(s));
+}
+
+/**
+ * 这段正文是不是「模型答应了，但回的是一句道歉」。
+ *
+ * 比上游明着拦下更阴险：HTTP 200、格式完全正常，于是调用方把这句道歉当成合格
+ * 的总结写了进去 —— 而备忘录是**整份覆盖**的（memory.js:summarizeMemo），
+ * 一句「很抱歉，我无法协助」能把用户攒了几个月的备忘录冲干净。
+ *
+ * 判得很紧，两个条件都要满足：
+ *
+ *  1. **短**。真的总结是几百上千字；拒答就那么一两句。
+ *  2. **拒答的话出现在开头**。角色在剧情里说「很抱歉」是常事，而模型要拒绝
+ *     你的时候一定是开门见山。放在正文中间的「抱歉」不算。
+ *
+ * 只在调用方明确传了 retryOnRefusal 时才会被问到（见 chatCompletion）——
+ * 正常聊天那条路压根不走这里，角色想道歉就让它道歉。
+ */
+const REFUSAL_PATTERNS = [
+  /(很|非常|十分)?抱歉[，,、]/,
+  /我(不能|无法|不便|没办法|恐怕不能)(协助|帮助|继续|提供|生成|完成|处理|总结)/,
+  /(不能|无法)(满足|回应|处理)(你|您)的(这个|这项)?(请求|要求)/,
+  /作为(一个|一名)?(AI|人工智能|语言模型|大语言模型)/i,
+  /违反了?(相关)?(的)?(内容)?(政策|规定|准则|使用条款)/,
+  /\bI(?:'m| am) (?:sorry|unable|not able)\b/i,
+  /\bI (?:can(?:no|')?t|cannot|won't) (?:help|assist|continue|provide|create|generate|comply)\b/i,
+  /\bAs an AI\b/i,
+  /(?:violat\w+|against) (?:our |the )?(?:usage |content )?polic/i,
+];
+/** 超过这个字数就当它真的在总结 —— 拒答不会写这么长。 */
+const REFUSAL_MAX_CHARS = 400;
+/** 拒答的话必须出现在开头这一段里。 */
+const REFUSAL_HEAD_CHARS = 120;
+
+export function looksLikeRefusal(text) {
+  const s = String(text ?? "").trim();
+  if (!s || s.length > REFUSAL_MAX_CHARS) return false;
+  const head = s.slice(0, REFUSAL_HEAD_CHARS);
+  return REFUSAL_PATTERNS.some((re) => re.test(head));
+}
+
+/**
+ * 在异常上盖一个 `blocked` 标记。
+ *
+ * 给调用方留个**能判**的钩子：这一类失败换条线、隔一会儿再试都一样过不去，
+ * 和「网络抖动」「额度用完」不是一回事。目前没人读它（记忆库那边失败就是失败，
+ * 一律不清 pending），留着是为了以后想在界面上把这一类单独说一句时不用再改
+ * llm.js —— 话本身已经说清了，标记只是省掉一次字符串匹配。
+ */
+function blockedIf(err, blocked) {
+  if (blocked) err.blocked = true;
+  return err;
+}
+
+/**
+ * 被拦下之后追加的那句话，一档比一档收敛。
+ *
+ * 原样重打三次大概率是三次一样的结果 —— 拦住它的是请求体本身，不是运气。
+ * 所以每次换个说法：先把「你要做的是中立摘要」说死，还不行就连原文引用都不要。
+ *
+ * 追加成一条 **user** 消息而不是改 system：中转站对 system 的处理五花八门
+ * （有的合并、有的丢弃），而最后一条 user 是一定会被看到的。这也顺带满足了
+ * Gemini 3.7/3.8 那条「消息数组不能以 assistant 结尾」的硬规矩。
+ */
+const SAFETY_NUDGES = [
+  "上一次的回答因为内容安全被拒了。请注意：这是一份**客观、中立、第三人称**的" +
+    "事实摘要任务，不是续写也不是创作。只概括发生了什么、谁做了什么决定、有哪些" +
+    "要点需要记住；不要复述敏感细节、露骨描写或原话。不要解释你的顾虑，直接给结果。",
+  "仍然被拒。请把上面的材料当成**已经脱敏的事件记录**来处理：只输出要点列表，" +
+    "每条一行，用最平实的措辞概括「谁、做了什么、结论是什么」。不要引用任何原文，" +
+    "不要描述任何具体动作或身体细节，不要作任何评价。只输出列表本身。",
+  "还是不行。那就只抽**最外层的事实骨架**：时间、地点、在场的人、达成的约定或" +
+    "结论、需要记住的偏好与禁忌。凡是涉及具体情节、身体、情绪细节的一律跳过不写。" +
+    "宁可写得少、写得干，也不要漏掉时间和约定。直接输出，不要任何前言后语。",
+];
+
+/**
  * 上游报错时把**完整的响应体**记进日志。
  *
  * 抛出去的那句话有长度上限（要发成短信），日志没有 —— 用户排查问题看的是
@@ -325,6 +450,204 @@ async function requestJson(
   return { ok: res.ok, status: res.status, data, text };
 }
 
+/* ================= 流式 ================= */
+
+/**
+ * 同 requestJson，但按 SSE 边收边喂。**返回的是一模一样的形状**
+ * `{ok, status, data, text}`。
+ *
+ * 形状一致这件事是刻意的，也是这个函数存在的全部理由：chatCompletion 那个
+ * 重试循环里有一大堆判断（isTransient 退避、rejectedParamField 脱参数重打、
+ * 换说法重试、logUpstreamFailure、最后取 `choices[0].message.content`），
+ * 它们**一行都不用为流式改**。收完之后把拼好的全文塞回
+ * `data.choices[0].message.content`，下游根本看不出这轮是流式收的。
+ *
+ * ── 三种「其实不是流」的情况都要兜住 ──
+ *
+ *  1. **非 2xx**：读完 body 当 text 返回，照走原来的错误分支。错误响应从来
+ *     不是 SSE，硬按 SSE 解析只会把一段好好的 JSON 错误信息弄丢。
+ *  2. **Content-Type 不是 event-stream**：整包 `JSON.parse`，按非流式返回 ——
+ *     这就是「跟随模型」那一档。自己部署的反代和一些中转站不管你发没发
+ *     `stream: true`，回的都是普通 JSON。
+ *  3. **流中间来一条 `data: {"error":...}`**：当上游错误返回，别把半截正文
+ *     当成成功的结果交出去。
+ *
+ * `onDelta` 每收到一小块正文调一次。它自己抛的异常**不会**打断这一轮 ——
+ * 那是「写给前端的管子断了」，而模型这边还在正常吐字；断的是显示，不是生成。
+ *
+ * @param {(text: string) => void} onDelta 每一小块正文
+ * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
+ */
+async function requestStream(url, { key, body, timeout = REQUEST_TIMEOUT, signal, onDelta }) {
+  const timer = AbortSignal.timeout(timeout);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
+      // 有些反代靠这个头决定回不回 SSE
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+    signal: signal ? AbortSignal.any([timer, signal]) : timer,
+    // 和 requestJson 同一条规矩：模型 API 默认不走代理
+    ...(await proxyFor("llm")),
+  });
+
+  // 错误响应不是 SSE，原样读成文本交给调用方那套错误处理
+  if (!res.ok) {
+    const text = await res.text();
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      /* 同 requestJson */
+    }
+    return { ok: false, status: res.status, data, text };
+  }
+
+  const kind = String(res.headers.get("content-type") ?? "");
+  if (!/event-stream/i.test(kind)) {
+    // 「跟随模型」：上游没给流，那就当普通 JSON 收下。一个字都不丢
+    const text = await res.text();
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      /* 非 JSON 也非 SSE：交给调用方按 text 报错 */
+    }
+    logDebug("LLM", `上游没回流式（Content-Type: ${kind || "空"}），这轮当整段收下`);
+    return { ok: true, status: res.status, data, text };
+  }
+
+  let full = "";
+  let usage = null;
+  let finish = null;
+  let model = "";
+  let upstreamError = null;
+
+  await readSse(res, (payload) => {
+    if (payload === "[DONE]") return true;
+    let chunk;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      // 心跳、注释、反代插的那点垃圾 —— 跳过，别为此毁掉一整轮
+      return false;
+    }
+    // 流中途报错：`data: {"error":{...}}`
+    if (chunk?.error) {
+      upstreamError = chunk.error;
+      return true;
+    }
+    const choice = chunk.choices?.[0];
+    // reasoning_content 是思考过程（DeepSeek R1 那一路），不是正文，不累进去
+    const piece = choice?.delta?.content;
+    if (typeof piece === "string" && piece) {
+      full += piece;
+      // 前端的管子断了不该连累这一轮生成
+      try {
+        onDelta?.(piece);
+      } catch {
+        /* 显示断了，生成继续 */
+      }
+    }
+    if (choice?.finish_reason) finish = choice.finish_reason;
+    // usage 一般只挂在最后一个 chunk 上（有的源压根不给）
+    if (chunk.usage) usage = chunk.usage;
+    if (chunk.model) model = String(chunk.model);
+    return false;
+  });
+
+  if (upstreamError) {
+    const text = JSON.stringify({ error: upstreamError });
+    return { ok: false, status: 200, data: { error: upstreamError }, text };
+  }
+
+  /*
+   * 拼回非流式的形状。`text` 那一份是给日志和错误信息用的（调用方会
+   * `.slice(0, 300)`），所以只放拼好的全文，不留 SSE 的原始帧 —— 几百个
+   * `data: {...}` 塞进日志没有任何可读性。
+   */
+  const data = {
+    ...(model ? { model } : {}),
+    choices: [{ index: 0, message: { role: "assistant", content: full }, finish_reason: finish }],
+    ...(usage ? { usage } : {}),
+  };
+  return { ok: true, status: res.status, data, text: JSON.stringify(data) };
+}
+
+/**
+ * 把响应体按 SSE 拆成一条条 `data:` 负载。
+ *
+ * 自己拆而不用 EventSource：那个只认 GET。规则按 SSE 那份规范来的最小子集 ——
+ * 事件之间空行分隔、`data:` 后面那截是负载、一个事件里多条 data 用 `\n` 接上。
+ *
+ * `\r\n` 也认：有的反代（尤其 IIS / nginx 中间加了一层的）回的是 CRLF，
+ * 只按 `\n\n` 切会把 `\r` 留在负载末尾，JSON.parse 照样能过但不干净；
+ * 而只按 `\n\n` 找边界在纯 CRLF 的流上直接找不到事件边界。
+ *
+ * @param {Response} res
+ * @param {(payload: string) => boolean} onPayload 返回 true 表示到此为止
+ */
+async function readSse(res, onPayload) {
+  const reader = res.body?.getReader?.();
+  if (!reader) throw new Error("上游没给响应体");
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+  let done = false;
+
+  /** 处理缓冲区里所有**完整**的事件（末尾那个不完整的留着等下一块）。 */
+  const drain = (flush) => {
+    for (;;) {
+      const m = /\r?\n\r?\n/.exec(buf);
+      let raw;
+      if (m) {
+        raw = buf.slice(0, m.index);
+        buf = buf.slice(m.index + m[0].length);
+      } else if (flush && buf.trim()) {
+        // 流断了但缓冲区里还剩一个没有尾随空行的事件（有的源最后一帧就这样）
+        raw = buf;
+        buf = "";
+      } else {
+        return;
+      }
+      const lines = raw.split(/\r?\n/);
+      const payload = lines
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).replace(/^ /, ""))
+        .join("\n");
+      if (!payload) continue; // 注释行（`: keep-alive`）和别的字段一律跳过
+      if (onPayload(payload)) {
+        done = true;
+        return;
+      }
+    }
+  };
+
+  try {
+    for (;;) {
+      const { value, done: finished } = await reader.read();
+      if (finished) break;
+      buf += decoder.decode(value, { stream: true });
+      drain(false);
+      if (done) break;
+    }
+    if (!done) {
+      buf += decoder.decode();
+      drain(true);
+    }
+  } finally {
+    // 提前收工（[DONE]、流里报错、用户按停）要主动掐掉连接，
+    // 不然这条 socket 会挂在那儿直到上游自己超时
+    try {
+      await reader.cancel();
+    } catch {
+      /* 已经断了 */
+    }
+  }
+}
+
 /**
  * 调一次 /chat/completions，成功返回助手文本。
  * 失败一律 throw Error（带中文原因），由调用方决定要不要换线。
@@ -337,10 +660,17 @@ async function requestJson(
  *        temperature 只是给「测试连接」那条路留的回落 —— 正式对话的生成参数
  *        走 opts.params（来自预设）
  * @param {Array} messages OpenAI 格式的消息数组
+ * 传了 `onDelta` 就按流式发，边收边喂给它；收完返回的还是拼好的全文，
+ * 调用方不传就完全是原来那条路（见 requestStream）。
+ *
  * @param {{label?:string, timeout?:number, maxTokens?:number, retries?:number,
- *          params?:object, signal?:AbortSignal}} [opts] label 只用于日志；
- *        params 见 preset.js 的 DEFAULT_PARAMS（温度 / Top P / 最大token /
- *        频率惩罚 / 存在惩罚）；signal 是「用户按停」，命中就抛 ABORTED_MESSAGE
+ *          params?:object, signal?:AbortSignal, retryOnRefusal?:number,
+ *          onDelta?:(text:string)=>void}} [opts]
+ *        label 只用于日志；params 见 preset.js 的 DEFAULT_PARAMS（温度 / Top P /
+ *        最大token / 频率惩罚 / 存在惩罚）；signal 是「用户按停」，命中就抛
+ *        ABORTED_MESSAGE；retryOnRefusal 是「被内容安全拦下时换个说法再试几次」，
+ *        默认 0（只有记忆库那几条总结链传，见 SAFETY_NUDGES）；onDelta 有就走
+ *        流式，每收到一小块正文调一次
  */
 export async function chatCompletion(endpoint, messages, opts = {}) {
   const label = opts.label ?? "API";
@@ -379,8 +709,45 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
   const maxTokens = opts.maxTokens ?? p.maxTokens;
   if (maxTokens > 0) body.max_tokens = maxTokens;
 
+  /*
+   * 流式。**由调用方给不给 onDelta 决定** —— 有人接着增量才值得按流式发，
+   * 没人接的话开了流只是把一整段拆成几百个包再拼回来，白费劲。
+   *
+   * 「跟随模型」那一档不在这里判：这边照样发 `stream: true`，上游要是回的
+   * 不是 SSE，requestStream 会当整段收下（见那边的注释）。判 auto / on / off
+   * 是上层的事（offline.js 读 config.stream.mode 决定要不要传 onDelta）。
+   */
+  let streaming = typeof opts.onDelta === "function";
+  if (streaming) {
+    body.stream = true;
+    // 有的中转站要这个才在最后一帧给 usage；不认的会忽略掉，发了不亏
+    body.stream_options = { include_usage: true };
+  }
+
   // 测试连接这类「用户正盯着等结果」的场合可以传 retries: 0 关掉重试
   const delays = RETRY_DELAYS.slice(0, opts.retries ?? RETRY_DELAYS.length);
+
+  /*
+   * 内容安全那一类失败：还能换几次说法。默认 0 = 和以前一模一样。
+   *
+   * 只有记忆库那几条总结链会传（memory.js / offline.js）。正常聊天**刻意不传** ——
+   * 角色在剧情里说「抱歉，我不能这样」是再正常不过的台词，那条路上一个字都不该
+   * 被这套逻辑碰到。
+   *
+   * 和上面 attempt 那套是两本账：那是「同一份请求碰运气再打一次」，这是「请求体
+   * 本身过不去，得换个说法」，互不占额度。
+   */
+  let refusalLeft = Math.max(0, Math.floor(Number(opts.retryOnRefusal) || 0));
+  let refusalTries = 0;
+  let nudged = false;
+
+  /** 换一档说法。替换上一句而不是往上堆 —— 堆三句自相矛盾的要求只会更糟。 */
+  const nudge = () => {
+    const note = SAFETY_NUDGES[Math.min(refusalTries - 1, SAFETY_NUDGES.length - 1)];
+    const head = nudged ? body.messages.slice(0, -1) : body.messages;
+    nudged = true;
+    body.messages = [...head, { role: "user", content: note }];
+  };
 
   const startedAt = Date.now();
   let result;
@@ -395,12 +762,28 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
     if (opts.signal?.aborted) throw abortedError();
     const retryIn = delays[attempt];
     try {
-      result = await requestJson(`${base}/chat/completions`, {
-        key,
-        body,
-        timeout: opts.timeout ?? REQUEST_TIMEOUT,
-        signal: opts.signal,
-      });
+      /*
+       * 流式和非流式走两个函数，但**返回同一个形状** —— 下面整段重试、脱参数、
+       * 取正文的逻辑因此完全不用分叉，见 requestStream 的注释。
+       *
+       * 重打时 onDelta 照样会被调，所以上游拦一次再重来，前端会收到两段增量；
+       * 那就是 chatWithFallback 的 onRestart 要解决的事（换线之前让前端清屏）。
+       * 这里不自己去清：chatCompletion 不知道前端长什么样。
+       */
+      result = streaming
+        ? await requestStream(`${base}/chat/completions`, {
+            key,
+            body,
+            timeout: opts.timeout ?? REQUEST_TIMEOUT,
+            signal: opts.signal,
+            onDelta: opts.onDelta,
+          })
+        : await requestJson(`${base}/chat/completions`, {
+            key,
+            body,
+            timeout: opts.timeout ?? REQUEST_TIMEOUT,
+            signal: opts.signal,
+          });
     } catch (e) {
       /*
        * 按停要在 isTransient 之前判掉。
@@ -420,13 +803,43 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
       throw new Error(`${label} 请求失败：${why}`);
     }
 
-    if (result.ok) break;
+    if (result.ok) {
+      /*
+       * HTTP 200 也可能是「模型答应了，但回的是一句道歉」。这一步在跳出循环
+       * **之前**判，才能用同一个循环换说法重打；判据很紧，见 looksLikeRefusal。
+       */
+      const reply = result.data?.choices?.[0]?.message?.content;
+      if (refusalLeft > 0 && looksLikeRefusal(reply)) {
+        refusalLeft -= 1;
+        refusalTries += 1;
+        nudge();
+        logWarn(
+          label,
+          `模型回的是一句道歉/拒答，换个说法重问（还能试 ${refusalLeft} 次）`,
+          String(reply).slice(0, 200)
+        );
+        continue;
+      }
+      break;
+    }
 
     const why = describeUpstream(result.status, result.text, result.data);
     if (retryIn !== undefined && isTransient(result.status, null)) {
       logWarn(label, `第 ${attempt + 1} 次${why}，${retryIn}ms 后重试`);
       attempt += 1;
       await wait(retryIn);
+      continue;
+    }
+
+    /*
+     * 上游明着说「这段内容我不做」。原样重打没有意义（isTransient 也不会认它），
+     * 但换个说法有希望 —— 总结本来就该是中立的第三人称摘要。
+     */
+    if (refusalLeft > 0 && isContentBlocked(result.status, result.text)) {
+      refusalLeft -= 1;
+      refusalTries += 1;
+      nudge();
+      logWarn(label, `被内容安全拦下，换个说法重问（还能试 ${refusalLeft} 次）`, why);
       continue;
     }
 
@@ -439,9 +852,31 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
       continue;
     }
 
+    /*
+     * 上游连 `stream` 都不收。和上面脱参数是同一个套路，但多一步：`streaming`
+     * 也要关掉，不然下一圈还是走 requestStream、还是按 SSE 去读一个普通 JSON。
+     *
+     * 「跟随模型」那一档兜的是「发了 stream 但回的不是 SSE」，这里兜的是
+     * **发都不让发**（有些老的自建反代会 400）。两处合起来才算真的「跟随」。
+     */
+    if (streaming && body.stream && rejectsStream(result.status, result.text)) {
+      delete body.stream;
+      delete body.stream_options;
+      streaming = false;
+      logWarn(label, `${model} 不收 stream，改成整段拿一次`, why);
+      continue;
+    }
+
     // 摘要那句会被截断（要发成短信），全文只在日志里 —— 这是最后一次机会
     logUpstreamFailure(label, result.status, result.text, body);
-    throw new Error(`${label} ${why}`);
+    throw blockedIf(
+      new Error(
+        refusalTries
+          ? `${label} 连着 ${refusalTries + 1} 次被内容安全拦下：${why}`
+          : `${label} ${why}`
+      ),
+      refusalTries && isContentBlocked(result.status, result.text)
+    );
   }
 
   const ms = Date.now() - startedAt;
@@ -450,6 +885,23 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
   if (typeof content !== "string") {
     throw new Error(
       `${label} 返回格式看不懂（缺 choices[0].message.content）：${result.text.slice(0, 300)}`
+    );
+  }
+
+  /*
+   * 试到最后一次还是一句道歉：**当失败抛出去**，不把它当成合格的结果返回。
+   *
+   * 这是这一整段的要点所在。以前这句道歉会被调用方当成正常总结 —— 而备忘录是
+   * 整份覆盖的，一句「很抱歉，我无法协助」就能把用户攒了几个月的备忘录冲干净。
+   * 抛出去之后走的是既有的失败路径：pending 不清、备忘录不动（用户的原话是
+   * 「还是不行就默认成功不成功」）。
+   */
+  if (refusalTries && looksLikeRefusal(content)) {
+    throw blockedIf(
+      new Error(
+        `${label} 连着 ${refusalTries + 1} 次只回了道歉，没给出总结：${content.slice(0, 200)}`
+      ),
+      true
     );
   }
 
@@ -477,8 +929,10 @@ function endpointUsable(ep) {
  * @param {object|null} primary 聊天模型的 endpoint
  * @param {object|null} fallback 副 API 的 endpoint，没有就传 null
  * @param {object} [params] 预设里的生成参数。主副共用同一份 —— 一个角色一份预设
- * @param {{signal?:AbortSignal}} [opts] 用户按停用的信号。按停**不换线** ——
- *        那不是主 API 坏了
+ * @param {{signal?:AbortSignal, onDelta?:(text:string)=>void,
+ *          onRestart?:()=>void}} [opts] signal 是用户按停。按停**不换线** ——
+ *        那不是主 API 坏了。onDelta 有就走流式；onRestart 在**换到副 API 之前**
+ *        调一次，让调用方把已经显示出来的半截清掉（见下面那段注释）
  * @returns {Promise<{content: string, usedFallback: boolean}>}
  * @throws {Error} 两条线都失败时抛出，消息里带上两边的原因
  */
@@ -492,6 +946,7 @@ export async function chatWithFallback(primary, fallback, messages, params = {},
       params,
       timeout: CHAT_TIMEOUT,
       signal: opts.signal,
+      onDelta: opts.onDelta,
     });
     return { content, usedFallback: false };
   } catch (primaryError) {
@@ -519,12 +974,28 @@ export async function chatWithFallback(primary, fallback, messages, params = {},
 
     logWarn("LLM", "主 API 失败，改用副 API", primaryMsg);
 
+    /*
+     * 换线之前让调用方清屏。
+     *
+     * 流式那条路上主 API 可能已经吐了半截、前端也已经显示出来了 —— 副 API
+     * 会从头再说一遍，不清的话用户看到的是两段接在一起的重复正文。放在
+     * chatCompletion 外面是因为它不知道前端长什么样，也不该知道。
+     *
+     * 非流式那条路 onRestart 压根没人传，这一句是空转。
+     */
+    try {
+      opts.onRestart?.();
+    } catch {
+      /* 前端的管子断了不该连累换线 */
+    }
+
     try {
       const content = await chatCompletion(fallback, messages, {
         label: fallbackLabel,
         params,
         timeout: CHAT_TIMEOUT,
         signal: opts.signal,
+        onDelta: opts.onDelta,
       });
       logInfo("LLM", "副 API 顶上了，这轮由它回复");
       return { content, usedFallback: true };

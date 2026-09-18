@@ -2893,7 +2893,60 @@ function trackOfflineRun(roleKey) {
 }
 
 /**
- * 演一轮。
+ * 这一轮要不要**按 SSE 回**。
+ *
+ * 两个条件都得满足：
+ *
+ *  1. 客户端自己要（请求体里 `stream: true`）。手机端那一路和老版本的前端
+ *     不带这个字段，走的还是原来那条 JSON 路，一个字节都不受影响。
+ *  2. 全局开关不是「非流式」（`config.stream.mode`）。`auto` 和 `on` 都按流式
+ *     发出去 —— 两者的区别在 llm.js 里（上游没回 SSE 时 auto 当整段收下），
+ *     这一层不用分。
+ */
+function wantsOfflineStream(config, req) {
+  return req.body?.stream === true && (config?.stream?.mode ?? "auto") !== "off";
+}
+
+/**
+ * 把一轮线下生成包成 SSE。
+ *
+ * 头照抄 `/api/logs/stream`（那条已经在 Nginx 反代后面跑了一年，
+ * `X-Accel-Buffering: no` 那行是必需的，不然增量会被攒着一次吐出来）。
+ *
+ * 四种事件：
+ *   `delta`   `{text}`        又来一小块正文
+ *   `reset`   `{}`            换线了，把已经显示的清掉重来
+ *   `done`    正常那份 JSON    和非流式那条路**完全一样**的响应体
+ *   `error`   `{ok:false,…}`  同上，失败那份
+ *
+ * `done` / `error` 的负载和 JSON 那条路一模一样，是为了让前端两条路只有
+ * 「怎么收」的区别，没有「收到什么」的区别 —— 收完都是同一个 handler。
+ */
+function offlineSse(res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders?.();
+  const send = (event, payload) => {
+    // 客户端半路关掉标签页时 res 已经不可写了，写进去会抛
+    if (res.writableEnded) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+  };
+  return {
+    onDelta: (text) => send("delta", { text }),
+    onRestart: () => send("reset", {}),
+    finish: (event, payload) => {
+      send(event, payload);
+      res.end();
+    },
+  };
+}
+
+/**
+ * 演一轮 / 重 roll。两条路只差三个参数，正文完全一样，所以合成一个。
  *
  * 打模型，几十秒，前端要长超时。业务上的失败（没配模型、没在演的剧情、
  * 模型返回空）用 **200 + `ok: false`** 表达并把原话带回去 —— 照
@@ -2902,65 +2955,60 @@ function trackOfflineRun(roleKey) {
  * 这样点一下「重 roll」就能重来，不用重打一遍。
  *
  * 用户按「停下」走的是 `/abort`，中止落在这儿的 catch 里 —— 和别的失败一个
- * 形状（200 + `ok:false` + 一句「被你按停了」+ 一份 state）。
+ * 形状（`ok:false` + 一句「被你按停了」+ 一份 state）。流式那条路也一样，
+ * 只是从 `error` 事件里出去。
+ *
+ * @param {boolean} reroll 重 roll 那一路
  */
-app.post("/api/offline/:roleKey/turn", async (req, res) => {
-  const ctx = offlineCtx(req, res);
-  if (!ctx) return;
-  const storyId = storyIdFrom(req, ctx.roleKey);
-  if (!storyId) return res.status(400).json({ ok: false, error: "现在没有在演的剧情" });
+function offlineTurnRoute(reroll) {
+  return async (req, res) => {
+    const ctx = offlineCtx(req, res);
+    if (!ctx) return;
+    const storyId = storyIdFrom(req, ctx.roleKey);
+    if (!storyId) return res.status(400).json({ ok: false, error: "现在没有在演的剧情" });
 
-  const run = trackOfflineRun(ctx.roleKey);
-  try {
-    const out = await runOfflineTurn(ctx.config, ctx.role, resolveUser(ctx.config, ctx.role), {
-      text: String(req.body?.text ?? ""),
-      choiceIndex: Number(req.body?.choiceIndex) || 0,
-      storyId,
-      signal: run.signal,
-    });
-    res.json({
-      ok: true,
-      usedFallback: out.usedFallback,
-      summary: out.summary,
-      ...offlineState(ctx.config, ctx.role, ctx.roleKey),
-    });
-  } catch (e) {
-    const error = String(e?.message ?? e);
-    // 按停是用户自己的操作，offline.js 那边已经记过一行了，这里不再报警
-    if (!e?.aborted) logWarn("线下模式", `「${ctx.role.name}」这轮没成：${error}`);
-    res.json({ ok: false, error, ...offlineState(ctx.config, ctx.role, ctx.roleKey) });
-  } finally {
-    run.done();
-  }
-});
+    // SSE 的头一旦写出去就只能用事件报错了，所以这个判断要在最前面
+    const sse = wantsOfflineStream(ctx.config, req) ? offlineSse(res) : null;
+    const run = trackOfflineRun(ctx.roleKey);
+    try {
+      const out = await runOfflineTurn(ctx.config, ctx.role, resolveUser(ctx.config, ctx.role), {
+        ...(reroll
+          ? { reroll: true }
+          : {
+              text: String(req.body?.text ?? ""),
+              choiceIndex: Number(req.body?.choiceIndex) || 0,
+            }),
+        storyId,
+        signal: run.signal,
+        onDelta: sse?.onDelta,
+        onRestart: sse?.onRestart,
+      });
+      const payload = {
+        ok: true,
+        usedFallback: out.usedFallback,
+        // 重 roll 那一路本来就不回 summary（它不产生新的待总结）
+        ...(reroll ? {} : { summary: out.summary }),
+        ...offlineState(ctx.config, ctx.role, ctx.roleKey),
+      };
+      if (sse) sse.finish("done", payload);
+      else res.json(payload);
+    } catch (e) {
+      const error = String(e?.message ?? e);
+      // 按停是用户自己的操作，offline.js 那边已经记过一行了，这里不再报警
+      if (!e?.aborted) {
+        logWarn("线下模式", `「${ctx.role.name}」${reroll ? "重 roll" : "这轮"}没成：${error}`);
+      }
+      const payload = { ok: false, error, ...offlineState(ctx.config, ctx.role, ctx.roleKey) };
+      if (sse) sse.finish("error", payload);
+      else res.json(payload);
+    } finally {
+      run.done();
+    }
+  };
+}
 
-/** 重 roll：删掉末尾的助手轮次，按同一份上文再生成一次。也能按停。 */
-app.post("/api/offline/:roleKey/reroll", async (req, res) => {
-  const ctx = offlineCtx(req, res);
-  if (!ctx) return;
-  const storyId = storyIdFrom(req, ctx.roleKey);
-  if (!storyId) return res.status(400).json({ ok: false, error: "现在没有在演的剧情" });
-
-  const run = trackOfflineRun(ctx.roleKey);
-  try {
-    const out = await runOfflineTurn(ctx.config, ctx.role, resolveUser(ctx.config, ctx.role), {
-      storyId,
-      reroll: true,
-      signal: run.signal,
-    });
-    res.json({
-      ok: true,
-      usedFallback: out.usedFallback,
-      ...offlineState(ctx.config, ctx.role, ctx.roleKey),
-    });
-  } catch (e) {
-    const error = String(e?.message ?? e);
-    if (!e?.aborted) logWarn("线下模式", `「${ctx.role.name}」重 roll 没成：${error}`);
-    res.json({ ok: false, error, ...offlineState(ctx.config, ctx.role, ctx.roleKey) });
-  } finally {
-    run.done();
-  }
-});
+app.post("/api/offline/:roleKey/turn", offlineTurnRoute(false));
+app.post("/api/offline/:roleKey/reroll", offlineTurnRoute(true));
 
 /**
  * 按停正在跑的这一轮。

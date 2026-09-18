@@ -1111,7 +1111,7 @@ export function TtsSection() {
                   placeholder="eleven_multilingual_v2"
                 />
               </Field>
-              {/* 这两个是 ElevenLabs 自己的 voice_settings，原样发过去 */}
+              {/* 这三个是 ElevenLabs 自己的 voice_settings，原样发过去 */}
               <ParamSlider
                 label="Stability"
                 hint="声音稳不稳。调低更活、更像人，也更容易飘；调高更平、更稳。默认 0.5。"
@@ -1129,6 +1129,15 @@ export function TtsSection() {
                 step={0.05}
                 value={el.similarityBoost ?? 0.75}
                 onChange={(v) => updateTtsApi({ elevenlabs: { ...el, similarityBoost: v } })}
+              />
+              <ParamSlider
+                label="Style（风格夸张度）"
+                hint="情绪起伏。调高语气更夸张、更有戏，也更容易念错字和跑偏，合成还会变慢。0 = 关，这时候压根不发这个参数；eleven_v3 不认它。默认 0。"
+                min={0}
+                max={1}
+                step={0.05}
+                value={el.style ?? 0}
+                onChange={(v) => updateTtsApi({ elevenlabs: { ...el, style: v } })}
               />
             </div>
           )}
@@ -1256,6 +1265,65 @@ export function TtsSection() {
   );
 }
 
+/**
+ * 「输出方式」那张卡 —— 线下模式是边生成边看还是整段等完。
+ *
+ * 和 TTS 一样放在「连接」面板、**全局一份**：能不能流取决于你到上游那一段
+ * 管子（中转站、自建反代、公司网关），换个角色不会变。
+ *
+ * 只管**线下模式**。iMessage 那条路要等模型把整段写完才知道拆成几条气泡、
+ * 每条隔多久发，中间那半截没地方放。
+ */
+export function StreamSection() {
+  const { config, updateStream } = useConfig();
+  const mode = config.stream?.mode ?? "auto";
+
+  const modes = [
+    {
+      id: "auto",
+      label: "跟随模型",
+      hint: "按流式发。上游要是不给流（假流式的反代、不支持的中转），自动当整段收下",
+    },
+    { id: "on", label: "流式", hint: "强制流式。上游不支持会自己退回整段，不会报错" },
+    { id: "off", label: "非流式", hint: "等模型写完再整段显示，和以前一样" },
+  ];
+
+  return (
+    <Card title="输出方式" desc="线下模式要不要边生成边看。全局一份，所有角色共用">
+      <div className="grid grid-cols-1 gap-4">
+        <Field label="线下模式的输出" hint="不影响 iMessage —— 那边要等整段写完才知道拆几条气泡">
+          <div className="flex flex-col gap-2 sm:flex-row">
+            {modes.map((m) => {
+              const on = mode === m.id;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => updateStream({ mode: m.id })}
+                  className={`flex-1 border px-3 py-2 text-left transition-colors duration-150 ${
+                    on
+                      ? "border-ink bg-sunken text-ink"
+                      : "border-line text-ink-faint hover:text-ink"
+                  }`}
+                >
+                  <span className="block text-ui">{m.label}</span>
+                  <span className="mt-0.5 block text-eyebrow leading-relaxed text-ink-meta">
+                    {m.hint}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </Field>
+        <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">
+          流式只改「什么时候看到字」。存档、正则、摘选项、记忆库那些一个字都不变 ——
+          落盘存的永远是模型的原文。生成中途按「停下」在任何一档都是当场断。
+        </p>
+      </div>
+    </Card>
+  );
+}
+
 export function ProviderPanel() {
   const { config } = useConfig();
   const providers = config.providers ?? [];
@@ -1271,8 +1339,9 @@ export function ProviderPanel() {
   const provider = providers.find((p) => p.id === itemId) ?? providers[0] ?? null;
 
   /*
-   * TTS 那张卡在两条路上都要出现：它是全局配置，不挂在任何一个服务商源底下，
-   * 一个源都还没建的时候也该能填（自建的 GPT-SoVITS 根本不需要服务商源）。
+   * TTS 和输出方式这两张卡在两条路上都要出现：它们是全局配置，不挂在任何一个
+   * 服务商源底下，一个源都还没建的时候也该能填（自建的 GPT-SoVITS 根本不需要
+   * 服务商源）。
    */
   if (!provider) {
     return (
@@ -1283,6 +1352,7 @@ export function ProviderPanel() {
           </p>
         </Card>
         <TtsSection />
+        <StreamSection />
         <SaveBar hint="所有源的密钥都只写入本地 data.config.json" />
       </>
     );
@@ -1297,6 +1367,7 @@ export function ProviderPanel() {
         defaultAudio={defaultAudio}
       />
       <TtsSection />
+      <StreamSection />
       <SaveBar hint="所有源的密钥都只写入本地 data.config.json" />
     </>
   );
