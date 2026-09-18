@@ -31,12 +31,29 @@ export const COOLDOWN_MS = 10 * 60 * 1000;
 /** 自主判断模式下模型给的小时数的合法区间。 */
 const MIN_HOURS = 0.05; // 3 分钟。再短就是刷屏了
 const MAX_HOURS = 24;
-/** 模型答了个看不懂的东西时退到这个间隔。 */
-const FALLBACK_HOURS = 1;
+/**
+ * 模型答了个看不懂的东西时退到这个间隔。
+ * 导出是给 imessage.js 用的：判断模型连着打不通时，它按这个数直接排发送。
+ */
+export const FALLBACK_HOURS = 1;
 
 /** 判断请求给的余量：只要一个数字，用不着 60 秒也用不着重试到天荒地老。 */
 const JUDGE_TIMEOUT = 30_000;
-const JUDGE_MAX_TOKENS = 16;
+/*
+ * 这里曾经是 16 —— 「只要一个数字，给 16 个 token 绰绰有余」。
+ *
+ * 对**思考模型**完全不成立。gemini-3.8-flash 这类会先花掉一整段 reasoning
+ * token 再开口，16 个额度全烧在思考上，返回的 message 里压根没有 content
+ * 字段（finish_reason: "length"），于是 llm.js 抛「返回格式看不懂」——
+ * 日志里每 30 分钟刷一条，这个功能实际上从来没成功过。
+ *
+ * 512 够思考模型想完再吐一个数字；话痨模型多写几句也不要紧，parseHours
+ * 只认里面的数字。真被这个数卡住还有 askJudge 的第二次（完全不限）兜底。
+ */
+const JUDGE_MAX_TOKENS = 512;
+
+/** 中文星期。proactive.js 刻意只 import config/llm/logs/prompt，不为这一行去引 env。 */
+const WEEKDAYS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
 
 /** "HH:MM" → 当天第几分钟。解析不出来返回 null。 */
 function clockMinutes(text) {
@@ -119,6 +136,15 @@ export function notifyReadOn(role) {
   return Boolean(role?.leaveOnRead?.receipt);
 }
 
+/** 「2026-09-18 星期五 06:01」——判断模型得知道现在几点，不然算不出勿扰。 */
+function nowLine(now = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return (
+    `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ` +
+    `${WEEKDAYS[now.getDay()]} ${p(now.getHours())}:${p(now.getMinutes())}`
+  );
+}
+
 /** 把内存历史拍成给判断模型看的几行文本。 */
 function historyLines(history, vars) {
   return (history ?? [])
@@ -184,9 +210,10 @@ export function buildProactiveInput(role, user, opts = {}) {
  * @param {object|null} user 生效的用户人设
  * @param {Array<{role:string,content:string}>} history 内存里的上文
  * @param {string} scope 日志 scope
+ * @param {{silenceMs?: number}} [opts] silenceMs = 距上次说话多久（给 <Silence> 用）
  * @returns {Promise<number>} 等待毫秒数。请求失败会 throw，由调用方决定退路
  */
-export async function judgeWaitByLLM(config, role, user, history, scope) {
+export async function judgeWaitByLLM(config, role, user, history, scope, opts = {}) {
   const p = role?.proactive ?? {};
   const ref = p.auto?.model;
   const picked = ref?.provider && ref?.modelId ? resolveEndpoint(config, ref) : null;
@@ -200,48 +227,146 @@ export async function judgeWaitByLLM(config, role, user, history, scope) {
   const count = Number.isFinite(p.contextCount) ? p.contextCount : 10;
   const recent = count > 0 ? (history ?? []).slice(-count) : [];
 
-  const system = [
+  const focusOn = Boolean(p.focus?.enabled);
+  const facts = [
+    wrap("Now", nowLine()),
+    Number.isFinite(opts.silenceMs) && opts.silenceMs > 0
+      ? wrap("Silence", `你们已经 ${humanizeWait(opts.silenceMs)}没说话了。`)
+      : "",
+    wrap(
+      "Focus",
+      focusOn
+        ? `${applyVars("{{user}}", vars)}的勿扰时段：${p.focus.start}-${p.focus.end}（这段时间里不要打扰）。`
+        : "没有设勿扰时段。"
+    ),
     wrap("Character", applyVars(role?.description ?? "", vars)),
     wrap("Chat_History", historyLines(recent, vars)),
   ]
     .filter(Boolean)
     .join("\n\n");
 
+  /*
+   * 判断提示词**发两遍**：最顶上一条 system，最底下一条 user，材料夹在中间。
+   *
+   * 用户要的。理由也站得住：中间那坨人设 + 上文动辄上千字，全是「角色扮演」
+   * 语气的材料，只在开头说一次「你现在的任务是给一个数字」，模型读到末尾早就
+   * 被带跑了，回来的是一句台词而不是一个数。末尾再钉一遍，最后读到的就是任务。
+   */
   const ask = applyVars(fillFocusVars(p.auto?.prompt ?? "", p.focus), vars);
   const messages = [
-    ...(system ? [{ role: "system", content: system }] : []),
-    { role: "user", content: ask },
+    { role: "system", content: ask },
+    ...(facts ? [{ role: "system", content: facts }] : []),
+    { role: "user", content: `${ask}\n\n现在只回一个数字（小时数），别的什么都不要写。` },
   ];
 
   // chatCompletion 返回的是**裸字符串**，不是 { content }。
   // 按对象解构过一次，结果是每次都拿到 undefined、每次都退到 FALLBACK_HOURS
   // —— 表现就是日志里那句「模型没给出能用的小时数」一直刷，而模型其实答得很好
-  const content = await chatCompletion(endpoint, messages, {
-    label: endpoint.label || "时间判断",
-    timeout: JUDGE_TIMEOUT,
-    maxTokens: JUDGE_MAX_TOKENS,
-    // 温度压到 0：要的是一个数，不是创意
-    params: { temperature: 0 },
-  });
+  const askJudge = (maxTokens) =>
+    chatCompletion(endpoint, messages, {
+      label: endpoint.label || "时间判断",
+      timeout: JUDGE_TIMEOUT,
+      maxTokens,
+      // 温度压到 0：要的是一个数，不是创意
+      params: { temperature: 0 },
+    });
+
+  /*
+   * 第二次**完全不限 max_tokens**（0 = 交给上游默认，见 llm.js:379）。
+   *
+   * 专治思考模型把额度烧光：第一次要么直接抛「缺 message.content」，要么
+   * 回一段被拦腰截断的思考。两种都值得不设上限再问一次 —— 一次判断而已，
+   * 多花的那点 token 远不如这功能瘫着贵。
+   */
+  let content = "";
+  try {
+    content = await askJudge(JUDGE_MAX_TOKENS);
+  } catch (e) {
+    if (e?.aborted) throw e;
+    logWarn(scope, `时间判断没打通，不限 token 再问一次`, e);
+    content = await askJudge(0);
+  }
+  if (!String(content ?? "").trim()) {
+    logWarn(scope, "时间判断回了个空的（多半 token 全花在思考上了），不限 token 再问一次");
+    content = await askJudge(0);
+  }
 
   return parseHours(content, scope);
 }
 
+/* 带单位的时长。数字在 $1，第二项是换算成小时的系数。 */
+const TIME_UNITS = [
+  [/(\d+(?:\.\d+)?)\s*个?\s*(?:小时|小時|钟头|鐘頭)/g, 1],
+  [/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)(?![a-z])/gi, 1],
+  [/(\d+(?:\.\d+)?)\s*个?\s*(?:分钟|分鐘|分)(?!\d)/g, 1 / 60],
+  [/(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|m)(?![a-z])/gi, 1 / 60],
+];
+/** 「半小时」「半个小时」：没有数字，但太常见了。 */
+const HALF_HOUR = /半\s*个?\s*(?:小时|小時|hour)/gi;
+/**
+ * 「2-3 小时」这种区间，归一成下界（`2 小时`）。
+ *
+ * 取下界是一直以来的行为：早一点开口比晚一点好，角色显得还活着。要求后面
+ * **紧跟单位**，所以 `2026-09-18` 这种日期不会被当成区间吃掉。
+ */
+const RANGE =
+  /(\d+(?:\.\d+)?)\s*[-–—~～至到]\s*\d+(?:\.\d+)?(?=\s*个?\s*(?:小时|小時|钟头|鐘頭|分钟|分鐘|hours?|hrs?|minutes?|mins?|[hm]\b))/gi;
+
 /**
  * 从模型的回答里抠出小时数，钳进 [MIN_HOURS, MAX_HOURS] 再换成毫秒。
  *
- * 取**第一个**数字：提示词要求只回一个数，但模型爱写「2小时」「大约1.5」
- * 甚至「2-3」。这些取第一个都是对的答案。一个数字都没有（「明天早上」）
- * 才退到 FALLBACK_HOURS —— 退比不发好，也比无限等下去好。
+ * 提示词要的是一个光秃秃的数字，但实际收到的可能是任何东西：思考模型会先吐
+ * 一整段 `<think>`，话痨模型会写三行理由再给结论，中转站会包一层 markdown。
+ * 用户的要求是「不管回复有多少字都只提取数字」，所以这里按三层来：
+ *
+ *  1. 剥掉 `<think>` 和 ``` 代码块 —— 思考过程里的数字（「上次是 3 小时前」）
+ *     不是结论。剥完啥也不剩（思考被截断、没闭合）就退回原文，有总比没有强。
+ *  2. **带单位的优先**：`2小时` / `30分钟` / `1.5h` / `half` 都认，分钟换算成
+ *     小时。这一层能挡住日期和时刻里的数字（`2026-09-18`、`23:00`）。
+ *  3. 还是没有才退到裸数字。
+ *
+ * 两层都取**最后一个**落在合法区间里的：模型话痨的时候结论在末尾（「……所以我
+ * 觉得 2 小时比较合适」），取第一个会抠到理由里的数。
+ *
+ * 一个数字都找不到（「明天早上」）才退到 FALLBACK_HOURS —— 退比不发好。
  */
 export function parseHours(text, scope) {
   const raw = String(text ?? "").trim();
-  const m = /-?\d+(?:\.\d+)?/.exec(raw);
-  let hours = m ? Number(m[0]) : NaN;
+
+  const stripped = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, " ")
+    .replace(/<\/?(?:think|thinking|reasoning)>/gi, " ")
+    .replace(/```[\s\S]*?```/g, " ")
+    .trim();
+  const body = (stripped || raw).replace(RANGE, "$1");
+
+  // {at: 在原文里的位置, hours: 换算后的小时数}
+  const found = [];
+  for (const [re, factor] of TIME_UNITS) {
+    re.lastIndex = 0;
+    for (const m of body.matchAll(re)) found.push({ at: m.index, hours: Number(m[1]) * factor });
+  }
+  HALF_HOUR.lastIndex = 0;
+  for (const m of body.matchAll(HALF_HOUR)) found.push({ at: m.index, hours: 0.5 });
+
+  if (!found.length) {
+    for (const m of body.matchAll(/-?\d+(?:\.\d+)?/g)) {
+      found.push({ at: m.index, hours: Number(m[0]) });
+    }
+  }
+
+  found.sort((a, b) => a.at - b.at);
+  const usable = found.filter((f) => Number.isFinite(f.hours) && f.hours > 0);
+  const inRange = usable.filter((f) => f.hours >= MIN_HOURS && f.hours <= MAX_HOURS);
+  // 区间内的优先；全都超出范围（「48」）就拿最后一个交给下面的 clamp
+  let hours = (inRange.at(-1) ?? usable.at(-1))?.hours ?? NaN;
 
   if (!Number.isFinite(hours) || hours <= 0) {
-    logWarn(scope, `模型没给出能用的小时数，按 ${FALLBACK_HOURS} 小时算`, raw.slice(0, 200));
+    logWarn(scope, `模型没给出能用的小时数，按 ${FALLBACK_HOURS} 小时算`, raw.slice(0, 500));
     hours = FALLBACK_HOURS;
+  } else if (raw.length > 12) {
+    // 模型没听话、写了一堆：解析出来的结果和原文都记一笔，好对账
+    logDebug(scope, `从模型那段话里解析出 ${hours} 小时`, raw.slice(0, 500));
   }
 
   const clamped = Math.min(MAX_HOURS, Math.max(MIN_HOURS, hours));

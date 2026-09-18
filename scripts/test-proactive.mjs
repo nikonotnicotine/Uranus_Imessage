@@ -250,14 +250,42 @@ console.log("\n=== 9. 算时间那一半（proactive.js）===");
 
   /*
    * parseHours 返回的是**毫秒**（钳进 [0.05, 24] 小时之后再乘），不是小时数。
-   * 提示词要求模型只回一个数，但它爱写「2小时」「大约1.5」「2-3」——
-   * 这些取第一个数字都是对的答案。
+   * 提示词要求模型只回一个数，但实际收到的可能是任何东西：思考模型先吐一段
+   * `<think>`，话痨模型写三行理由再给结论，中转站包一层 markdown。
+   * 用户的要求是「不管回复有多少字都只提取数字」。
    */
   const H = 3600_000;
   check("纯数字", parseHours("2"), 2 * H);
   check("带小数", parseHours("1.5"), 1.5 * H);
   check("夹在话里", parseHours("我觉得 3 小时后比较合适"), 3 * H);
   check("写成区间时取第一个", parseHours("2-3 小时"), 2 * H);
+
+  // 带单位的优先于裸数字：这一层挡的是日期、时刻里的数字
+  check("分钟换算成小时", parseHours("30分钟"), 0.5 * H);
+  check("英文分钟", parseHours("about 45 minutes"), 0.75 * H);
+  check("英文小时缩写", parseHours("1.5h"), 1.5 * H);
+  check("半小时", parseHours("半个小时吧"), 0.5 * H);
+  check(
+    "带单位的压过时刻里的数字",
+    parseHours("现在是 23:00，她多半睡了，我 8 小时后再说"),
+    8 * H
+  );
+
+  // 话痨模型：结论在末尾，取最后一个合法的
+  check(
+    "长篇大论取末尾的结论",
+    parseHours("上次聊天是 3 小时前，她说要去睡了。综合看，我觉得等 6 小时比较好。"),
+    6 * H
+  );
+  // 思考模型：<think> 里的数字是推理过程，不是结论
+  check(
+    "剥掉 think 块",
+    parseHours("<think>可能 2 小时？不对，太急了</think>\n5"),
+    5 * H
+  );
+  check("剥掉 markdown 代码块", parseHours("```json\n{\"h\": 9}\n```\n4"), 4 * H);
+  // think 没闭合（被 max_tokens 截断）时整段都是思考，剥完啥也不剩 —— 那就用原文
+  check("think 没闭合时退回原文", parseHours("<think>我觉得 7 小时差不多"), 7 * H);
   // 一个数字都没有时**不能返回空** —— 返回空的话调用方拿 undefined 去 setTimeout，
   // 等于立刻开火。退到 1 小时比不发好，也比无限等下去好
   check("一个数字都没有：退到 1 小时", parseHours("看心情吧"), 1 * H);

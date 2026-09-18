@@ -53,6 +53,7 @@ import {
 } from "./offlinestore.js";
 import {
   COOLDOWN_MS,
+  FALLBACK_HOURS,
   buildProactiveInput,
   humanizeWait,
   judgeWaitByLLM,
@@ -862,8 +863,20 @@ function chain(runner, spaceId, task, what) {
 
 /**
  * 把一条消息放进这条会话的合并队列。
- * 队列在 queueWait 秒内没有新消息进来就整体交给 handleTurn()。
  * 导出仅为便于单独测试合并逻辑。
+ *
+ * ── 窗口以**第一条**消息为基准 ──
+ *
+ * 第一条消息开一个 queueWait 秒的窗口，窗口内后来的消息只是往里加，**不会**
+ * 把计时器推后。到点一次性全带上交给 handleTurn()。
+ *
+ * 以前是每来一条就清零重算（debounce）。那样最坏情况没有上界 —— 对方一直断断
+ * 续续地打，每条都在计时器到点前落地，这一轮就一直不结算，人已经说完三句了还
+ * 在等。现在最多等 queueWait 秒，从第一条算起。
+ *
+ * 代价是对方要是打得慢，第五句可能落在窗口外、被分到下一轮去。这是刻意换的：
+ * 「偶尔分两轮回」比「说完了还在干等」体感好，而且下一轮的上下文里前一轮就在
+ * 上面，接得上。
  *
  * @param {{text?: string, image?: object, voice?: object}} item
  *   文本、图片附件、或语音附件（三选一）
@@ -889,7 +902,6 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
    * 都标成已读（见 spectrum 的 read() 文档）。
    */
   if (item?.message) slot.message = item.message;
-  if (slot.timer) clearTimeout(slot.timer);
 
   const fire = () => {
     if (slot.timer) clearTimeout(slot.timer);
@@ -916,15 +928,28 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
 
   if (wait === 0) {
     fire();
-  } else {
-    logDebug(
-      scopeOf(runner, "桥接"),
-      `攒消息中：${slot.texts.length} 条文本 / ${slot.images.length} 张图 / ` +
-        `${(slot.voices ?? []).length} 条语音，等 ${wait}s 无新消息就发`
-    );
-    slot.timer = setTimeout(fire, wait * 1000);
-    runner.pending.set(spaceId, slot);
+    return;
   }
+
+  runner.pending.set(spaceId, slot);
+  const counts =
+    `${slot.texts.length} 条文本 / ${slot.images.length} 张图 / ` +
+    `${(slot.voices ?? []).length} 条语音`;
+
+  /*
+   * 计时器只在**开窗那一下**装，后来的消息一律不碰它 —— 这就是「以第一条为
+   * 基准」的全部实现。判据用 `slot.timer` 而不是「texts 是不是空的」：只发了
+   * 一张图、一条语音那轮一个字都没有，但窗口一样已经开着了。
+   */
+  if (slot.timer) {
+    const left = Math.max(0, Math.round((slot.firesAt - Date.now()) / 100) / 10);
+    logDebug(scopeOf(runner, "桥接"), `又攒一条：${counts}，还有 ${left}s 就发`);
+    return;
+  }
+
+  logDebug(scopeOf(runner, "桥接"), `攒消息中：${counts}，${wait}s 后把这期间的一起发`);
+  slot.firesAt = Date.now() + wait * 1000;
+  slot.timer = setTimeout(fire, wait * 1000);
 }
 
 /**
@@ -2919,9 +2944,13 @@ export function igSessionFor(getConfig) {
 /**
  * 拿（或新建）某条会话的主动消息调度槽。
  *
- *  stage    "judge" = 到点先问模型下次什么时候发；"send" = 到点直接发
- *  awaiting 上一条主动消息发出去了，还没等到对方回话
- *  read     awaiting 期间收到过已读回执（下一条会缀上「已读但没回复」）
+ *  stage      "judge" = 到点先问模型下次什么时候发；"send" = 到点直接发
+ *  awaiting   上一条主动消息发出去了，还没等到对方回话
+ *  read       awaiting 期间收到过已读回执（下一条会缀上「已读但没回复」）
+ *  lastTalkAt 最后一次真有人说话的时刻（判时给模型看「多久没说话」用）
+ *  judgeFails 「问模型隔多久开口」连着失败几次了，成功一次清零
+ *
+ * 后两个**不落盘**（saveSlot 只挑前面那几个字段）：重启后从零数起正合适。
  */
 function proactiveSlot(runner, spaceId) {
   let slot = runner.proactive.get(spaceId);
@@ -2934,6 +2963,8 @@ function proactiveSlot(runner, spaceId) {
       stage: "send",
       awaiting: false,
       read: false,
+      lastTalkAt: 0,
+      judgeFails: 0,
     };
     runner.proactive.set(spaceId, slot);
   }
@@ -2969,6 +3000,7 @@ function disarmProactive(runner, spaceId) {
  * @param {object} [opts.space] 入站消息上的 space；没有也行，到点现要
  * @param {string} [opts.peer]  对方地址，算会话 ID 用
  * @param {boolean} [opts.replied] 对方回话了：把「已读没回」那笔勾销
+ * @param {boolean} [opts.talked] 刚有人说过话（角色自己发完一条也算），刷新沉默计时
  * @param {number} [opts.delayMs] 指定等待毫秒；不给就按模式算
  * @param {"judge"|"send"} [opts.stage] 指定这次到点干什么；不给就按模式定
  */
@@ -2991,6 +3023,14 @@ function armProactive(getConfig, runner, spaceId, opts = {}) {
     slot.awaiting = false;
     slot.read = false;
   }
+  /*
+   * 「多久没说话」的起点。只有**真的有人开口**才动它：对方回了话
+   * （replied），或者角色自己刚发完一条主动消息（talked）。
+   *
+   * 勿扰 / 协助 / 线下 / 要不到 space 那几条路径也在反复调这个函数，
+   * 跟着它们一起刷新的话这个数永远接近 0，喂给判断模型就成了假情报。
+   */
+  if (opts.replied || opts.talked) slot.lastTalkAt = Date.now();
   if (slot.timer) {
     clearTimeout(slot.timer);
     slot.timer = null;
@@ -3182,9 +3222,35 @@ async function fireProactive(getConfig, runner, spaceId) {
     const history = loadHistory(runner, role, sessionId, scope);
     let wait;
     try {
-      wait = await judgeWaitByLLM(config, role, resolveUser(config, role), history, scope);
+      wait = await judgeWaitByLLM(config, role, resolveUser(config, role), history, scope, {
+        silenceMs: slot.lastTalkAt ? Date.now() - slot.lastTalkAt : 0,
+      });
+      slot.judgeFails = 0;
     } catch (e) {
-      // 判断这一次打不通不该让主动消息永久停摆：等一个「没回复」的周期再问一次
+      /*
+       * 判断打不通了。以前这里一律「等一个周期再问」——判断模型要是配坏了
+       * （模型名写错、渠道没了、返回格式不对），这就是个**无限循环**：每隔
+       * minWaitMinutes 刷一条同样的报错，主动消息一条也发不出去。用户日志里
+       * 那串每 30 分钟一条的「返回格式看不懂」就是这么来的。
+       *
+       * 所以只白问一次。第二次还不通就认了，按 FALLBACK_HOURS 直接排发送
+       * ——判不出时间总比彻底哑掉强，用户要的是角色会主动说话，不是一个
+       * 精确的时间。
+       */
+      slot.judgeFails = (slot.judgeFails ?? 0) + 1;
+      if (slot.judgeFails >= 2) {
+        logWarn(
+          scope,
+          `问模型「隔多久再开口」连着失败 ${slot.judgeFails} 次，不问了，改成 ${FALLBACK_HOURS} 小时后直接发`,
+          e
+        );
+        slot.judgeFails = 0;
+        armProactive(getConfig, runner, spaceId, {
+          delayMs: FALLBACK_HOURS * 3600_000,
+          stage: "send",
+        });
+        return;
+      }
       logWarn(scope, "问模型「隔多久再开口」失败，过一阵再问", e);
       armProactive(getConfig, runner, spaceId, { delayMs: judgeWaitMs(p), stage: "judge" });
       return;
@@ -3210,7 +3276,8 @@ async function fireProactive(getConfig, runner, spaceId) {
   const fresh = currentRole(getConfig(), runner)?.proactive ?? p;
   const stage = fresh.mode === "auto" ? "judge" : "send";
   const base = stage === "judge" ? judgeWaitMs(fresh) : randomWaitMs(fresh);
-  armProactive(getConfig, runner, spaceId, { delayMs: COOLDOWN_MS + base, stage });
+  // talked：角色自己刚开过口，沉默计时从这一刻重新算
+  armProactive(getConfig, runner, spaceId, { delayMs: COOLDOWN_MS + base, stage, talked: true });
 }
 
 /**
