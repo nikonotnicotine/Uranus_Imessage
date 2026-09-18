@@ -50,7 +50,7 @@ import { roleLabel } from "../labels.js";
 import { HTML_TAG, dropStray, splitRich } from "../offlinehtml.js";
 import { offlineMediaUrl } from "../offlinemedia.js";
 import { useSection } from "../section.jsx";
-import { api, useConfig } from "../store.jsx";
+import { api, apiStream, useConfig } from "../store.jsx";
 import { Button, Card, Field, Modal, fmtStamp, inputCls } from "../ui.jsx";
 
 import { LastPromptBody, useLastPrompt } from "./context.jsx";
@@ -76,17 +76,18 @@ const TURN_CHUNK = 20;
 const NEAR_TOP_PX = 600;
 
 /**
- * 一个渲染块最高画多少 —— 超了里面自己滚，旁边多一个「放高一点」放到 TALL_H。
+ * 渲染块的高度保险丝 —— **不是**版式上的上限。
  *
- * 状态栏 widget 动辄几千像素高，全撑开的话一条回复就能顶掉整屏，剧情反而
- * 看不见了。所以给个上限，想细看再展开。
+ * 框子报多高就画多高，正则渲染出来的东西要像页面自己的一部分那样铺开，不该
+ * 套在一个会滚的小框里：widget 自己的圆角、玻璃底、留白就是它的设计，外面
+ * 再夹一道边框和滚动条，看着就成了「网页里嵌了个网页」。以前压到 1600 的
+ * 后果是状态栏和选项这种几千像素高的块**天天在滚**，用户得先展开才看得全。
  *
- * 上限别压太低：一条回复里状态栏和剧情选项是两个独立的渲染块，各自量各自的
- * 高度 —— 状态栏展开态就有近 700px，压到 640 的话选项那块会被裁在可视区外，
- * 看起来像「正则没生效」，而实际上它渲染得好好的。
+ * 留这个数只为挡病态值：万一撞上「body 高度跟着 viewport 走」的写法，两边
+ * 能互相顶着往上长。SIZE_SCRIPT 那边有 40 次上报封顶兜着，这里再加一道，
+ * 正常内容永远碰不到。
  */
-const MAX_H = 1600;
-const TALL_H = 2400;
+const MAX_H = 20000;
 
 /**
  * 框子里那个播放键的四张脸。
@@ -358,10 +359,10 @@ function withShim(doc) {
  * 合成和凭据都在父窗口这边。
  *
  * 高度由框子自己量出来报过来（`SIZE_SCRIPT`）—— 跨源拦的是父窗口读框子，
- * 框子读自己一直是允许的。超过 `MAX_H` 才给一个「放高一点」，没超就不打扰。
+ * 框子读自己一直是允许的。报多少画多少，不裁、不加边框，让它看着就是页面的
+ * 一部分（`MAX_H` 只是挡病态值的保险丝）。
  */
 function HtmlBlock({ html, doc: docHtml, roleKey, turnId, auto, onVoiceError }) {
-  const [tall, setTall] = useState(false);
   // 框子报过来的内容高度，0 = 还没报（用下面那个初始值兜着）
   const [size, setSize] = useState(0);
   const box = useRef(null);
@@ -518,36 +519,22 @@ function HtmlBlock({ html, doc: docHtml, roleKey, turnId, auto, onVoiceError }) 
    * 报过来的高度加 2px：差一个像素的舍入就够让框子里冒出一条滚动条。
    * 还没报到就先给 240 —— 和以前那个写死的值一样，免得刚挂上时跳一下。
    */
-  const over = size > MAX_H;
-  const height = size ? Math.min(Math.max(size + 2, 48), tall ? TALL_H : MAX_H) : 240;
+  const height = size ? Math.min(Math.max(size + 2, 48), MAX_H) : 240;
 
   return (
-    <div className="grid grid-cols-1 gap-1.5">
-      <iframe
-        ref={box}
-        // 只放行脚本：状态栏里的「」得自己挂播放键。**同源访问仍然被拦着** ——
-        // 框子里碰不到外面这个页面，也就碰不到挂在它上面的密钥
-        sandbox="allow-scripts"
-        title="渲染结果"
-        srcDoc={doc}
-        className="w-full border border-line bg-paper"
-        style={{ height }}
-      />
-      {over && (
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <button
-            type="button"
-            onClick={() => setTall((t) => !t)}
-            className="text-meta text-ink-faint transition-colors duration-150 hover:text-ink"
-          >
-            {tall ? "收起这块" : "放高一点"}
-          </button>
-          <span className="text-meta text-ink-meta">
-            这块有 {size} 像素高，没放开的时候里面能滚
-          </span>
-        </div>
-      )}
-    </div>
+    // 没有边框、没有底色：widget 自带的卡片样式就是它该有的样子，外面再包一层
+    // 就成了框里套框。iframe 默认 display:inline，底下会多出一条基线缝，block 掉
+    <iframe
+      ref={box}
+      // 只放行脚本：状态栏里的「」得自己挂播放键。**同源访问仍然被拦着** ——
+      // 框子里碰不到外面这个页面，也就碰不到挂在它上面的密钥
+      sandbox="allow-scripts"
+      title="渲染结果"
+      srcDoc={doc}
+      scrolling="no"
+      className="block w-full border-0 bg-transparent"
+      style={{ height }}
+    />
   );
 }
 
@@ -1337,6 +1324,15 @@ export function OfflinePanel({ onGoto }) {
   const [busy, setBusy] = useState(false);
   // 「停下」按下去之后到那轮真收尾之间的那一小段，按键自己先灰掉
   const [stopping, setStopping] = useState(false);
+  /*
+   * 正在流进来的那半截正文（`null` = 这会儿没在流）。
+   *
+   * 只是**给眼睛看的临时字符串**，不进 `state.story.turns` —— 落盘那份由后端
+   * 那条 `done` 事件带回来的完整 state 说了算。所以下面渲染它的时候不跑
+   * `toUser` 那套正则、不切 HTML widget：半截标签渲不出东西，半条正则规则
+   * 匹配出来的更是乱的。收完一眨眼就被正式那条顶掉。
+   */
+  const [streaming, setStreaming] = useState(null);
 
   const [input, setInput] = useState("");
   const [menuKey, setMenuKey] = useState("");
@@ -1422,6 +1418,8 @@ export function OfflinePanel({ onGoto }) {
     setLoadedMore(0);
     setShowSummary(false);
     setShowPrompt(false);
+    // 上一个角色那轮要是还在流，半截正文不能跟着显示在这个角色的剧情里
+    setStreaming(null);
     if (!itemId) return undefined;
     (async () => {
       try {
@@ -1462,28 +1460,62 @@ export function OfflinePanel({ onGoto }) {
    *
    * 后端每次都回一整份 state，所以这里统一收下 —— 包括 `ok:false` 那次
    * （用户那句话已经落盘了，界面得先显示出来，才谈得上「重 roll」）。
+   *
+   * ── 会生成的那两条走 SSE ──
+   *
+   * `/turn` 和 `/reroll` 是唯一两条要等模型写字的路。全局开关不是「非流式」时
+   * 给它们加 `stream: true`，改走 `apiStream` 边收边显示。**收尾完全一样**：
+   * 后端那条 `done` 事件的负载和 JSON 那条路一个字节都不差，所以下面这几行
+   * （收 state、判 `ok:false`、`refreshRows`）两条路共用。
+   *
+   * 改一条、隐藏、删除这些不打模型，照旧走 `api()`。
    */
   const run = useCallback(
     async (path, options = {}) => {
       if (!itemId) return null;
+      const url = `/api/offline/${encodeURIComponent(itemId)}${path}`;
+      // 严格等 off 才关掉：认不出的值（老配置、手改坏的）当默认的「跟随模型」
+      const wantStream =
+        (config.stream?.mode ?? "auto") !== "off" &&
+        options.method === "POST" &&
+        (path === "/turn" || path === "/reroll");
+
       setBusy(true);
       setError("");
       setNote("");
+      if (wantStream) setStreaming("");
       try {
-        const r = await api(`/api/offline/${encodeURIComponent(itemId)}${path}`, options);
+        let r = null;
+        if (wantStream) {
+          await apiStream(url, {
+            body: { ...(options.body ?? {}), stream: true },
+            onEvent: (name, payload) => {
+              if (name === "delta") setStreaming((s) => (s ?? "") + (payload?.text ?? ""));
+              // 换副 API 了：主 API 吐的那半截作废，它会从头再说一遍
+              else if (name === "reset") setStreaming("");
+              else if (name === "done" || name === "error") r = payload;
+            },
+          });
+        } else {
+          r = await api(url, options);
+        }
         if (r?.roleKey) setState(r);
         if (r?.ok === false) setError(r.error || "这一步没成");
+        // 流走完了却一条 done/error 都没收到：多半是管子中途断了（网关超时、
+        // 断网）。这时候正式 state 没来，不能默默把那半截留在屏幕上当结果
+        if (wantStream && !r) setError("生成中断了 —— 连接断在半路。点「重 roll」再来一次");
         refreshRows();
         return r;
       } catch (e) {
         setError(String(e?.message ?? e));
         return null;
       } finally {
+        setStreaming(null);
         setBusy(false);
         setStopping(false);
       }
     },
-    [itemId, refreshRows]
+    [itemId, refreshRows, config.stream?.mode]
   );
 
   /**
@@ -1537,6 +1569,15 @@ export function OfflinePanel({ onGoto }) {
   useEffect(() => {
     if (turns.length) bottom.current?.scrollIntoView({ block: "nearest" });
   }, [turns.length]);
+
+  /*
+   * 流进来的字把那条临时气泡撑长，也要跟着往下滚 —— 不然生成到第三段就滚出
+   * 屏幕了，用户得自己拖。`block: "nearest"` 让已经往上翻去看旧轮次的时候不被
+   * 硬拽回来（那时候 bottom 不在视口里，浏览器不会动）。
+   */
+  useEffect(() => {
+    if (streaming) bottom.current?.scrollIntoView({ block: "nearest" });
+  }, [streaming]);
 
   /*
    * 往上滚到头就再补一批更早的。
@@ -1976,6 +2017,32 @@ export function OfflinePanel({ onGoto }) {
                       )}
                     </div>
                   ))}
+
+                  {/*
+                    * 正在流进来的那半截。
+                    *
+                    * 刻意**不走 `Bubble`**：那个组件要 `turn.id` 才能挂编辑/隐藏/删除
+                    * 的菜单，而这条还没落盘、没有 id，也不该能编辑。这里只借它的
+                    * 外形（头像 + 名字 + 同一个框），正文是纯文本 `whitespace-pre-wrap`
+                    * —— 半截 HTML 和半条正则渲出来的东西比不渲更难看。
+                    */}
+                  {streaming !== null && (
+                    <div className="flex items-start gap-3">
+                      <Avatar file={state.avatar} name={roleName} />
+                      <div className="min-w-0 max-w-[min(52rem,88%)] flex-1">
+                        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                          <span className="text-eyebrow uppercase text-ink-faint">{roleName}</span>
+                          <span className="text-meta text-ink-meta">正在写…</span>
+                        </div>
+                        <div className="mt-1.5 w-fit border border-line bg-sunken px-3.5 py-3">
+                          <p className="whitespace-pre-wrap text-body leading-relaxed text-ink-soft">
+                            {streaming}
+                            <span className="ml-0.5 animate-pulse text-ink-faint">▍</span>
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   <div ref={bottom} />
 
