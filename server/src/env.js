@@ -31,13 +31,19 @@
  * （默认，免费无密钥，无预警）、和风天气（国内，官方灾害预警）、
  * WeatherAPI（国外）。后两个要用户自填密钥，任何一环没配齐或请求失败
  * 都退回 Open-Meteo —— 天气是锦上添花，有总比没有好。
+ *
+ * 「有总比没有好」这条贯彻到底：同一坐标两小时内不重查（WEATHER_TTL），
+ * 三家都打不通时拿上一次查到的顶上（staleWeather，最多 24 小时），
+ * 那份缓存还落盘（重启也不丢），代理自己坏掉时脱开代理直连再试一次
+ * （fetchJson）。全落空了才是「这一轮不带天气」。
  */
 
 import chineseDaysPkg from "chinese-days";
 import Holidays from "date-holidays";
 
+import { WEATHER_CACHE_PATH, readJson, writeJson } from "./datadir.js";
 import { logDebug, logWarn } from "./logs.js";
-import { proxyFor, whyNetwork } from "./proxy.js";
+import { netCode, proxyFor, usesProxy, whyNetwork } from "./proxy.js";
 
 /**
  * chinese-days 的 ESM 默认导出套了两层：顶层既有各个函数、又有一个
@@ -90,6 +96,24 @@ const GEO_FAIL_TTL = 10 * 60 * 1000;
  * 场景，不是防灾系统，用一个 TTL 管到底比给预警单开一套缓存值当。
  */
 export const WEATHER_TTL = 2 * 60 * 60 * 1000;
+
+/**
+ * 查不到天气时，往回退多久还算能用（毫秒）。
+ *
+ * 以前查失败就 `return null`，这一轮**彻底没有天气** —— 哪怕缓存里正躺着
+ * 一小时前刚查到的那份。用户的原话：「报错了不要不带天气啊，带上次查到的
+ * 天气不就可以了吗」。确实，两小时前的天气比没有天气有用得多。
+ *
+ * 上限定在 24 小时：再往前就是拿昨天的天气冒充今天，那还不如没有 ——
+ * 模型会一本正经地跟着演「今天好热」，而外面正在下雨。
+ */
+const WEATHER_STALE_MAX = 24 * 60 * 60 * 1000;
+/**
+ * 天气查失败后多久之内不再打网络（毫秒）。和 GEO_FAIL_TTL 一个道理：
+ * 代理坏掉的时候，每轮消息都去赔一次 5 秒超时，用户那头就是每条都慢 5 秒，
+ * 而买回来的还是同一份旧数据。10 分钟够网络恢复后很快再试。
+ */
+const WEATHER_FAIL_TTL = 10 * 60 * 1000;
 
 /**
  * 时区缩写。
@@ -220,14 +244,101 @@ const geoCache = new Map();
  */
 const geoFailCache = new Map();
 /**
- * 缓存键 → {at, data}。两小时过期。
+ * 缓存键 → {at, data}。两小时过期（WEATHER_TTL）。
  *
  * 键里带**数据源和预警开关**（见 weatherAt）—— 只按坐标缓存的话，用户刚
  * 把预警打开，两小时内还是拿的没有预警的那份旧数据，看着像开关没生效。
+ *
+ * 过期之后**不立刻扔**：查不到新的时候还要拿它顶上（staleWeather），
+ * 一直留到 WEATHER_STALE_MAX。启动时从盘上读回来，见 loadWeatherCache。
  */
-const weatherCache = new Map();
+const weatherCache = new Map(loadWeatherCache());
+/**
+ * 坐标 → 上次天气查失败的时刻。见 WEATHER_FAIL_TTL。
+ *
+ * 和 geoFailCache 同一个路子，也和 weatherCache 分开：那边是「查到了什么」，
+ * 这边是「刚才没查成，十分钟内别再赔一次超时了」。按**坐标**而不是完整缓存键
+ * 记 —— 代理坏掉的时候三个数据源一个都打不通，没必要一家一家再试一遍。
+ */
+const weatherFailCache = new Map();
 /** date-holidays 的实例按国家码复用 —— 每次 new 都要载一遍该国规则。 */
 const holidaysCache = new Map();
+
+/**
+ * 天气缓存落盘的节流（毫秒）。
+ *
+ * 查一次天气管两小时，本来就写不了几次；攒一下是为了「两个城市几乎同时查完」
+ * 那种，别为了差几毫秒的两次更新写两遍盘。
+ */
+const WEATHER_SAVE_DELAY = 5000;
+let weatherSaveTimer = null;
+
+/** 启动时把盘上那份读回来。坏了、过期了的都丢掉，返回给 Map 构造函数的数组。 */
+function loadWeatherCache() {
+  const raw = readJson(WEATHER_CACHE_PATH, null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const now = Date.now();
+  const out = [];
+  for (const [key, v] of Object.entries(raw)) {
+    const at = Number(v?.at);
+    if (!Number.isFinite(at) || at > now || now - at >= WEATHER_STALE_MAX) continue;
+    if (!v?.data || typeof v.data !== "object") continue;
+    out.push([key, { at, data: v.data }]);
+  }
+  return out;
+}
+
+/**
+ * 把内存里这份天气缓存写到盘上（节流）。
+ *
+ * 写盘的理由只有一个：查不到的时候拿上一次查到的顶上。纯内存的话，代理坏着的
+ * 时候重启一次进程，连「上一次」都没有了 —— 而代理坏掉和重启进程恰恰经常
+ * 同时发生（用户看见报错，第一反应就是重启）。
+ *
+ * 写不进去只 warn：这份缓存丢了最多让下一轮多打一次网络。
+ */
+function saveWeatherCacheSoon() {
+  if (weatherSaveTimer) return;
+  weatherSaveTimer = setTimeout(() => {
+    weatherSaveTimer = null;
+    const now = Date.now();
+    const out = {};
+    for (const [key, v] of weatherCache) {
+      if (now - v.at < WEATHER_STALE_MAX) out[key] = v;
+    }
+    try {
+      writeJson(WEATHER_CACHE_PATH, out);
+    } catch (e) {
+      logWarn("环境", "天气缓存写不进硬盘（不影响这一轮，只是重启后要重查）", e);
+    }
+  }, WEATHER_SAVE_DELAY);
+  // 不能让这个定时器把进程钉住：它只是个锦上添花的写盘
+  weatherSaveTimer.unref?.();
+}
+
+/** 「23 分钟」「3.5 小时」。只给日志看。 */
+function ageText(at) {
+  const mins = Math.max(0, Math.round((Date.now() - at) / 60_000));
+  return mins < 60 ? `${mins} 分钟` : `${(mins / 60).toFixed(1)} 小时`;
+}
+
+/**
+ * 这个坐标上还能用的**最新一份**旧数据。没有就是 null。
+ *
+ * 不挑数据源：和风查不通的时候，上一次退回 Open-Meteo 存下的那份照样能用 ——
+ * 少一条灾害预警，总比这一轮压根没有天气强。超过 WEATHER_STALE_MAX 的不要，
+ * 拿昨天的天气冒充今天还不如没有。
+ */
+function staleWeather(at) {
+  const suffix = `:${at}`;
+  let best = null;
+  for (const [key, v] of weatherCache) {
+    if (!key.endsWith(suffix)) continue;
+    if (Date.now() - v.at >= WEATHER_STALE_MAX) continue;
+    if (!best || v.at > best.at) best = v;
+  }
+  return best;
+}
 
 /**
  * 把这几张表全清掉。控制台的「清理缓存」按钮用。
@@ -237,19 +348,33 @@ const holidaysCache = new Map();
  * 会重新查一遍，只是慢那么一两秒 —— 这几张表里没有任何**数据**，
  * 全都是能重新查出来的东西，所以清它是安全的。
  *
- * @returns {{geo: number, geoFail: number, weather: number, holidays: number}} 各清了几条
+ * @returns {{geo:number, geoFail:number, weather:number, weatherFail:number, holidays:number}} 各清了几条
  */
 export function clearEnvCache() {
   const counts = {
     geo: geoCache.size,
     geoFail: geoFailCache.size,
     weather: weatherCache.size,
+    weatherFail: weatherFailCache.size,
     holidays: holidaysCache.size,
   };
   geoCache.clear();
   geoFailCache.clear();
   weatherCache.clear();
+  weatherFailCache.clear();
   holidaysCache.clear();
+
+  // 盘上那份也一起清 —— 只清内存的话重启一次刚清掉的天气又回来了，
+  // 而「清理缓存」这个按钮要的就是「忘掉查过的东西，重查一遍」
+  if (weatherSaveTimer) {
+    clearTimeout(weatherSaveTimer);
+    weatherSaveTimer = null;
+  }
+  try {
+    writeJson(WEATHER_CACHE_PATH, {});
+  } catch (e) {
+    logWarn("环境", "天气缓存文件清不掉（内存里那份已经清了）", e);
+  }
   return counts;
 }
 
@@ -396,19 +521,54 @@ function dayTag(country, date, year, at, dow) {
  * 「请求超时」和「代理拒绝连接」要改的地方完全不同。
  */
 async function fetchJson(url, timeout, headers) {
+  // 每次都要新的 AbortSignal，所以是个函数而不是一个对象
+  const init = () => ({
+    signal: AbortSignal.timeout(timeout),
+    ...(headers ? { headers } : {}),
+  });
+
   let res;
   try {
-    res = await fetch(url, {
-      signal: AbortSignal.timeout(timeout),
-      ...(headers ? { headers } : {}),
-      ...(await proxyFor("weather")),
-    });
+    res = await fetch(url, { ...init(), ...(await proxyFor("weather")) });
   } catch (e) {
-    throw new Error(whyNetwork(e, "weather", timeout));
+    /*
+     * 代理自己坏了的时候，脱开代理直连再试一次。
+     *
+     * 用户报的那条 `连接被重置 —— 代理 http://127.0.0.1:7892 不稳定？` 就是这种：
+     * 代理进程还开着、端口也通，但隧道中途被掐。这时候直连**有戏** ——
+     * 和风天气本来就该直连，Open-Meteo 在国内也时好时坏。多赔一次请求换一份
+     * 真数据，比直接退回一小时前那份划算。
+     *
+     * 只认这几种「代理层面」的错。超时**不**在其中：已经白等了 5 秒，再等一轮
+     * 只会让这条消息更慢，而 weatherAt 那边本来就有旧数据兜着。
+     */
+    const code = netCode(e);
+    if (!usesProxy("weather") || !PROXY_FAULT_CODES.has(code)) {
+      throw new Error(whyNetwork(e, "weather", timeout));
+    }
+    logDebug("环境", `走代理查天气失败（${code}），脱开代理直连再试一次`);
+    try {
+      // 这一发**刻意不走代理**：代理就是刚才坏掉的那个东西
+      res = await fetch(url, init());
+    } catch (e2) {
+      // 直连也不行。报的还是**走代理**那次的原因 —— 那才是用户真正要去改的东西
+      throw new Error(`${whyNetwork(e, "weather", timeout)}（直连也不行：${netCode(e2) || e2?.message}）`);
+    }
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
+
+/** 「代理自己坏了」的典型错误码。见 fetchJson —— 这几种脱开代理还有戏。 */
+const PROXY_FAULT_CODES = new Set([
+  "ECONNRESET", // 隧道被中途掐断。用户报的就是这个
+  "ECONNREFUSED", // 代理端口没开
+  "ENOTFOUND", // 代理的域名解析不了
+  "EAI_AGAIN",
+  "EPIPE",
+  "CERT_HAS_EXPIRED", // 代理在中间做 TLS 拦截，拿自签证书顶包
+  "UND_ERR_SOCKET",
+]);
 
 /**
  * 内置坐标表：常见城市不打网络也能解析。
@@ -845,10 +1005,20 @@ function pickSource(geo, weather, keys) {
 }
 
 /**
- * 当前天气 + 明日预报 + 灾害预警。失败返回 null。
+ * 当前天气 + 明日预报 + 灾害预警。彻底没辙时才返回 null。
  *
- * 选定的源请求失败会**再试一次 Open-Meteo** —— 密钥过期、额度用光、官方
- * 改了字段名，这些都不该让这一轮彻底没有天气。两边都失败才返回 null。
+ * 三层退路，一层比一层旧：
+ *
+ *  1. 选定的源。失败就**再试一次 Open-Meteo** —— 密钥过期、额度用光、官方改了
+ *     字段名，这些都不该让这一轮彻底没有天气。
+ *  2. 两边都不通时，拿**上次查到的**顶上（staleWeather，最多 24 小时前）。
+ *     用户的原话：「报错了不要不带天气啊，带上次查到的天气不就可以了吗」。
+ *     确实 —— 天气本来就两小时才刷一次，网断的那阵子用一小时前那份，
+ *     比让角色突然不知道外面什么天气强得多。
+ *  3. 连旧的都没有，才是 null。
+ *
+ * 退回来的旧数据在提示词里**不做任何标注**：那一行会被用户的正则状态栏原样
+ * 渲出来，多一句「（旧）」就是脸上多一块补丁。只在控制台说清用的是多久前那份。
  *
  * @returns {Promise<WeatherData|null>}
  */
@@ -859,34 +1029,67 @@ async function weatherAt(geo, weather, keys) {
   const hit = weatherCache.get(key);
   if (hit && Date.now() - hit.at < WEATHER_TTL) return hit.data;
 
+  /*
+   * 刚失败过：这十分钟里连试都不试，直接吃旧的。
+   *
+   * 代理坏掉的时候每一轮都去打一遍，等于每条消息都赔一次 5 秒超时（两个城市
+   * 是 Promise.all，所以是并排赔），而买回来的还是同一份旧数据。
+   */
+  const failedAt = weatherFailCache.get(at);
+  if (failedAt && Date.now() - failedAt < WEATHER_FAIL_TTL) {
+    const stale = staleWeather(at);
+    if (stale) {
+      logDebug(
+        "环境",
+        `${geo.name} 的天气刚查失败过，${Math.round(WEATHER_FAIL_TTL / 60000)} 分钟内先用 ${ageText(stale.at)}前那份`
+      );
+      return stale.data;
+    }
+    return null;
+  }
+
   const run = () => {
     if (source === "qweather") return fetchQWeather(geo, opts);
     if (source === "weatherapi") return fetchWeatherApi(geo, opts);
     return fetchOpenMeteo(geo);
   };
 
+  /** 查到了：记下来、解掉失败冷却、顺手排一次写盘。 */
+  const keep = (cacheKey, data) => {
+    weatherCache.set(cacheKey, { at: Date.now(), data });
+    weatherFailCache.delete(at);
+    saveWeatherCacheSoon();
+    return data;
+  };
+
+  /** 全都不通：进冷却，能退回旧数据就退，退不了才是 null。 */
+  const giveUp = (e, what) => {
+    weatherFailCache.set(at, Date.now());
+    const stale = staleWeather(at);
+    if (stale) {
+      logWarn("环境", `${what}，用的是 ${ageText(stale.at)}前查到的那份`, e);
+      return stale.data;
+    }
+    logWarn("环境", `${what}，这一轮不带天气`, e);
+    return null;
+  };
+
   let data = null;
   try {
     data = await run();
   } catch (e) {
-    if (source === "openmeteo") {
-      logWarn("环境", `查 ${geo.name} 的天气失败，这一轮不带天气`, e);
-      return null;
-    }
+    if (source === "openmeteo") return giveUp(e, `查 ${geo.name} 的天气失败`);
     logWarn("环境", `${source} 查 ${geo.name} 失败，退回 Open-Meteo`, e);
     try {
       data = await fetchOpenMeteo(geo);
     } catch (e2) {
-      logWarn("环境", `Open-Meteo 也没查到 ${geo.name}，这一轮不带天气`, e2);
-      return null;
+      return giveUp(e2, `Open-Meteo 也没查到 ${geo.name}`);
     }
     // 存在退回后的键上：下一轮别再白等一次超时的官方 API
-    weatherCache.set(`openmeteo:0:${at}`, { at: Date.now(), data });
-    return data;
+    return keep(`openmeteo:0:${at}`, data);
   }
 
-  weatherCache.set(key, { at: Date.now(), data });
-  return data;
+  return keep(key, data);
 }
 
 /* ================= 对外 ================= */

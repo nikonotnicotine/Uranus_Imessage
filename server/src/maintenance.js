@@ -70,7 +70,7 @@ export function clearCaches(why = "控制台") {
   }
 
   const parts = [
-    `环境 ${env.geo + env.geoFail + env.weather + env.holidays} 条`,
+    `环境 ${env.geo + env.geoFail + env.weather + env.weatherFail + env.holidays} 条`,
     "正则编译结果",
     "配置",
     `${history} 条会话的内存上下文`,
