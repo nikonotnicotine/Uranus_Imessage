@@ -109,6 +109,12 @@ uranus-regexrules-*.json
 .vscode/settings.local.json
 *.code-workspace
 
+# ---------- 一次性的预设补丁 ----------
+# 改某一份具体预设的脚本。预设本身在 data/ 里（已经挡掉了），补它的脚本
+# 也没必要进仓库：里面写死了那份预设的规则名，对别人一点用没有。
+scripts/patch-*-regex.mjs
+scripts/merge-*-preset.mjs
+
 # ---------- 操作系统垃圾 ----------
 .DS_Store
 Thumbs.db

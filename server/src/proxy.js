@@ -370,6 +370,47 @@ export async function proxyFor(scope) {
 }
 
 /**
+ * 把一个网络异常里埋着的错误码全挖出来，最像「真正原因」的那个排在最前。
+ *
+ * 真实原因有时埋得比 `e.cause` 更深。Happy Eyeballs（Node 20 起默认开）在
+ * IPv6 和 IPv4 都连不上时会抛一个 `AggregateError`，`code` 挂在外层、
+ * **里面每一条才带具体原因**；代理隧道里出的 TLS/HTTP 错也会再包一层。
+ * 只读 `e.cause.code` 的话这些全都读不到，于是掉进 whyNetwork 最后那个兜底、
+ * 把 undici 的 `fetch failed` 原样吐出去。
+ *
+ * `UND_ERR_CONNECT_TIMEOUT` 排在后面：它是 undici 对「连不上」的统称，
+ * 底下那条具体的（ECONNREFUSED 之类）才是要说给人听的。
+ *
+ * @returns {string[]} 从最具体到最笼统。一个都没有时是空数组
+ */
+export function netCodes(e) {
+  const codes = [];
+  const seen = new Set();
+  const walk = (err, depth = 0) => {
+    if (!err || depth > 4 || seen.has(err)) return;
+    seen.add(err);
+    const c = String(err?.code ?? "").trim();
+    if (c) codes.push(c);
+    for (const sub of err?.errors ?? []) walk(sub, depth + 1);
+    walk(err?.cause, depth + 1);
+  };
+  walk(e?.cause);
+  walk(e);
+  const first = codes.find((c) => c !== "UND_ERR_CONNECT_TIMEOUT");
+  return first ? [first, ...codes.filter((c) => c !== first)] : codes;
+}
+
+/**
+ * 最像「真正原因」的那个错误码，没有就是空串。
+ *
+ * 调用方拿它做**判断**（env.js 靠它认「这是代理自己坏了，值得脱开代理再试
+ * 一次」）；要说给人听的话用下面的 whyNetwork。
+ */
+export function netCode(e) {
+  return netCodes(e)[0] ?? "";
+}
+
+/**
  * 网络层出错时说人话，带上「是不是代理的问题」。
  *
  * `fetch failed` 是 undici 对一切网络问题的统称，原样抛给用户等于什么都没说。
@@ -386,28 +427,8 @@ export function whyNetwork(e, scope, timeoutMs) {
   const viaProxy = usesProxy(scope);
   const via = viaProxy ? `代理 ${maskProxy(proxySettings().url)}` : "";
 
-  /**
-   * 真实原因有时埋得比 `e.cause` 更深。
-   *
-   * Happy Eyeballs（Node 20 起默认开）在 IPv6 和 IPv4 都连不上时会抛一个
-   * `AggregateError`，`code` 挂在外层、**里面每一条才带具体原因**；代理隧道
-   * 里出的 TLS/HTTP 错也会再包一层。只读 `e.cause.code` 的话这些全都读不到，
-   * 于是掉进最后那个兜底、把 undici 的 `fetch failed` 原样吐出去。
-   */
-  const codes = [];
-  const seen = new Set();
-  const walk = (err, depth = 0) => {
-    if (!err || depth > 4 || seen.has(err)) return;
-    seen.add(err);
-    const c = String(err?.code ?? "").trim();
-    if (c) codes.push(c);
-    for (const sub of err?.errors ?? []) walk(sub, depth + 1);
-    walk(err?.cause, depth + 1);
-  };
-  walk(e?.cause);
-  walk(e);
-
-  const code = codes.find((c) => c !== "UND_ERR_CONNECT_TIMEOUT") ?? codes[0] ?? "";
+  const codes = netCodes(e);
+  const code = codes[0] ?? "";
 
   if (name === "TimeoutError" || code === "UND_ERR_HEADERS_TIMEOUT" || /timeout/i.test(msg)) {
     const secs = timeoutMs ? `（${Math.round(timeoutMs / 1000)} 秒）` : "";

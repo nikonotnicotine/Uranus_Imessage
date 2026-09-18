@@ -327,11 +327,46 @@ export function WorldEntryRow({ book, entry, index, total, open, onToggleOpen, o
   );
 }
 
+/**
+ * 关键词那两个输入框。
+ *
+ * ── 为什么要在这儿存一份草稿 ──
+ *
+ * 存进配置的是**数组**，输入框里是**一行字**，中间隔着一次 split/join。
+ * 以前这个框是「受控 + 每敲一下就转换」：`value` 直接 `keys.join(",")`，
+ * onChange 立刻 split 回数组。于是敲下分隔符的那一刻，它切出来的末尾是个
+ * 空串、被 `filter(Boolean)` 扔掉，再 join 回来那个逗号就**从框里消失了**
+ * —— 表现就是「只能输一个关键词，逗号根本打不进去」。
+ *
+ * 所以正在编辑时以本地这份原文为准，数组只管往外存。失焦（或按回车）时用
+ * 规范化后的结果把框里的字顶掉一次 —— 这样多余的空格、重复的词、连着打的
+ * 两个逗号会在**敲完之后**收拾干净，而不是在打字中途跳着改。
+ */
+function KeysInput({ value, onChange, placeholder }) {
+  const [draft, setDraft] = useState(null); // null = 没在编辑，显示外面那份
+  return (
+    <input
+      className={inputCls}
+      value={draft ?? value}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        onChange(e.target.value);
+      }}
+      onBlur={() => setDraft(null)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") setDraft(null);
+      }}
+      placeholder={placeholder}
+    />
+  );
+}
+
 export function WorldEntryEditor({ book, entry }) {
   const { updateWorldEntry, setWorldEntryKeys } = useConfig();
   const patch = (p) => updateWorldEntry(book.id, entry.id, p);
-  const keysText = (entry.keys ?? []).join("、");
-  const secondText = (entry.secondaryKeys ?? []).join("、");
+  // 回显用英文逗号 + 空格：存进去的分隔符就是它，看到的和该打的是同一个符号
+  const keysText = (entry.keys ?? []).join(", ");
+  const secondText = (entry.secondaryKeys ?? []).join(", ");
   // 纯 ASCII 的关键词才谈得上「整词匹配」，中文没有词边界
   const asciiOnly =
     (entry.keys ?? []).length > 0 && (entry.keys ?? []).every((k) => /^[\x20-\x7e]+$/.test(k));
@@ -363,24 +398,20 @@ export function WorldEntryEditor({ book, entry }) {
 
       {!entry.constant && (
         <>
-          <Field label="关键词" hint="顿号、逗号或换行分隔，命中任一个就触发">
-            <input
-              className={inputCls}
+          <Field label="关键词" hint="用英文逗号分隔，命中任一个就触发">
+            <KeysInput
               value={keysText}
-              onChange={(e) => setWorldEntryKeys(book.id, entry.id, "keys", e.target.value)}
-              placeholder="王都、阿瓦隆"
+              onChange={(v) => setWorldEntryKeys(book.id, entry.id, "keys", v)}
+              placeholder="王都, 阿瓦隆"
             />
           </Field>
           <Field
             label="次要关键词"
             hint="填了就要求「主关键词命中 且 这里也命中一个」，留空表示不加这个条件"
           >
-            <input
-              className={inputCls}
+            <KeysInput
               value={secondText}
-              onChange={(e) =>
-                setWorldEntryKeys(book.id, entry.id, "secondaryKeys", e.target.value)
-              }
+              onChange={(v) => setWorldEntryKeys(book.id, entry.id, "secondaryKeys", v)}
               placeholder="（留空）"
             />
           </Field>

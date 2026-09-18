@@ -1151,6 +1151,15 @@ async function ttsElevenLabs(cfg, text, voiceId) {
       voice_settings: {
         stability: Number(cfg?.stability ?? 0.5),
         similarity_boost: Number(cfg?.similarityBoost ?? 0.75),
+        /*
+         * 风格夸张度**只在大于 0 时才发**。
+         *
+         * 这一项是 v2 系模型的（multilingual_v2 / turbo_v2_5）；eleven_v3 的
+         * voice_settings 认的是另一套，多塞一个它不认的字段有被整个请求打回的
+         * 风险。默认 0 时干脆不发，请求体和加这个功能之前一模一样 —— 不碰
+         * 已经调好的配置。官方也提醒 style > 0 会让合成变慢、更容易念飘。
+         */
+        ...(Number(cfg?.style ?? 0) > 0 ? { style: Number(cfg.style) } : {}),
       },
     }),
     ...(await proxyFor("tts")),

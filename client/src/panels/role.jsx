@@ -2705,7 +2705,7 @@ function RoleProactiveFields({ role }) {
 
               <Field
                 label="时间判断用哪个模型"
-                hint="不选 = 用上面「模型 → 聊天 API」那条。判断只要一个数字，max_tokens 压到 16，一次的钱可以忽略"
+                hint="不选 = 用上面「模型 → 聊天 API」那条。判断只带人设和几条上文，一次的钱可以忽略"
               >
                 <ModelSelect
                   category="chat"
@@ -2716,7 +2716,7 @@ function RoleProactiveFields({ role }) {
 
               <PromptField
                 label="时间判断提示词"
-                hint="要模型只回一个数字（单位：小时，可以是小数）。回话里带别的字也没关系，会取第一个数字；一个数字都没有就按 1 小时算"
+                hint="要模型只回一个数字（单位：小时，可以是小数）。写成一长段也没关系，会剥掉思考过程再从里面抠数字，「30分钟」这种带单位的也认；一个数字都找不到才按 1 小时算"
                 value={auto.prompt}
                 onChange={(v) => patchIn("auto", { prompt: v })}
                 placeholder="留空 = 用内置的那段"

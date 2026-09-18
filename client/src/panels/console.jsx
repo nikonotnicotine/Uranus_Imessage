@@ -80,19 +80,26 @@ export function LogRow({ entry }) {
         entry.level === "error" || entry.level === "critical" ? "bg-warnsoft" : ""
       }`}
     >
-      <div className="flex items-start gap-2">
+      {/*
+       * flex-wrap + 正文 basis-full：scope 可以长到离谱（llm.js 会把整个渠道名
+       * 拼进去，「主 API（55 · 逆[gcli企1-次-0.03￥]gemini-3.1-pro-preview）」），
+       * 不换行的话它把同一行里 flex-1 的正文挤到 0 宽，break-words 就把正文
+       * 拆成一字一行往下掉。窄屏让正文整行独占，sm 以上才收回三列。
+       */}
+      <div className="flex flex-wrap items-start gap-x-2">
         <span className="mt-[3px] shrink-0 font-mono text-meta tabular-nums text-ink-meta">
           {fmtTime(entry.ts)}
         </span>
         <span
-          className={`mt-[2px] shrink-0 text-eyebrow uppercase ${meta.cls}`}
+          className={`mt-[2px] min-w-0 max-w-full truncate text-eyebrow uppercase ${meta.cls}`}
+          title={entry.scope}
         >
           {entry.scope}
         </span>
         <button
           type="button"
           onClick={() => hasDetail && setOpen((o) => !o)}
-          className={`min-w-0 flex-1 text-left text-meta leading-relaxed ${
+          className={`min-w-0 basis-full text-left text-meta leading-relaxed sm:flex-1 sm:basis-0 ${
             LEVEL_ORDER.indexOf(entry.level) >= LEVEL_ORDER.indexOf("warn")
               ? "text-warn"
               : "text-ink-soft"

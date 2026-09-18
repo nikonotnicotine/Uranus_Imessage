@@ -1143,7 +1143,7 @@ function StepPace() {
           max={60}
           step={1}
           onChange={(v) => updateChat({ queueWait: v })}
-          hint="你还在打字的时候它先不回，等这么久没新消息才开始想"
+          hint="从你第一句起算，这段时间里连发的几句拼成一轮一起回。最多等这么久"
           suffix="秒"
         />
 

@@ -31,7 +31,7 @@ export function ChatPanel() {
             max={60}
             step={1}
             onChange={(v) => updateChat({ queueWait: v })}
-            hint="合并用户连发消息"
+            hint="从对方第一条消息起算，这段时间里连发的拼成一轮一起回。最多等这么久"
             suffix="秒"
           />
         </div>

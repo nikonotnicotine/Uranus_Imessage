@@ -319,7 +319,7 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
   const expect = [
     ["server/src/ignet.js", 1], // igFetch，Meta 的 Graph API 全走它
     ["server/src/env.js", 1], // fetchJson，天气和地名查询的唯一出网口
-    ["server/src/llm.js", 1], // requestJson
+    ["server/src/llm.js", 2], // requestJson（整段拿）+ requestStream（边收边喂）
     ["server/src/update.js", 1], // 查 GitHub 的 latest release
     ["server/src/photon.js", 2], // 查已登记的用户 + 登记
     ["server/src/websearch.js", 3], // DuckDuckGo / Tavily / Brave

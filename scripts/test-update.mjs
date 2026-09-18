@@ -69,11 +69,19 @@ function stub(answer) {
   return seen;
 }
 
+/*
+ * 造一份「远端有新版」的 release。
+ *
+ * 大版本号刻意写成 `9xx.0.0` 而不是某个具体数字 —— 以前这儿钉着 `v0.9.0`，
+ * 本地版本涨到 1.0.8 之后它就变成「远端比本地旧」，「认出有新版」那条无声
+ * 地开始失败。这个数永远比 package.json 里那个大。
+ */
+const NEWER = "900.0.0";
 const RELEASE = {
-  tag_name: "v0.9.0",
-  name: "0.9.0 —— 测试用",
+  tag_name: `v${NEWER}`,
+  name: `${NEWER} —— 测试用`,
   body: "修了几个东西。",
-  html_url: "https://github.com/nikonotnicotine/Uranus_Imessage/releases/tag/v0.9.0",
+  html_url: `https://github.com/nikonotnicotine/Uranus_Imessage/releases/tag/v${NEWER}`,
   published_at: "2026-09-15T00:00:00Z",
 };
 
@@ -104,9 +112,9 @@ console.log("\n=== 3. 有新版 ===");
   const seen = stub(reply(200, RELEASE));
   const r = await U.checkUpdate({ force: true });
   check("ok", r.ok, true);
-  // 本地是 0.1.x，远端造的是 0.9.0
+  // 远端造的那个永远比本地大（见 NEWER 那儿的注释）
   check("认出有新版", r.hasUpdate, true);
-  check("远端版本号原样带上（界面上要显示）", r.latest, "v0.9.0");
+  check("远端版本号原样带上（界面上要显示）", r.latest, RELEASE.tag_name);
   check("更新说明带上", r.notes, "修了几个东西。");
   check("链接指向那个 release", r.url, RELEASE.html_url);
   checkThat("带上了当前版本，界面能写「你现在是 vX」", Boolean(r.current));
