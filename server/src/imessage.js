@@ -3175,8 +3175,25 @@ async function commitIgTurn(getConfig, runner, role, outcome) {
       ]
         .filter((s) => String(s ?? "").trim())
         .join("\n");
-      // 评论也没有、短信也发不了 —— 这一轮什么都没发生，别往上下文里塞空壳
+      /*
+       * 两侧都得有字才写。
+       *
+       * assistant 空 = 评论也没有、短信也发不了，这一轮什么都没发生，
+       * 别往上下文里塞空壳。
+       *
+       * mark 空 = 「对方那边发生了什么」这句旁白没拼出来。存档里留一条空的
+       * user 消息，下一轮拼提示词时就是个空 turn，有的上游直接回 400。
+       * 走到这儿说明 markFor 漏了一种 kind，所以记一条 warn 而不是静默跳过。
+       */
       if (!assistant) return;
+      if (!String(outcome.mark ?? "").trim()) {
+        logWarn(
+          scope,
+          `${outcome.roleName} 这一轮（${outcome.kind || "未知类型"}）没有上文旁白，跳过不记`,
+          assistant
+        );
+        return;
+      }
 
       loadHistory(runner, fresh, sessionId, scope);
       const hist = runner.history.get(sessionId) ?? [];

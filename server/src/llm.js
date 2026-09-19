@@ -427,6 +427,26 @@ const REFUSAL_HEAD_CHARS = 120;
 export function looksLikeRefusal(text) {
   const s = String(text ?? "").trim();
   if (!s || s.length > REFUSAL_MAX_CHARS) return false;
+
+  /*
+   * 中转站把审核提示语**塞进 200 的正文里**这一种，单独认。
+   *
+   * 用户丢备忘录就是这么丢的：上游没回 400，而是回了 HTTP 200，正文是
+   *   `The prompt could not be submitted. The prompt contains sensitive words
+   *    that violate Google's Generative AI Prohibited Use policy. Try
+   *    rephrasing the prompt. If you think this was an error, send feedback.`
+   * 这句话既不是道歉（REFUSAL_PATTERNS 一条都不沾 —— 它没说「抱歉」、没说
+   * 「我无法」，主语压根不是模型），也不走 isContentBlocked（那个只在非 2xx
+   * 时被问到）。于是两道闸同时漏，它被当成一份合格的备忘录**整份覆盖**写了
+   * 进去。第二次总结时 writeMemo 又把这份坏的复制进 `.bak`，原来那份就彻底
+   * 没了 —— 用户的原话：「我回去找备份，也是一样的。我原来的备忘录直接不见了」。
+   *
+   * 所以这里复用 BLOCK_PATTERNS（`sensitive words` / `prohibited use` 那几条）
+   * 直接判正文。不管措辞是道歉还是平台提示，结论都一样：这不是总结，
+   * 换个说法重问，用尽还不行就当失败。
+   */
+  if (BLOCK_PATTERNS.some((re) => re.test(s))) return true;
+
   const head = s.slice(0, REFUSAL_HEAD_CHARS);
   return REFUSAL_PATTERNS.some((re) => re.test(head));
 }
@@ -857,7 +877,10 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
    * 和上面 attempt 那套是两本账：那是「同一份请求碰运气再打一次」，这是「请求体
    * 本身过不去，得换个说法」，互不占额度。
    */
-  let refusalLeft = Math.max(0, Math.floor(Number(opts.retryOnRefusal) || 0));
+  // 调用方给的额度。refusalLeft 会被减到 0，所以「这条链接不接受拒答吗」
+  // 得另存一份 —— 最后那道闸要靠它判（见函数末尾 refusalAllowed 那段）
+  const refusalAllowed = Math.max(0, Math.floor(Number(opts.retryOnRefusal) || 0));
+  let refusalLeft = refusalAllowed;
   let refusalTries = 0;
   let nudged = false;
 
@@ -1018,17 +1041,30 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
   }
 
   /*
-   * 试到最后一次还是一句道歉：**当失败抛出去**，不把它当成合格的结果返回。
+   * 试到最后一次还是拒答 / 审核提示语：**当失败抛出去**，不把它当成合格的结果。
    *
-   * 这是这一整段的要点所在。以前这句道歉会被调用方当成正常总结 —— 而备忘录是
+   * 这是这一整段的要点所在。以前这种回复会被调用方当成正常总结 —— 而备忘录是
    * 整份覆盖的，一句「很抱歉，我无法协助」就能把用户攒了几个月的备忘录冲干净。
    * 抛出去之后走的是既有的失败路径：pending 不清、备忘录不动（用户的原话是
    * 「还是不行就默认成功不成功」）。
+   *
+   * 条件是 `retryOnRefusal > 0` 而不是 `refusalTries > 0`。差别在**第一次**：
+   * 以前要「已经换过说法」才判，可 refusalTries 是在上面那个循环里加的，
+   * 而循环 `continue` 的前提正是判出了拒答 —— 所以走到这儿只剩两种情况：
+   * 试满了（refusalTries > 0），或者**压根没判出来**。后者就是用户遇到的那次：
+   * 上游回 200、正文是 Google 那句 `sensitive words...`，looksLikeRefusal
+   * 当时不认它，refusalTries 停在 0，于是这道闸也跳过，那句话直接写进了备忘录。
+   * 现在措辞那一侧已经认了（见 looksLikeRefusal 里的 BLOCK_PATTERNS），
+   * 这里把条件放宽是第二道保险：只要调用方说了「这条链不接受拒答」，
+   * 就一次都不放过。
    */
-  if (refusalTries && looksLikeRefusal(content)) {
+  if (refusalAllowed > 0 && looksLikeRefusal(content)) {
     throw blockedIf(
       new Error(
-        `${label} 连着 ${refusalTries + 1} 次只回了道歉，没给出总结：${content.slice(0, 200)}`
+        refusalTries
+          ? `${label} 连着 ${refusalTries + 1} 次都被内容安全拦下（换了 ${refusalTries} 次说法），` +
+            `没给出总结：${content.slice(0, 200)}`
+          : `${label} 被内容安全拦下，没给出总结：${content.slice(0, 200)}`
       ),
       true
     );

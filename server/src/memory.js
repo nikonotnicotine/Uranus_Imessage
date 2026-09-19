@@ -650,9 +650,46 @@ export async function summarizeMemo(config, role, key, now = new Date()) {
   const text = raw.trim();
   if (!text) throw new Error("模型返回了空的备忘录");
 
+  /*
+   * 缩水闸：新的一份**明显比旧的短**就不写，当这一轮失败。
+   *
+   * 上面那几道闸管的是「拒答被当成结果」，管不住这一种：模型老老实实回了一份
+   * 备忘录，只是把旧条目漏掉了一半。被内容安全拦过之后尤其容易 —— 重试那几档
+   * nudge 就是在叫它写得更收敛（「宁可写得少、写得干」），而备忘录是整份覆盖，
+   * 收敛的代价就是旧条目被冲掉。用户丢的那条备忘录就是这么没的。
+   *
+   * 判的是**行数**而不是字数：备忘录是一条一行的清单，模型把三行合成一段长句
+   * 时字数可能还涨了，条目却少了。阈值 60%：正常的一轮更新是「旧的全留着 +
+   * 新增几条」，行数只会持平或变多；真要精简也不至于一次砍掉四成。
+   *
+   * 失败之后 pending 一个字节不清（调用方的 markFail 只动计数），所以这批
+   * 对话还在，下一轮会连着新的一起再总结一次。旧备忘录也一个字没动。
+   *
+   * 旧的只有几行时不判（LEAN_FLOOR）：从 2 行变 1 行是 50%，但那更可能是
+   * 用户刚开始用、模型在正常合并，拦下来只会让人一直收到失败提醒。
+   */
+  const LEAN_FLOOR = 6;
+  const LEAN_RATIO = 0.6;
+  const lineCount = (s) => String(s ?? "").split("\n").filter((l) => l.trim()).length;
+  const before = lineCount(readMemo(key));
+  const after = lineCount(text);
+  if (before >= LEAN_FLOOR && after < Math.ceil(before * LEAN_RATIO)) {
+    // 这一版不写盘，所以正文只剩日志这一个去处 —— 用户要能核对「到底是模型漏了
+    // 还是它合并得挺好、是这道闸判严了」，不记下来就只剩一句抽象的失败提示
+    logWarn(
+      "记忆库",
+      `${key} 的备忘录这一版从 ${before} 条缩到 ${after} 条，没有覆盖。模型这次写的全文如下`,
+      text
+    );
+    throw new Error(
+      `模型这一版备忘录只剩 ${after} 条，原来有 ${before} 条 —— 像是把旧条目漏掉了，` +
+        `所以没有覆盖。待总结的对话还留着，下一轮会再试一次（这一版的全文在控制台日志里）`
+    );
+  }
+
   writeMemo(key, text);
   commitPending("memo", key);
-  logInfo("记忆库", `${key} 备忘录更新了（${text.length} 字）`);
+  logInfo("记忆库", `${key} 备忘录更新了（${text.length} 字、${after} 条）`);
   return { content: text };
 }
 

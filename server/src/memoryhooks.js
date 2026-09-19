@@ -237,11 +237,30 @@ async function runOne(kind, config, role, key, notify) {
     const maxFails = cfg.maxFails ?? 3;
     logError("记忆库", `${key} 的${name}总结失败（第 ${after.fails} 次，待总结的内容都还在）`, e);
 
-    if (after.fails >= maxFails && notify) {
+    /*
+     * 内容安全那一类**第一次就说**，不攒到 maxFails。
+     *
+     * 别的失败（模型没配、网络不通、额度没了）攒几次再说是对的：多半是临时的，
+     * 下一轮就好了，每次都发一条只是刷屏。内容安全不一样 —— llm.js 那边已经
+     * 换了三档说法、三次都被拦下才会走到这儿，它不会自己好转，而且用户**必须
+     * 当场知道**：这一轮没有更新，所以现在看到的那份是旧的。
+     *
+     * 用户的原话：「不要再覆盖备忘录了，而是在控制台和聊天窗口提醒用户被安全
+     * 内容拦截了，已重试了三次什么的」。控制台那条是上面的 logError，
+     * 这里是聊天窗口那条。
+     *
+     * `e.blocked` 是 llm.js:blockedIf 盖的标记 —— 到现在才有了第一个读它的人。
+     */
+    const blocked = Boolean(e?.blocked);
+    if ((blocked || after.fails >= maxFails) && notify) {
       // 说清「没丢东西」—— 不然用户看到「失败」第一反应是聊天记录没了
+      const head = blocked
+        ? `⚠️ ${name}被模型的内容安全拦下了，换了 3 次说法都没过去，这一轮没有生成。\n` +
+          `你现在看到的${name}还是上一次那份，一个字都没被覆盖。`
+        : `⚠️ ${name}已经连着 ${after.fails} 次没总结成功：${why}`;
       await notify(
-        `⚠️ ${name}已经连着 ${after.fails} 次没总结成功：${why}\n` +
-          `待总结的 ${after.lines} 行聊天记录一条都没删，配置好之后会接着总结。`
+        `${head}\n待总结的 ${after.lines} 行聊天记录一条都没删，` +
+          `${blocked ? "下一轮会连着新的再试一次" : "配置好之后会接着总结"}。`
       ).catch(() => {});
       // 说过一次就把计数归零重新数，别每次失败都刷一条
       resetFails(kind, key);

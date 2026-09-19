@@ -998,7 +998,18 @@ const llmPort = fakeLlm.address().port;
   check("赞落盘了", store.readPosts("user").find((p) => p.id === liked.id)?.likes, ["小明"]);
   check("点赞不打模型", llmHits.length, 0);
   check("用户的帖子被赞了要进爱心页", [store.readActivity()[0].kind, store.readActivity()[0].actor], ["like", "小明"]);
-  check("点赞不惊动私聊", committed.length, 0);
+  /*
+   * 点赞**也要交给 commit**。
+   *
+   * 以前这里断言 `committed.length === 0`，把「点赞什么都不记」当成正确形状
+   * 钉着 —— 于是用户发条快拍、角色点了赞，私聊里那边一无所知。现在点赞
+   * 和评论走同一条 commit，只是 comment 为空、commentLine 写的是点赞那句。
+   */
+  check("点赞也交给 commit 去写上下文", committed.length, 1);
+  check("点赞轮不带评论、不带短信", [committed[0]?.comment, committed[0]?.dm], ["", ""]);
+  check("点赞轮的上文旁白和评论轮同一句", likeOut.mark, "[Instagram] 小满 发了一条新帖子，你刷到了");
+  check("点赞轮助手那侧写的是点赞", likeOut.commentLine, "[Instagram] 你给这条帖子点了个赞");
+  check("对用户的点赞一律记上下文", likeOut.record, true);
 
   // ── 用户来评论，按概率这次不回 ──
   const skipped = store.addPost("小明", {
@@ -1007,7 +1018,21 @@ const llmPort = fakeLlm.address().port;
     comments: [{ id: "c-u", owner: "user", text: "在哪拍的" }],
   });
   const noReply = await doTask({ roleId: "r-1", kind: "userComment", postOwner: "小明", postId: skipped.id, commentId: "c-u" }, { roll: miss });
-  check("没中就当没看见", [noReply.action, noReply.reason], ["none", "按概率这次不回"]);
+  /*
+   * 没中 = 「**看到了，没回**」，不是「没看到」。
+   *
+   * 以前这里断言 action 是 none、而且一个字都不记 —— 于是用户在 IG 上留的言
+   * 被整个吞掉，角色下一轮在私聊里压根不知道你说过话。丢的是**用户主动说的
+   * 一句话**，比点赞那条更要紧。只有「不回」这一层是概率决定的。
+   */
+  check("没中也照样进上下文", [noReply.action, noReply.reason], ["skip", "按概率这次不回"]);
+  check("没中这一轮也交给 commit", committed.length, 2);
+  check("助手那侧写的是「看到了没回」", noReply.commentLine, "[Instagram] 你看到了这条留言，没有回");
+  check("mark 里带上用户那句原话（下一轮私聊才接得上）",
+    noReply.mark, "[Instagram] 小满 在 Instagram 上跟你说：在哪拍的");
+  check("没中不打模型", llmHits.length, 0);
+  check("没中不在 IG 上留任何痕迹",
+    store.readPosts("小明").find((p) => p.id === skipped.id)?.comments.length, 1);
   const ghost = await doTask({ roleId: "r-1", kind: "userComment", postOwner: "小明", postId: skipped.id, commentId: "c-没有这条" }, { roll: zero });
   check("评论被删了", [ghost.action, ghost.reason], ["none", "那条评论已经被删了"]);
   check("到这儿还是一次模型都没打", llmHits.length, 0);
@@ -1028,7 +1053,8 @@ const llmPort = fakeLlm.address().port;
   check("评论落到帖子上了", landed.map((c) => [c.owner, c.text, c.replyTo]), [["小明", "这张好看", ""]]);
   check("commentId 是落盘后那条的 id", out.commentId, landed[0].id);
   check("进了爱心页", [store.readActivity().length - actsBefore, store.readActivity()[0].kind, store.readActivity()[0].text], [1, "comment", "这张好看"]);
-  check("交给 commit 去写上下文 / 发短信", [committed.length, committed[0]?.comment], [1, "这张好看"]);
+  // 前面的点赞和「看到没回」各占一格，所以这里是第 3 条
+  check("交给 commit 去写上下文 / 发短信", [committed.length, committed[2]?.comment], [3, "这张好看"]);
   check("回用户的帖子不会再排队（要不要回是用户的事）", store.readQueue().length, 0);
 
   // ── 角色对角色：不发短信，但要记上下文，并且可能把对面叫起来 ──
@@ -1043,7 +1069,7 @@ const llmPort = fakeLlm.address().port;
   check("评论发了，短信按规矩不发", [peerOut.action, peerOut.comment, peerOut.dm], ["comment", "恭喜", ""]);
   check("mark 里引了对方那句", peerOut.mark, "[Instagram] 阿瑞 在 Instagram 上跟你说：这组绝了");
   check("recordPeer 开着 → 记上下文", peerOut.record, true);
-  check("commit 被叫了", committed.length, 2);
+  check("commit 被叫了", committed.length, 4);
   check("角色之间的来回不进爱心页", store.readActivity().length, actsBefore2);
   check("把对面叫起来了", store.readQueue().map((t) => [t.roleId, t.kind, t.chain]), [["r-2", "charComment", 1]]);
 
@@ -1058,8 +1084,26 @@ const llmPort = fakeLlm.address().port;
   const quiet = await doTask({ roleId: "r-2", kind: "charComment", postOwner: "阿瑞", postId: charliesPost.id, commentId: "c-nk" }, { roll: zero });
   check("IG 上照样留痕", [quiet.action, quiet.comment], ["comment", "上周"]);
   check("recordPeer 关着 → 不记上下文", quiet.record, false);
-  check("commit 没被叫（用户那边一个字都看不见）", committed.length, 2);
+  check("commit 没被叫（用户那边一个字都看不见）", committed.length, 4);
   check("评论还是落盘了", store.readPosts("阿瑞").find((p) => p.id === charliesPost.id)?.comments.length, 2);
+
+  /*
+   * 点赞那条出口也得认 recordPeer —— 两条出口各判一次，漂移了就是
+   * 「评论不记、赞倒记了」这种前后不一致。
+   */
+  const peerLiked = store.addPost("小明", {
+    caption: "角色间点赞用",
+    createdAt: new Date(TQ - 3600e3).toISOString(),
+  });
+  const peerLike = await doTask(
+    { roleId: "r-2", kind: "charPost", postOwner: "小明", postId: peerLiked.id },
+    { roll: zero }
+  );
+  check("角色间也是先掷点赞", peerLike.action, "like");
+  check("recordPeer 关着 → 这个赞也不记", peerLike.record, false);
+  check("所以 commit 没被叫", committed.length, 4);
+  check("赞照样落盘了", store.readPosts("小明").find((p) => p.id === peerLiked.id)?.likes, ["阿瑞"]);
+  check("角色之间的赞不进爱心页", store.readActivity()[0].kind !== "like" || store.readActivity()[0].actor !== "阿瑞", true);
 
   // ── 线程聊够了 / 模型什么都没说 ──
   const full = store.addPost("小明", {
@@ -1078,11 +1122,14 @@ const llmPort = fakeLlm.address().port;
   nextReply = "   ";
   const said = await doTask({ roleId: "r-1", kind: "userPost", postOwner: "user", postId: mute.id }, { roll: miss });
   check("模型什么都没说就当没发生", [said.action, said.reason], ["none", "模型这一轮什么都没说"]);
+  // 数的是「有没有多出一条」，不是绝对条数 —— 上面每加一个用例都会动那个总数，
+  // 写死数字的话以后加用例就得回来改这一行
   check("评论轮里冒出来的 [post:] 不照做", await (async () => {
+    const before = store.readPosts("小明").length;
     nextReply = "[post:我也发一条][comment:好看]";
     const o = await doTask({ roleId: "r-1", kind: "userPost", postOwner: "user", postId: mute.id }, { roll: miss });
-    return [o.comment, store.readPosts("小明").length];
-  })(), ["好看", 3]);
+    return [o.comment, store.readPosts("小明").length - before];
+  })(), ["好看", 0]);
 }
 
 console.log("\n=== 32. igComposeNote：主动消息那一轮缀的发帖说明 ===");

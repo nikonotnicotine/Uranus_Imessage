@@ -1157,7 +1157,7 @@ const REFUSAL_MSG = "很抱歉，我无法协助处理这个请求。";
     err = e.message;
   }
   check("道歉也要重试满（1 + 3 发）", sentBodies.length, 4);
-  checkThat("错误里说清「只回了道歉」", /连着 4 次只回了道歉/.test(err), err.slice(0, 80));
+  checkThat("错误里说清连着几次被拦、换了几次说法", /连着 4 次都被内容安全拦下（换了 3 次说法）/.test(err), err.slice(0, 80));
   checkThat("那句道歉不会出现在错误之外的地方 —— 旧备忘录一字未动", store.readMemo(CK) === memoBefore);
   checkThat("旧备忘录里不含那句道歉（用户最怕的那件事）", !store.readMemo(CK).includes("很抱歉"));
   check("失败后待总结文件字节数没变", bytesOf(memoPendC), before);
@@ -1172,6 +1172,114 @@ const REFUSAL_MSG = "很抱歉，我无法协助处理这个请求。";
   check("第二次给出正文就收下", out.content, "这是一份正常的备忘录清单。");
   check("只打了两发，没白打第三第四次", sentBodies.length, 2);
   check("写进去的是正文，不是道歉", store.readMemo(CK), "这是一份正常的备忘录清单。");
+}
+
+/*
+ * ---- 审核提示语躺在 HTTP 200 的正文里：用户丢备忘录的那条真实路径 ----
+ *
+ * 上游没回 400，回的是 200 + 正文就是 Google 那句 `sensitive words...`。
+ * 这句话不是道歉（没说「抱歉」、没说「我无法」，主语压根不是模型），以前
+ * looksLikeRefusal 认不出来，于是被当成一份合格的备忘录**整份覆盖**写了进去；
+ * 第二次总结时 writeMemo 又把这份坏的复制进 .bak，原来那份就彻底没了。
+ */
+{
+  const cfg = chainConfig();
+  const good = "1. 周六 09:00 出发\n2. 记得带帐篷\n3. 她不吃香菜";
+  store.writeMemo(CK, good);
+  store.appendPending("memo", CK, { user: "会撞上审核的一轮", assistant: "嗯" });
+  const before = bytesOf(memoPendC);
+
+  fakeLLM(BLOCK_MSG); // 200 + 审核提示语，四发都是它
+  let err = "";
+  let blocked = false;
+  try {
+    await chains.summarizeMemo(cfg, chainRole(cfg), CK);
+  } catch (e) {
+    err = e.message;
+    blocked = Boolean(e.blocked);
+  }
+  check("200 里的审核提示语也要换说法重试满（1 + 3 发）", sentBodies.length, 4);
+  checkThat("错误里说清是被内容安全拦下", /被内容安全拦下/.test(err), err.slice(0, 80));
+  checkThat("带上 blocked 标记（memoryhooks 靠它当场通知用户）", blocked);
+  check("旧备忘录一字未动 —— 用户丢的那份就是这么丢的", store.readMemo(CK), good);
+  checkThat("备忘录里没有那句审核提示语", !store.readMemo(CK).includes("sensitive words"));
+  check("待总结一个字节没清", bytesOf(memoPendC), before);
+  // 备份也得是好的那份：第二次生成时 writeMemo 会把当前内容复制进 .bak，
+  // 当前内容没被污染，.bak 自然也干净
+  checkThat("没有写盘，所以 .bak 里也不会留下坏的那份", !store.readMemo(CK).includes("could not be submitted"));
+}
+
+// ---- 同一句审核提示语，记忆那条链也不许当成一条记忆存下来 ----
+{
+  const cfg = chainConfig();
+  store.appendPending("memory", CK, { user: "记忆也会撞上", assistant: "嗯" });
+  const memBefore = store.readMemories(CK).length;
+  const before = bytesOf(pendFileC);
+  fakeLLM(BLOCK_MSG);
+  let err = "";
+  try {
+    await chains.summarizeMemory(cfg, chainRole(cfg), CK);
+  } catch (e) {
+    err = e.message;
+  }
+  checkThat("记忆那边也认出来了", /被内容安全拦下/.test(err), err.slice(0, 80));
+  check("没有凭空多出一条记忆", store.readMemories(CK).length, memBefore);
+  check("待总结也没清", bytesOf(pendFileC), before);
+}
+
+// ---- 200 里的审核提示语，换个说法之后过了 —— 照常收下 ----
+{
+  const cfg = chainConfig();
+  store.writeMemo(CK, "1. 旧的一条");
+  store.appendPending("memo", CK, { user: "第二次就好了", assistant: "嗯" });
+  fakeLLM((n) => (n === 1 ? BLOCK_MSG : "1. 旧的一条\n2. 这轮新增的"));
+  const out = await chains.summarizeMemo(cfg, chainRole(cfg), CK);
+  check("第二次给出正文就收下", out.content, "1. 旧的一条\n2. 这轮新增的");
+  check("只打了两发", sentBodies.length, 2);
+  check("写进去的是正文", store.readMemo(CK), "1. 旧的一条\n2. 这轮新增的");
+}
+
+// ---- 备忘录缩水：模型正常回了，但把旧条目漏掉一半，也不许覆盖 ----
+{
+  const cfg = chainConfig();
+  // 先铺一份 8 条的备忘录（缩水闸只在旧的有 6 条以上时才判）
+  const full = Array.from({ length: 8 }, (_, i) => `${i + 1}. 第 ${i + 1} 条要记的事`).join("\n");
+  store.writeMemo(CK, full);
+
+  store.appendPending("memo", CK, { user: "会把清单写残的一轮", assistant: "嗯" });
+  const before = bytesOf(memoPendC);
+  // 三条，不到 8 条的 60%（ceil(4.8) = 5）—— 判成漏了
+  fakeLLM("1. 只剩这条\n2. 和这条\n3. 还有这条");
+  let err = "";
+  try {
+    await chains.summarizeMemo(cfg, chainRole(cfg), CK);
+  } catch (e) {
+    err = e.message;
+  }
+  checkThat("错误里说清缩到了几条", /只剩 3 条，原来有 8 条/.test(err), err.slice(0, 80));
+  check("旧备忘录一字未动", store.readMemo(CK), full);
+  check("待总结也一个字节没清", bytesOf(memoPendC), before);
+  // 这一条不是拒答，所以不该吃换说法的额度 —— 就打一发
+  check("缩水不走换说法重试（只打一发）", sentBodies.length, 1);
+
+  // 同一批对话，下一轮模型好好写了 —— 照常收下
+  store.writeMemo(CK, full);
+  fakeLLM(`${full}\n9. 这轮新增的一条`);
+  const ok = await chains.summarizeMemo(cfg, chainRole(cfg), CK);
+  checkThat("下一轮写全了就收下", ok.content.includes("9. 这轮新增的一条"));
+  check("这次写盘了", store.readMemo(CK).split("\n").length, 9);
+  check("成功之后待总结清空了", bytesOf(memoPendC), 0);
+}
+
+// ---- 备忘录本来就只有几条时不判缩水（刚开始用，模型在正常合并） ----
+{
+  const cfg = chainConfig();
+  store.writeMemo(CK, "1. 就这一条\n2. 加这一条");
+  store.appendPending("memo", CK, { user: "合并成一条", assistant: "嗯" });
+  fakeLLM("1. 合并之后的一条");
+  const out = await chains.summarizeMemo(cfg, chainRole(cfg), CK);
+  check("旧的不到 6 条就不拦", out.content, "1. 合并之后的一条");
+  check("照常写盘", store.readMemo(CK), "1. 合并之后的一条");
 }
 
 // ---- 503 那种上游故障走的还是原来的退避，不吃换说法的额度 ----
@@ -1376,6 +1484,44 @@ const hkLog = () => store.diaryLogPath(HK);
   check("前缀：剥这一步不打任何接口", sentBodies.length, 0);
 }
 
+/*
+ * ---- IG 那几轮走的也是同一个 recordTurn：三样一个不落 ----
+ *
+ * igrun 那边三条出口（点了赞、看到留言没回、留了评论）都汇到 commitIgTurn，
+ * 由它调 afterTurn → recordTurn。所以只要这里三样都落下去，那三条出口就都齐了
+ * —— 「记忆记了但日记没记」这种形状在设计上不可能出现（recordTurn 一次写三份）。
+ *
+ * 这一组钉的是**磁盘**：igrun 那边的测试只验到 outcome 和 commit 有没有被叫，
+ * 验不到三份文件里到底有没有字。
+ */
+{
+  const cfg = hookConfig();
+  const IG = "HookIG";
+  const role = { ...hookRole(cfg), name: IG };
+
+  // 三条出口传进来的形状：mark 当 user、commentLine（+ 短信）当 assistant
+  const rounds = [
+    ["[Instagram] 小满 发了一条新帖子，你刷到了", "[Instagram] 你给这条帖子点了个赞"],
+    ["[Instagram] 小满 在 Instagram 上跟你说：在哪拍的", "[Instagram] 你看到了这条留言，没有回"],
+    ["[Instagram] 小满 发了一条快拍，你点开看了", "[Instagram 评论] 这张好看\n晚点打给你"],
+  ];
+  for (const [user, assistant] of rounds) hooks.recordTurn(cfg, role, { user, assistant });
+
+  check("IG：待总结记忆攒了 6 行（3 轮）", store.readPending("memory", IG).lines, 6);
+  check("IG：待总结备忘录也攒了 6 行", store.readPending("memo", IG).lines, 6);
+  check("IG：日记流水也是 6 行", store.readDiaryLog(IG).trim().split(/\r?\n/).length, 6);
+
+  const diary = store.readDiaryLog(IG);
+  checkThat("IG：点赞那轮进了日记流水", diary.includes("你给这条帖子点了个赞"));
+  checkThat("IG：「看到没回」那轮也进了日记流水", diary.includes("你看到了这条留言，没有回"));
+  checkThat("IG：评论那轮连顺带的短信一起进了", diary.includes("[Instagram 评论] 这张好看"));
+  checkThat("IG：用户在 IG 上说的原话也在（下一轮才接得上）", diary.includes("在哪拍的"));
+  checkThat("IG：三样内容一致（recordTurn 一次写三份）",
+    store.readPending("memory", IG).text.trim() === diary.trim() &&
+      store.readPending("memo", IG).text.trim() === diary.trim());
+  check("IG：记一笔不打任何接口", sentBodies.length, 0);
+}
+
 // ---- 三道闸全关：一个字都不写 ----
 {
   const cfg = hookConfig();
@@ -1463,6 +1609,41 @@ const hkLog = () => store.diaryLogPath(HK);
     store.readPending("memory", HK).fails, 0);
   checkThat("挂点：到上限时待总结的内容仍然全在",
     store.readPending("memory", HK).lines >= 4);
+}
+
+/*
+ * ---- 被内容安全拦下：第一次就通知，不攒到 maxFails ----
+ *
+ * 别的失败（模型没配、网络不通、额度没了）攒几次再说是对的，多半下一轮就好了。
+ * 内容安全不一样：llm.js 已经换了三档说法、三次都被拦才会走到这儿，它不会自己
+ * 好转，而且用户**必须当场知道**这一轮没更新 —— 他丢那份备忘录就是因为坏内容
+ * 静悄悄覆盖了进去、自己没发现，第二次生成时连 .bak 也跟着被顶掉。
+ */
+{
+  const cfg = hookConfig({ memory: { rounds: 1, maxFails: 3 }, memo: { rounds: 999 } });
+  const BK = "HookBlock";
+  const role = { ...hookRole(cfg), name: BK };
+  const said = [];
+  const notify = async (t) => {
+    said.push(t);
+  };
+
+  hooks.recordTurn(cfg, role, { user: "会撞上审核的一轮", assistant: "嗯" });
+  const before = store.readPending("memory", BK).text;
+  fakeLLM(BLOCK_MSG); // 200 + 那句审核提示语，四发都是它
+  await hooks.runSummaries(cfg, role, notify);
+
+  check("拦截：换说法一共打了 4 发（1 + 3）", sentBodies.length, 4);
+  check("拦截：第一次就发一条说明（maxFails=3 也不等）", said.length, 1);
+  checkThat("拦截：说明里点明是内容安全", said[0].includes("内容安全"), said[0]);
+  checkThat("拦截：说清换了 3 次说法", /3 次说法/.test(said[0]), said[0]);
+  checkThat("拦截：说清旧的那份一个字都没被覆盖",
+    said[0].includes("一个字都没被覆盖"), said[0]);
+  checkThat("拦截：说清待总结没删", said[0].includes("一条都没删"), said[0]);
+  check("拦截：待总结正文一字未动", store.readPending("memory", BK).text, before);
+  check("拦截：没有凭空多出一条记忆", store.readMemories(BK).length, 0);
+  check("拦截：说过之后计数归零（否则每轮都刷一条）",
+    store.readPending("memory", BK).fails, 0);
 }
 
 // ---- 手动记忆：不看轮数 ----

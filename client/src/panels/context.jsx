@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { applyVars, resolveUser, roleLabel } from "../labels.js";
 import { useSection } from "../section.jsx";
 import { ROLE_LABELS, api, useConfig } from "../store.jsx";
@@ -23,6 +23,9 @@ export function ContextPanel({ onGoto }) {
   // 正在编辑哪一条（消息 id，没 id 的老存档退回 "#下标"）+ 编辑框里的草稿
   const [editKey, setEditKey] = useState("");
   const [draft, setDraft] = useState("");
+  // 详情里现在显示的是哪条会话。用 ref 而不是 state：它只用来分辨
+  // 「这次 effect 是换会话还是按了刷新」，自己不该触发重渲染
+  const shownId = useRef(null);
 
   const refreshList = useCallback(async () => {
     try {
@@ -38,6 +41,44 @@ export function ContextPanel({ onGoto }) {
   useEffect(() => {
     refreshList();
   }, [refreshList]);
+
+  /*
+   * 「刷新」要**连详情一起拉**。
+   *
+   * 以前只刷左边那列：详情是 `useEffect([itemId])` 拉的，itemId 没变就不重拉。
+   * 于是「打开某条会话 → 在手机上又聊了几轮 → 点刷新」看到的还是打开那一刻的
+   * 快照，条数没动。磁盘上其实已经写进去了（appendTurn 是同步写），
+   * 表现却是「上下文不保存了，待总结里倒是有」—— 后者每次进面板都重新读文件，
+   * 所以只有上下文这一侧看着像丢了东西。
+   *
+   * 这个 nonce 就是给那个 effect 一个「itemId 没变也重跑一次」的把手。
+   */
+  const [nonce, setNonce] = useState(0);
+  const refreshAll = useCallback(() => {
+    setNonce((n) => n + 1);
+    return refreshList();
+  }, [refreshList]);
+
+  /*
+   * 开着这个面板时自动跟着新 —— 每 10 秒一次，只在**没有在编辑**的时候。
+   *
+   * 不自动刷的话，用户一边在手机上聊一边看着这一页，看到的永远是打开那一刻的
+   * 快照，很容易得出「存档不写了」的结论。10 秒是拍的：存档就在本机磁盘上，
+   * 一次请求是读一个 json 文件，比 shell.jsx 那个 20 秒的时钟还轻。
+   *
+   * `editKey` 非空就停：轮询会把 detail 整份换掉，正在打字的那条会被拉回
+   * 磁盘上的旧内容 —— 用户的草稿在 draft 里还在，但对照着改的原文变了，
+   * 更糟的是 commitEdit 按下标写回，期间 messages 长度变了就会改错条。
+   */
+  useEffect(() => {
+    if (!itemId || editKey || busy) return undefined;
+    const timer = setInterval(() => {
+      setNonce((n) => n + 1);
+      // 左边那列的「N 条」也要跟着走，否则详情涨了、列表还是旧数字
+      refreshList();
+    }, 10000);
+    return () => clearInterval(timer);
+  }, [itemId, editKey, busy, refreshList]);
 
   // 所有角色的会话都列出来，不再按「当前角色」过滤 —— 左边点一条就看那条
   const chats = useMemo(
@@ -121,14 +162,22 @@ export function ContextPanel({ onGoto }) {
    */
   useEffect(() => {
     let alive = true;
-    setDetail(null);
-    setDetailError("");
-    setEditKey("");
+    // 换会话才清空重来；`nonce` 变化是「刷新」按的，那时候旧内容留在屏幕上，
+    // 拉到新的直接替换 —— 否则每点一次刷新都闪一下「读取中」
+    if (itemId !== shownId.current) {
+      shownId.current = itemId;
+      setDetail(null);
+      setDetailError("");
+      setEditKey("");
+    }
     if (!itemId) return undefined;
     (async () => {
       try {
         const r = await api(`/api/sessions/${encodeURIComponent(itemId)}`);
-        if (alive) setDetail(r);
+        if (alive) {
+          setDetail(r);
+          setDetailError("");
+        }
       } catch (e) {
         if (alive) setDetailError(String(e?.message ?? e));
       }
@@ -136,7 +185,7 @@ export function ContextPanel({ onGoto }) {
     return () => {
       alive = false;
     };
-  }, [itemId]);
+  }, [itemId, nonce]);
 
   /** 整份覆盖写回。删单条 / 清空 / 改单条都走这个。 */
   async function writeMessages(messages) {
@@ -208,7 +257,7 @@ export function ContextPanel({ onGoto }) {
         title="上下文"
         desc="和模型的对话记录，按会话存档在本地"
         actions={
-          <Button variant="outline" onClick={refreshList}>
+          <Button variant="outline" onClick={refreshAll}>
             <RefreshCw size={14} /> 刷新
           </Button>
         }

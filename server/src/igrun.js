@@ -509,6 +509,60 @@ function nothing(task, role, reason) {
   };
 }
 
+/**
+ * 这条任务是「角色对角色」吗。
+ *
+ * 只看 kind，所以点赞那条出口和评论那条出口能共用它 —— 两处都要拿它去问
+ * `recordPeer` 那道闸，各写一遍迟早漂移。
+ */
+function isPeerKind(kind) {
+  return kind === "charPost" || kind === "charComment";
+}
+
+/**
+ * 「确实看到了，但这一轮没在 IG 上说话」—— 把这一轮记进上下文和记忆库。
+ *
+ * 两条路共用：掷中 likeChance 只点了个赞、以及 userComment 掷 replyChance 没中。
+ * 共同点是**没打模型**，所以 `built.vars` 这会儿不存在、vars 得自己拼（取的是
+ * 同一个来源 config.js:resolveUser，算出来的用户名和评论轮一致）。
+ *
+ * 这两条恰恰是最常走的路（likeChance 默认 45、replyChance 默认 60），以前都是
+ * 直接 return、什么都不记，后果是用户发了东西、角色看见了，私聊里却跟个没事人
+ * 一样。用户的原话：「角色明明看到点赞评论了，却在私聊里跟个没事人一样」。
+ *
+ * 记进去的三样是 recordTurn 一次写的（记忆 / 备忘录 / 日记流水共用同一份原文，
+ * 见 memoryhooks.js），所以这里不用、也不该分别去管三样。
+ *
+ * 会话是**现取**的，没有挪到 runIgTask 开头：那几条 `nothing(...)` 早退
+ * （内容被删了、快拍过期了）本来一次磁盘都不用读，提前建会话等于给每条不干活的
+ * 任务都白读一遍存档。
+ *
+ * @param {object} what 出岔子时日志里那句话（IG 上的痕迹已经留下了，不能回滚）
+ */
+async function recordSeen(config, role, task, opts, { commentLine, peerName = "", quote = "", fields = {}, what }) {
+  const vars = { char: String(role?.name ?? ""), user: resolveUser(config, role)?.name ?? "" };
+  const outcome = {
+    ...nothing(task, role, ""),
+    ...fields,
+    mark: markFor(task.kind, vars, peerName, quote),
+    commentLine,
+    // 角色之间的互动照 recordPeer 那道闸走，和评论轮同一个规矩
+    record: !isPeerKind(task.kind) || role?.instagram?.recordPeer !== false,
+  };
+
+  if (outcome.record) {
+    const session = opts.session ? await opts.session(role) : null;
+    if (session?.commit) {
+      try {
+        await session.commit(outcome);
+      } catch (e) {
+        logError(SCOPE, what, e);
+      }
+    }
+  }
+  return outcome;
+}
+
 /** 上下文里代替「对方发了条消息」的那一句。 */
 function markFor(kind, vars, peerName, quote) {
   const who = kind.startsWith("user") ? String(vars?.user ?? "") || "用户" : peerName || "对方";
@@ -622,7 +676,25 @@ export async function runIgTask(config, task, opts = {}) {
     target = list.find((c) => c.id === task.commentId);
     if (!target) return nothing(task, role, "那条评论已经被删了");
     if (task.kind === "userComment" && !hit(ig.replyChance ?? 60, roll)) {
-      return nothing(task, role, "按概率这次不回");
+      /*
+       * 掷 replyChance 没中 —— 语义是「**看到了，没回**」，不是「没看到」。
+       *
+       * 所以这一轮照样进上下文和记忆库。这里丢掉的东西比点赞那条更要紧：
+       * 那是**用户主动说的一句话**，吞掉之后角色下一轮在私聊里压根不知道
+       * 你在 IG 上留过言。
+       *
+       * 只有「不回」这一层是概率决定的，「知不知道」不该跟着掷骰子。
+       *
+       * 引文进 mark（markFor 里超过 60 字会截断），这样模型看到的是「她说了
+       * 什么」而不是干巴巴一句「她留了言」—— 下一轮私聊里才接得上话。
+       */
+      return recordSeen(config, role, task, opts, {
+        fields: { action: "skip", reason: "按概率这次不回" },
+        peerName: String(target?.owner ?? ""),
+        quote: target?.text ?? "",
+        commentLine: "[Instagram] 你看到了这条留言，没有回",
+        what: `${self} 这条「看到没回」没落到上下文里`,
+      });
     }
     if (task.kind === "charComment" && !isStory) {
       // 排队那会儿算过一次，但中间可能又来了几条 —— 到点再算一次才准
@@ -647,7 +719,21 @@ export async function runIgTask(config, task, opts = {}) {
         at: new Date(now).toISOString(),
       });
     }
-    return { ...nothing(task, role, ""), action: "like" };
+
+    /*
+     * 点赞**也要进上下文和待总结**（理由和实现都在 recordSeen 上面）。
+     *
+     * 助手那侧必须有字：commitIgTurn 那边 `if (!assistant) return` 会把两边
+     * 都空的轮次整个丢掉（见 imessage.js），所以 commentLine 写成一句人话。
+     */
+    return recordSeen(config, role, task, opts, {
+      fields: { action: "like" },
+      peerName: task.kind === "charPost" ? owner : "",
+      commentLine: isStory
+        ? "[Instagram] 你给这条快拍点了个赞"
+        : "[Instagram] 你给这条帖子点了个赞",
+      what: `${self} 点赞这一轮的上下文没落下去（赞已经点了）`,
+    });
   }
 
   // ── 到这儿才轮到模型 ──
@@ -694,7 +780,7 @@ export async function runIgTask(config, task, opts = {}) {
   }
 
   const text = String(parsed.comments[0] ?? "").trim();
-  const isPeer = task.kind === "charPost" || task.kind === "charComment";
+  const isPeer = isPeerKind(task.kind);
   let dm = isPeer ? "" : String(parsed.rest ?? "").trim();
   if (isPeer && parsed.rest?.trim()) {
     // 角色之间的互动按用户定的规矩**不触发 iMessage 回复**
