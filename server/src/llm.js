@@ -123,6 +123,10 @@ function trimBase(url) {
  * 1. **消息数组不能以 assistant 结尾**，上游直接回 400
  *    `Requests ending with a model turn are not supported.`
  *    也就是「预填」（prefill）这套玩法在这两个版本上整个不支持。
+ *    注意「结尾」是**跳过 system 之后**的结尾：中转站会把所有 system 提走当
+ *    `systemInstruction`，剩下的才是 Gemini 眼里的 contents。所以
+ *    `[…, assistant, system]` 在我们这边看着不以 assistant 结尾，到了上游
+ *    照样挨这个 400 —— 见 moveModelTail。
  * 2. **生成参数一个都不能带**：temperature / top_p / top_k /
  *    frequency_penalty / presence_penalty，带上就报错。
  *
@@ -141,15 +145,37 @@ const GEMINI_STRICT = /gemini[^0-9]{0,4}3[._-][78](?![0-9])/i;
  * 预填的正文**不扔掉**，改挂到 user 名下 —— 预填那个效果是保不住的（上游
  * 不支持），但正文里写的格式要求还是让模型看到，比直接丢掉强。前面紧跟着
  * 就是 user 的话并进那条，避免发出两条连着的 user。
+ *
+ * ── 为什么要先跳过尾部的 system ──
+ *
+ * 上游判的不是「数组以 assistant 结尾」，是「**contents** 以 model turn 结尾」，
+ * 而 system 压根不在 contents 里（被提走当 systemInstruction 了）。所以
+ * `[…, user, assistant, system]` 这种形状，我们这边看着好好的，到上游那边
+ * contents 的最后一条就是 assistant，照样 400。
+ *
+ * IG 那一轮天然长这个样：它不是被消息触发的，末尾那条行动指令挂的是 system
+ * （igprompt.js 结尾那段），而从存档恢复的上文最后一轮往往是角色说的话。
+ * 结果就是每条互动任务都必然吃一个 400、出队即丢 —— 点赞（不打模型那条路）
+ * 之外整个 Instagram 分区都不动。
+ *
+ * 摘下来的 system 原样放回数组末尾：它们该发还是要发，只是不参与「谁是最后
+ * 一个 turn」这个判断。
  */
 function moveModelTail(messages, label) {
   const out = (Array.isArray(messages) ? messages : []).slice();
-  // 尾部可能连着好几条（预设里能写多条预填条目），一路收到不是 assistant 为止
+
+  // 1. 尾部的 system 先搁一边，它们挡不住这条 400
+  const trailing = [];
+  while (out.length && out.at(-1)?.role === "system") trailing.unshift(out.pop());
+
+  // 2. 剩下的尾部可能连着好几条 assistant（预设里能写多条预填条目），
+  //    一路收到不是 assistant 为止
   const tails = [];
   while (out.length && out.at(-1)?.role === "assistant") {
     const content = out.pop()?.content;
     if (typeof content === "string") tails.unshift(content);
   }
+  // 真的不以 assistant 收尾（跳过 system 之后），原样返回，一个字都不动
   if (!tails.length) return messages;
 
   const text = tails.filter((s) => s.trim()).join("\n\n");
@@ -162,12 +188,23 @@ function moveModelTail(messages, label) {
     }
   }
 
+  // 3. system 放回去。位置在最后 —— 它们本来就在最后，而且 systemInstruction
+  //    不看顺序
+  out.push(...trailing);
+
   logWarn(
     label,
     "这个模型不收以 assistant 结尾的消息数组，末尾的预填已改挂到 user 名下",
-    text
-      ? `预填正文（${text.length} 字）并进了最后一条 user，预填本身的效果在这个模型上拿不到`
-      : "预填是空的，整条去掉了"
+    [
+      text
+        ? `预填正文（${text.length} 字）并进了最后一条 user，预填本身的效果在这个模型上拿不到`
+        : "预填是空的，整条去掉了",
+      trailing.length
+        ? `末尾那 ${trailing.length} 条 system 不算 turn（上游拿它当 systemInstruction），已跳过去找的 assistant`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("；")
   );
   return out;
 }

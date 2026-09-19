@@ -520,17 +520,54 @@ checkThat(
   "没有上文：user 那条就是行动指令",
   basic.messages.at(-1).content.startsWith("现在轮到你了")
 );
-// 有上文的正常情况一个字不动：行动指令还是并进 </Chat_History> 那条 system
+/*
+ * 上文以角色的话结尾时，行动指令也必须换成 user —— 同一条 400 的另一半。
+ *
+ * 上面那几条防的是「一条 user 都不剩」，这几条防的是「最后一个 turn 是
+ * assistant」。上游把 system 提走当 systemInstruction，所以 `assistant, system`
+ * 这个尾巴在它眼里就是以 model turn 结尾，回 400
+ * `Requests ending with a model turn are not supported.`
+ *
+ * 这是 IG 这一轮的**常态**，不是边角：上文从存档恢复，最后一轮十有八九是角色
+ * 说的话。这个洞让每条互动任务都必然吃一个 400、出队即丢，整个分区只剩
+ * 「掷中 likeChance 直接点赞」那条不打模型的路还活着。
+ */
 check(
-  "有上文：形状还是老样子",
+  "上文以 assistant 结尾：行动指令挂 user",
   withHist.messages.map((m) => m.role),
-  ["system", "user", "assistant", "system"]
+  ["system", "user", "assistant", "system", "user"]
 );
 checkThat(
-  "有上文：行动指令并进了 </Chat_History>",
-  withHist.messages.at(-1).role === "system" &&
-    withHist.messages.at(-1).content.startsWith("</Chat_History>") &&
-    withHist.messages.at(-1).content.includes("现在轮到你了")
+  "上文以 assistant 结尾：最后一个 turn 不是 assistant",
+  withHist.messages.filter((m) => m.role !== "system").at(-1).role === "user"
+);
+checkThat(
+  "上文以 assistant 结尾：user 那条就是行动指令",
+  withHist.messages.at(-1).content.startsWith("现在轮到你了")
+);
+
+// 上文正好以用户那句话结尾时一个字不动：行动指令还是并进 </Chat_History> 那条
+// system，模型看惯的形状不白改
+const userTail = await build(
+  { kind: "userPost", owner: "user", post: userPost },
+  {
+    history: [
+      { role: "user", content: "在干嘛" },
+      { role: "assistant", content: "刚下班" },
+      { role: "user", content: "那你看我新发的帖子了吗" },
+    ],
+  }
+);
+check(
+  "上文以 user 结尾：形状还是老样子",
+  userTail.messages.map((m) => m.role),
+  ["system", "user", "assistant", "user", "system"]
+);
+checkThat(
+  "上文以 user 结尾：行动指令并进了 </Chat_History>",
+  userTail.messages.at(-1).role === "system" &&
+    userTail.messages.at(-1).content.startsWith("</Chat_History>") &&
+    userTail.messages.at(-1).content.includes("现在轮到你了")
 );
 
 // 预设里关掉的条目，这一轮也不产出

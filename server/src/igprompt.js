@@ -383,27 +383,41 @@ export async function buildIgPrompt(config, role, scene, opts = {}) {
    * 默认用 system 而不是 user —— 这不是谁说的话，而且 system 能和上面那条
    * `</Chat_History>` 合并掉，省一条消息。
    *
-   * ── 但上文为空时必须换成 user ──
+   * ── 但「最后一条不是 system 的消息」得是 user，不然必然 400 ──
    *
-   * 上面每一条都是 system，第 5 步那几条上文是**唯一**的例外。所以上下文一空，
-   * mergeAdjacent 会把所有东西合成**一条 system**，一条 user 都不剩。Gemini 系
-   * 的上游对这种请求直接回 400 `contents is not specified` —— 它把 system 当
-   * systemInstruction 拿走，contents 就空了，整轮白打一次。
+   * Gemini 系的上游把 system 提走当 systemInstruction，剩下的才是它眼里的
+   * contents。所以判据不是「数组里有没有 user」，是**跳过末尾的 system 之后，
+   * 最后那条是谁说的**。两种情况都会炸，而且都是 IG 这一轮的常态：
    *
-   * 这不是罕见路径。runIgTask 里那句「现在没有可用的会话，这一轮照跑，但上文
-   * 是空的、短信发不出去」写的就是它：进程刚重启、对方还没说过话的时候，IG
-   * 那一轮照样会被队列叫起来。那条降级路径的意思是「评论照发，只是没上文」，
-   * 不该变成一次必然失败的请求。
+   *   a. 上文为空 → 所有条目都是 system，mergeAdjacent 合成一条，contents 空了，
+   *      上游回 400 `contents is not specified`。runIgTask 里那句「现在没有可用的
+   *      会话，这一轮照跑，但上文是空的」写的就是它：进程刚重启、对方还没说过话
+   *      的时候，IG 那一轮照样会被队列叫起来。
+   *   b. 上文以角色的话结尾（**从存档恢复的上文十有八九如此**）→ contents 的最后
+   *      一条是 assistant，上游回 400
+   *      `Requests ending with a model turn are not supported.`
+   *
+   * b 那条以前漏了：`parts.some(p => p.role === "user")` 只要上文里有过一句用户的
+   * 话就判「有 user」，于是行动指令挂 system，末尾成了 `assistant, system` ——
+   * 我们这边看着不以 assistant 结尾，上游眼里正是。结果每条互动任务都吃一个
+   * 400、出队即丢，整个 Instagram 分区只剩「掷中 likeChance 直接点赞」那条不打
+   * 模型的路还活着。
    *
    * 挑这一条来换，是因为它语义上最接近 user（「现在轮到你了」本来就是冲着
    * 模型说的一句指令），而且它已经在最底下，换个 role 不动任何顺序。
-   * **只在真的缺 user 时才换** —— 有上文的正常情况一个字不变，免得白改了
-   * 模型看惯的那个形状。
+   * **只在真的需要时才换** —— 上文正好以用户那句话结尾的话一个字不变，
+   * 免得白改了模型看惯的那个形状。
+   *
+   * llm.js:moveModelTail 那边也补了同一条口径（跳过尾部 system 再找 assistant），
+   * 两层都有：这里从源头不产出这种形状，那里给所有链路兜底。
    */
   const actionKey = PEER_SCENES.has(scene?.kind) ? "peerAction" : "action";
   const action = String(templates?.[actionKey] ?? "").trim() || defaultTemplate(actionKey);
-  const hasUser = parts.some((p) => p.role === "user");
-  parts.push({ role: hasUser ? "system" : "user", content: applyVars(action, vars).trim() });
+  const lastTurn = parts.filter((p) => p.role !== "system" && String(p.content ?? "").trim()).at(-1);
+  parts.push({
+    role: lastTurn?.role === "user" ? "system" : "user",
+    content: applyVars(action, vars).trim(),
+  });
 
   return {
     messages: mergeAdjacent(parts),

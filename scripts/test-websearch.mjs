@@ -976,6 +976,48 @@ console.log("\n[Gemini 3.7 / 3.8 的两条硬规矩]");
       assert.equal(b.messages.at(-1).role, "assistant", `${name} 被误认成 3.7/3.8`);
     }
     ok("3.78 / 3.80 这类名字不被误认");
+
+    /*
+     * 末尾挂着 system 的 assistant 尾巴也要挪走。
+     *
+     * 上游判的不是「数组以 assistant 结尾」，是「**contents** 以 model turn
+     * 结尾」—— system 被提走当 systemInstruction，压根不在 contents 里。所以
+     * `[…, assistant, system]` 在我们这边看着好好的，到上游那边最后一个 turn
+     * 正是 assistant，照样 400。
+     *
+     * 这是 IG 那一轮的形状：行动指令挂在最底下当 system，上文从存档恢复、
+     * 最后一轮往往是角色说的话。只看字面末尾的话，每条互动任务都必然吃一个
+     * 400、出队即丢。
+     */
+    const b尾system = await call("gemini-3.8-flash", [
+      { role: "system", content: "人设" },
+      { role: "user", content: "在干嘛" },
+      { role: "assistant", content: "刚下班" },
+      { role: "system", content: "现在轮到你了" },
+    ]);
+    assert.deepEqual(
+      b尾system.messages.map((m) => m.role),
+      ["system", "user", "system"],
+      JSON.stringify(b尾system.messages)
+    );
+    assert.equal(
+      b尾system.messages.filter((m) => m.role !== "system").at(-1).role,
+      "user",
+      JSON.stringify(b尾system.messages)
+    );
+    // 挪走的正文并进了那条 user，末尾那条 system 原样留着
+    assert.ok(b尾system.messages[1].content.includes("刚下班"), b尾system.messages[1].content);
+    assert.equal(b尾system.messages.at(-1).content, "现在轮到你了");
+    ok("末尾挂 system 时也跳过去找 assistant 尾巴，system 本身留着");
+
+    // 跳过 system 之后真的以 user 结尾，一个字不动
+    const 尾system正常 = [
+      { role: "user", content: "在干嘛" },
+      { role: "system", content: "现在轮到你了" },
+    ];
+    const b尾system正常 = await call("gemini-3.8-flash", 尾system正常);
+    assert.deepEqual(b尾system正常.messages, 尾system正常);
+    ok("跳过 system 后以 user 结尾的数组一个字不改");
   } finally {
     globalThis.fetch = real;
   }
