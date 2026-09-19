@@ -295,7 +295,13 @@ function categoryTag(entry) {
   const cats = entry?.categories ?? [];
   if (cats.includes("chat")) return "";
   // MODEL_CATEGORIES 的中文名，client/src/labels.js:CATEGORY_LABELS 有一份镜像
-  const names = { vision: "识图", audio: "听音", image: "生图", embedding: "向量" };
+  const names = {
+    vision: "识图",
+    audio: "听音",
+    video: "看视频",
+    image: "生图",
+    embedding: "向量",
+  };
   const tag = cats.map((c) => names[c] ?? c).join("/");
   return tag ? `（仅${tag}）` : "（未分类）";
 }

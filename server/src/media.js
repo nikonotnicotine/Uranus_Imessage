@@ -1417,8 +1417,13 @@ async function parseImageResponse(data, raw, scope) {
  *   文生图  POST {base}/images/generations，JSON
  *   图生图  POST {base}/images/edits，multipart/form-data（参考图当文件传上去）
  *
- * 都**不传 size** —— 各家默认尺寸不一样，写死一个很容易撞上「这个模型不支持
- * 1024x1024」然后整个请求 400。让上游用自己的默认值。
+ * 比例**默认一个字都不传** —— 各家默认尺寸不一样，写死一个很容易撞上「这个
+ * 模型不支持 1024x1024」然后整个请求 400。所以除非用户在那个模型上明确选了
+ * 一档（config.js:IMAGE_RATIOS），否则让上游用自己的默认值，行为和以前一样。
+ *
+ * 选了的话 `size` 和 `aspect_ratio` **两个一起发**：OpenAI 那套认前者（像素串），
+ * Imagen 那套认后者（比例串），没有一个字段是通用的。多发一个不认识的字段，
+ * 中转站的处理是忽略 —— 和 negative_prompt 同一个赌法。
  *
  * 正面提示词拼在画面描述**前面**（它多半是「masterpiece, best quality」这类
  * 风格词，放前面权重更高）；负面提示词走 negative_prompt 字段 —— 这不是
@@ -1446,6 +1451,8 @@ export async function generateImage(endpoint, req, scope = "生图") {
   const refFile = req?.refFile || null;
   const auth = key ? { Authorization: `Bearer ${key}` } : {};
   const startedAt = Date.now();
+  // 用户没选比例时是 null，下面两条路都据此整个跳过，一个字段都不加
+  const ratio = endpoint?.ratio ?? null;
 
   let res;
   try {
@@ -1457,6 +1464,10 @@ export async function generateImage(endpoint, req, scope = "生图") {
       form.append("n", "1");
       form.append("response_format", "b64_json");
       if (negative) form.append("negative_prompt", negative);
+      if (ratio) {
+        form.append("size", ratio.size);
+        form.append("aspect_ratio", ratio.key);
+      }
       const bytes = await fs.promises.readFile(refFile);
       const ext = path.extname(refFile).toLowerCase();
       form.append(
@@ -1483,6 +1494,7 @@ export async function generateImage(endpoint, req, scope = "生图") {
           n: 1,
           response_format: "b64_json",
           ...(negative ? { negative_prompt: negative } : {}),
+          ...(ratio ? { size: ratio.size, aspect_ratio: ratio.key } : {}),
         }),
         ...(await proxyFor("llm")),
       });
@@ -1508,7 +1520,8 @@ export async function generateImage(endpoint, req, scope = "生图") {
   logInfo(
     scope,
     `${endpoint?.label ?? model} 出图成功，${Math.round(buffer.length / 1024)}KB ${ext}，` +
-      `耗时 ${ms}ms${refFile ? `（参考图 ${path.basename(refFile)}）` : ""}`
+      `耗时 ${ms}ms${ratio ? `（要的是 ${ratio.key}）` : ""}` +
+      `${refFile ? `（参考图 ${path.basename(refFile)}）` : ""}`
   );
   return { buffer, mimeType, ext, ms };
 }

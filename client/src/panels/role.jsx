@@ -4234,6 +4234,7 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
   const fb = role.fallbackModel ?? {};
   const vis = role.visionModel ?? {};
   const aud = role.audioModel ?? {};
+  const vid = role.videoModel ?? {};
   const doc = role.fileRead ?? {};
 
   /*
@@ -4249,6 +4250,7 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
     fb.enabled && "副 API",
     vis.enabled && "识图",
     aud.enabled && "听音",
+    vid.enabled && "看视频",
     doc.enabled !== false && "读文件",
   ]
     .filter(Boolean)
@@ -4545,9 +4547,63 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
             </div>
 
             {/*
-              * 读文件。摆在识图 / 听音后面是因为是同一类事（把附件变成模型看得懂的
-              * 东西），但它**不打模型**：解压 docx、抽 pdf 的文本流全是本地计算，
-              * 不花钱，所以默认开、也没有「模型」那一栏
+              * 看视频 API。挨着听音放，因为走的是**同一条** Gemini 原生接口、
+              * 同一个请求形状，只有 mime 不同。
+              *
+              * 但两个提示写得不一样，因为用户要当心的事不一样：听音那边的坑是
+              * 「非 Gemini 的模型听不到」，看视频这边还多一条「中转站可能吃不下」——
+              * 实测五家里有一家网关连 12MB 都直接 413，而它听语音是好的。所以这里
+              * 的提示里要写清 20MB 那道闸和「先去连接面板试一下」。
+              */}
+            <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
+              <label className="flex items-start justify-between gap-4">
+                <span className="min-w-0">
+                  <span className="block text-ui text-ink">视频识别 API</span>
+                  <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                    对方发视频时先让它看一遍（画面、动作、里面的说话声），再把描述交给聊天模型。
+                  </span>
+                </span>
+                <Switch
+                  checked={Boolean(vid.enabled)}
+                  onChange={(v) => patch({ videoModel: { ...vid, enabled: v } })}
+                  label="启用视频识别"
+                />
+              </label>
+              {vid.enabled && (
+                <>
+                  <Field
+                    label="模型"
+                    hint="标了「看视频」分类的才会出现在这里。和听音同一条 Gemini 原生接口，只有 Gemini 系的模型看得到"
+                  >
+                    <ModelSelect
+                      category="video"
+                      value={vid}
+                      onChange={(ref) => patch({ videoModel: { ...vid, ...ref } })}
+                    />
+                  </Field>
+                  <NumberField
+                    label="单轮最多识别"
+                    value={vid.maxClips ?? 1}
+                    min={1}
+                    max={5}
+                    step={1}
+                    onChange={(v) => patch({ videoModel: { ...vid, maxClips: v } })}
+                    hint="一轮里连发好几段视频时只看前 N 段。一段视频的用量比一条语音大一个量级，上传本身也要几十秒，所以默认只看 1 段"
+                    suffix="段"
+                  />
+                  <p className="text-meta leading-relaxed text-ink-faint">
+                    超过 20MB 的视频不会下载，只会告诉角色「对方发了段视频但你看不到」。
+                    体积上限卡在这里是因为中转站那层拒不拒跟家数强相关 ——
+                    实测有的网关连 12MB 都直接拒。先去「连接」面板用「试一下」传一段看看这家行不行。
+                  </p>
+                </>
+              )}
+            </div>
+
+            {/*
+              * 读文件。摆在识图 / 听音 / 看视频后面是因为是同一类事（把附件变成
+              * 模型看得懂的东西），但它**不打模型**：解压 docx、抽 pdf 的文本流
+              * 全是本地计算，不花钱，所以默认开、也没有「模型」那一栏
               */}
             <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
               <label className="flex items-start justify-between gap-4">

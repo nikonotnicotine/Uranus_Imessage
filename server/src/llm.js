@@ -16,7 +16,7 @@
  */
 
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
-import { DEFAULT_AUDIO_PROMPT, DEFAULT_VISION_PROMPT } from "./config.js";
+import { DEFAULT_AUDIO_PROMPT, DEFAULT_VIDEO_PROMPT, DEFAULT_VISION_PROMPT } from "./config.js";
 import { proxyFor } from "./proxy.js";
 
 const REQUEST_TIMEOUT = 60000;
@@ -1295,42 +1295,53 @@ function geminiNativeUrl(url, model) {
 }
 
 /**
- * 让多模态模型听一段音频，返回一段文字。
+ * 把一段媒体（音频 / 视频）连同提示词打 Gemini 原生的 generateContent。
  *
  * **这是这个文件里唯一不打 OpenAI 兼容接口的聊天类请求**，所以没复用
  * chatCompletion，理由是实测出来的：OpenAI 那个
  * `{type:"input_audio", input_audio:{data, format}}` 字段，三家中转站
  * 没有一家往上游透传 —— 模型收到的是一条没有音频的空消息，然后开始编。
  * 换成 Gemini 原生的 `inline_data` 打 `:generateContent` 就全通了。
+ * 视频同理，而且实测过五家中转站都能真的读到画面（见下面 describeVideo）。
  *
  * 除了请求形状，别的都和这个文件里其他函数一样：同一批服务商源、同一套
  * 密钥轮换（endpoint 由 config.js:resolveEndpoint 解析好传进来）、同一套
  * 重试规则、同一套错误摘要。
  *
- * @param {object} endpoint 听音模型的 endpoint（url / key / model / label）
- * @param {string} prompt 听音提示词，空则用 DEFAULT_AUDIO_PROMPT
- * @param {{base64:string, mimeType:string, name?:string, seconds?:number}} audio
+ * ── 为什么音频和视频共用这一个函数 ──
+ *
+ * 两条路的请求体**逐字段完全一样**，只有 `mime_type` 和默认提示词不同。
+ * 各写一份的话下次改重试规则、改错误归因、改空回复的处理就要改两处，
+ * 而漏改的那一处只会在真出错时才暴露 —— 那时候在意的人正在等回复。
+ *
+ * @param {object} endpoint 模型的 endpoint（url / key / model / label）
+ * @param {string} prompt 提示词，空则用 kind.defaultPrompt
+ * @param {{base64:string, mimeType:string, name?:string, seconds?:number}} media
+ * @param {{what:string, noun:string, defaultPrompt:string, fallbackMime:string}} kind
+ *   what 进日志和错误文案（「听音」/「看视频」）、noun 是东西名（「音频」/「视频」）
  * @returns {Promise<string>} 转写/描述文本
  * @throws {Error} 识别失败
  */
-export async function transcribeAudio(endpoint, prompt, audio) {
-  const label = endpoint?.label ? `听音 API（${endpoint.label}）` : "听音 API";
+async function inlineMedia(endpoint, prompt, media, kind) {
+  const label = endpoint?.label ? `${kind.what} API（${endpoint.label}）` : `${kind.what} API`;
   const base = trimBase(endpoint?.url);
   const key = endpoint?.key ?? "";
   const model = endpoint?.model ?? "";
 
-  // 前三条是配置没填全（Uranus 侧的事），第四条是这边把音频取坏了，都别推给服务商
+  // 前三条是配置没填全（Uranus 侧的事），第四条是这边把字节取坏了，都别推给服务商
   if (!base) throw faultKind(new Error(`${label} 没填接口地址`), "config");
   if (!key) throw faultKind(new Error(`${label} 没填密钥`), "config");
   if (!model) throw faultKind(new Error(`${label} 没填模型名`), "config");
-  if (!audio?.base64) throw faultKind(new Error(`${label} 拿到的是一段空音频`), "config");
+  if (!media?.base64) {
+    throw faultKind(new Error(`${label} 拿到的是一段空${kind.noun}`), "config");
+  }
 
-  const usePrompt = String(prompt ?? "").trim() || DEFAULT_AUDIO_PROMPT;
-  const mimeType = audio.mimeType || "audio/mpeg";
+  const usePrompt = String(prompt ?? "").trim() || kind.defaultPrompt;
+  const mimeType = media.mimeType || kind.fallbackMime;
   const url = geminiNativeUrl(base, model);
 
   /*
-   * parts 的顺序：音频在前、提示词在后。
+   * parts 的顺序：媒体在前、提示词在后。
    *
    * 官方文档的例子就是这个顺序，参考插件也是。反过来放不会报错，但
    * 「先听完再看要求」比「先看要求再听」更贴近模型的注意力实现。
@@ -1340,7 +1351,7 @@ export async function transcribeAudio(endpoint, prompt, audio) {
       {
         role: "user",
         parts: [
-          { inline_data: { mime_type: mimeType, data: audio.base64 } },
+          { inline_data: { mime_type: mimeType, data: media.base64 } },
           { text: usePrompt },
         ],
       },
@@ -1351,11 +1362,11 @@ export async function transcribeAudio(endpoint, prompt, audio) {
     ? { "Content-Type": "application/json", "x-goog-api-key": key }
     : { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
 
-  const kb = Math.round((audio.base64.length * 3) / 4 / 1024);
+  const kb = Math.round((media.base64.length * 3) / 4 / 1024);
   logDebug(
-    "听音",
-    `开始识别语音${audio.name ? `「${audio.name}」` : ""}（约 ${kb}KB, ${mimeType}${
-      audio.seconds ? `, ${audio.seconds.toFixed(1)}s` : ""
+    kind.what,
+    `开始识别${kind.noun}${media.name ? `「${media.name}」` : ""}（约 ${kb}KB, ${mimeType}${
+      media.seconds ? `, ${media.seconds.toFixed(1)}s` : ""
     }）`,
     `POST ${url}`
   );
@@ -1366,7 +1377,8 @@ export async function transcribeAudio(endpoint, prompt, audio) {
   for (let attempt = 0; ; attempt += 1) {
     const retryIn = delays[attempt];
     try {
-      // 音频体积和图片一个量级（甚至更大），超时跟着识图一起放宽
+      // 音频体积和图片一个量级（甚至更大），超时跟着识图一起放宽。
+      // 视频更慢 —— 实测 19MB 在某家中转站要 69 秒，所以这个超时不能缩
       result = await requestJson(url, { body, headers, timeout: VISION_TIMEOUT });
     } catch (e) {
       const why = describeNetworkError(e);
@@ -1386,12 +1398,12 @@ export async function transcribeAudio(endpoint, prompt, audio) {
       await wait(retryIn);
       continue;
     }
-    // 请求体里绝大部分是 base64 音频，原样记进日志没意义也没法看，
+    // 请求体里绝大部分是 base64 字节，原样记进日志没意义也没法看，
     // 所以这里不走 logUpstreamFailure（它是照 OpenAI 的 messages 结构写的）
     logWarn(
       label,
       `上游返回 ${result.status}，完整响应体如下`,
-      `请求：${model}，音频 ${kb}KB / ${mimeType}\n响应：${result.text || "（空响应体）"}`
+      `请求：${model}，${kind.noun} ${kb}KB / ${mimeType}\n响应：${result.text || "（空响应体）"}`
     );
     throw faultKind(
       new Error(`${label} ${why}`),
@@ -1436,12 +1448,60 @@ export async function transcribeAudio(endpoint, prompt, audio) {
 
   const usage = result.data?.usageMetadata;
   logDebug(
-    "听音",
+    kind.what,
     `${model} 回了 ${text.length} 字，耗时 ${ms}ms`,
     usage ? `token 用量：${JSON.stringify(usage)}` : undefined
   );
 
   return text;
+}
+
+/**
+ * 让多模态模型听一段音频，返回一段文字。请求形状见 inlineMedia。
+ *
+ * @param {object} endpoint 听音模型的 endpoint（url / key / model / label）
+ * @param {string} prompt 听音提示词，空则用 DEFAULT_AUDIO_PROMPT
+ * @param {{base64:string, mimeType:string, name?:string, seconds?:number}} audio
+ * @returns {Promise<string>} 转写/描述文本
+ */
+export async function transcribeAudio(endpoint, prompt, audio) {
+  return inlineMedia(endpoint, prompt, audio, {
+    what: "听音",
+    noun: "音频",
+    defaultPrompt: DEFAULT_AUDIO_PROMPT,
+    fallbackMime: "audio/mpeg",
+  });
+}
+
+/**
+ * 让多模态模型看一段视频，返回一段文字。请求形状见 inlineMedia。
+ *
+ * ── 这条路是实测验过的，不是照文档抄的 ──
+ *
+ * 用一段刻意设计成「答案没法猜」的测试视频（画面上写着 CAT 42、一个绿方块
+ * 从左匀速移到右）问过用户那五家中转站：文字、颜色、**移动方向**三样全对，
+ * 而方向这件事只看一帧是答不出来的。中途还反过来验过一次 —— 第一版测试视频
+ * 我的 ffmpeg 命令写错了、方块压根没画上去，五家**一致说「没有方块、画面
+ * 静止」**，没有一家顺着提问编一个出来。所以画面是真读进去了。
+ *
+ * ── 但体积卡得很死 ──
+ *
+ * 同一批实测：12MB 有一家（网关那层）直接 413；52MB 五家里两家 413。所以
+ * 上游能不能吃下来跟中转站强相关，调用方必须先过 MAX_VIDEO_BYTES 那道闸
+ * （见 imessage.js:readVideo），别指望这里能兜。
+ *
+ * @param {object} endpoint 看视频模型的 endpoint（url / key / model / label）
+ * @param {string} prompt 提示词，空则用 DEFAULT_VIDEO_PROMPT
+ * @param {{base64:string, mimeType:string, name?:string, seconds?:number}} video
+ * @returns {Promise<string>} 画面描述
+ */
+export async function describeVideo(endpoint, prompt, video) {
+  return inlineMedia(endpoint, prompt, video, {
+    what: "看视频",
+    noun: "视频",
+    defaultPrompt: DEFAULT_VIDEO_PROMPT,
+    fallbackMime: "video/mp4",
+  });
 }
 
 /**

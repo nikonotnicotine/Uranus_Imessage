@@ -67,6 +67,22 @@ export const DEFAULT_AUDIO_PROMPT_RICH =
   "不要回答用户，不要对上述内容做任何解释，严格按格式输出。";
 
 /**
+ * 看视频的默认提示词。
+ *
+ * 比识图那句长，因为视频多了一个维度：**发生了什么**。只说「描述画面」的话
+ * 模型容易只写第一帧看到的东西，等于白花一次视频调用。
+ *
+ * 结尾同样硬加了「禁止推测」——理由和听音那两段一样（见上面的注释），而且
+ * 视频更容易触发：中转站要是把视频吞了没传上去，模型手里只有文件名，
+ * 光凭「IMG_1234.mov」它也能编出一段像样的描述来。
+ */
+export const DEFAULT_VIDEO_PROMPT =
+  "请用中文描述这段视频：画面里有什么、发生了什么（动作和先后顺序）、" +
+  "出现过的文字、以及整体氛围。如果有人说话，把话的大意也写进去。\n" +
+  "只输出描述本身，不要加「这段视频」之类的开场白，控制在 200 字以内。\n" +
+  "只写你确实看到和听到的内容，看不清就直说看不清，禁止凭空推测或补全。";
+
+/**
  * 主动消息的默认提示词（以系统身份直接发给模型的那条 user 消息）。
  * 留空 = 还原成这句，和记忆库那几段一个规矩（见 normalizeProactive）。
  */
@@ -237,10 +253,46 @@ const LEGACY_DEFAULT_SYSTEM =
  * 所以它不走 chatCompletion，单开一条请求路径（见 llm.js:transcribeAudio）。
  * 但**服务商源和密钥轮换照旧共用**，理由和 embedding 一样。
  *
+ * `video` 是看视频，和 audio 是同一条原生路径、同一个请求形状
+ * （llm.js:inlineMedia 两边共用）。**没有和 audio 合成一个分类**，因为
+ * 「这个模型听得到声音」和「这个模型吃得下几十 MB 的视频」是两件事：实测
+ * 五家中转站里有一家网关连 12MB 都直接 413，而它听语音是好的。合成一类的话
+ * 用户只能靠试出来，分开就能各挂各的。
+ *
  * 这张表在 `client/src/labels.js:MODEL_CATEGORIES` 和
  * `server/src/commands.js:categoryTag` 各有一份镜像，加分类要三处一起改。
  */
-export const MODEL_CATEGORIES = ["chat", "vision", "image", "embedding", "audio"];
+export const MODEL_CATEGORIES = ["chat", "vision", "image", "embedding", "audio", "video"];
+
+/**
+ * 出图比例能选哪几档。
+ *
+ * ── 为什么一档里要带两个值 ──
+ *
+ * 各家认的字段不是一个：OpenAI 那套（DALL·E、以及绝大多数中转站的兼容层）认
+ * `size`，值是像素串 `1024x1024`；Google Imagen、以及不少国产模型认
+ * `aspect_ratio`，值是 `16:9` 这种比例串。**两个都发**，不认的那个会被忽略 ——
+ * 和 `negative_prompt` 同一个赌法（见 media.js:generateImage 的注释）。
+ *
+ * ── 为什么默认是「不选」──
+ *
+ * generateImage 原本刻意一个尺寸都不传，理由写在那个文件里：各家默认尺寸不
+ * 一样，写死一个很容易撞上「这个模型不支持 1024x1024」然后整个请求 400。
+ * 这条理由现在仍然成立，所以默认那一档（`""`）保持原样不传，**用户选了才传**。
+ * 也就是说这个功能只可能让事情变好或者保持原样，不会让原来能出图的配置变不能。
+ *
+ * 像素值都取 1024 一边、另一边按比例凑到 64 的整数倍 —— 各家对宽高的约束
+ * 基本都是「64 整除」，凑不齐的值有些模型会直接拒。
+ *
+ * 这张表在 `client/src/labels.js:IMAGE_RATIOS` 有一份镜像，加档位两处一起改。
+ */
+export const IMAGE_RATIOS = [
+  { key: "1:1", size: "1024x1024", label: "正方形 1:1" },
+  { key: "3:4", size: "768x1024", label: "竖图 3:4" },
+  { key: "4:3", size: "1024x768", label: "横图 4:3" },
+  { key: "9:16", size: "576x1024", label: "竖屏 9:16" },
+  { key: "16:9", size: "1024x576", label: "宽屏 16:9" },
+];
 
 /**
  * 提示词里能用的变量。
@@ -463,6 +515,10 @@ export const DEFAULT_CONFIG = {
         maxClips: 2,
         emotion: false,
       },
+      // 看视频：把对方发来的视频转成一段描述再喂给聊天模型。也默认关 ——
+      // 一段十几 MB 的视频上传要几十秒、按 token 算也比图片贵得多，
+      // 而且不是每家中转站都吃得下（实测有一家网关 12MB 就 413）
+      videoModel: { enabled: false, provider: "", modelId: "", maxClips: 1 },
       // 读文件：对方发来 txt / md / json / docx / pdf 时把正文读出来当文字给模型。
       // 只是解压和抽文本，不打模型也不花钱，所以和识图一样默认开。
       // maxChars 是单个文件最多读多少字，超了截断并在末尾说一句
@@ -657,9 +713,15 @@ function normalizeModelEntry(input, id) {
     // 听音提示词。留空 = 按角色的「情绪识别」开关在两套内置提示词里挑
     // （DEFAULT_AUDIO_PROMPT / DEFAULT_AUDIO_PROMPT_RICH）
     audioPrompt: str(input?.audioPrompt),
+    // 看视频提示词。留空 = 用 DEFAULT_VIDEO_PROMPT（只有一套，没有情绪开关那种分叉）
+    videoPrompt: str(input?.videoPrompt),
     // 生图的正/负面提示词，拼在画面描述前后。只对 image 分类的模型有意义
     imagePrompt: str(input?.imagePrompt),
     negativePrompt: str(input?.negativePrompt),
+    // 出图比例。空串 = 不传，让上游用自己的默认值（见 media.js:generateImage）
+    imageRatio: IMAGE_RATIOS.some((r) => r.key === input?.imageRatio)
+      ? input.imageRatio
+      : "",
   };
 }
 
@@ -779,6 +841,8 @@ export function resolveImageEndpoint(config) {
         // 拼在用户/模型给的画面描述前面
         positivePrompt: str(entry.imagePrompt).trim(),
         negativePrompt: str(entry.negativePrompt).trim(),
+        // 空串 = 不传尺寸。整档带出去，media.js 那边要 size 和 aspect_ratio 两个值
+        ratio: IMAGE_RATIOS.find((r) => r.key === entry.imageRatio) ?? null,
       };
     }
   }
@@ -794,6 +858,8 @@ export function resolveRoleEndpoints(config, role) {
   const visionEntry = vision?.enabled ? findModel(config, vision) : null;
   const audio = role?.audioModel;
   const audioEntry = audio?.enabled ? findModel(config, audio) : null;
+  const video = role?.videoModel;
+  const videoEntry = video?.enabled ? findModel(config, video) : null;
   return {
     chat: resolveEndpoint(config, role?.chatModel),
     fallback: role?.fallbackModel?.enabled
@@ -809,6 +875,10 @@ export function resolveRoleEndpoints(config, role) {
       audioEntry?.audioPrompt?.trim() ||
       (audio?.emotion ? DEFAULT_AUDIO_PROMPT_RICH : DEFAULT_AUDIO_PROMPT),
     maxClips: clampInt(audio?.maxClips, 2, 1, 10),
+    // 看视频。只有一套内置提示词，所以没有听音那种「按开关挑」的分叉
+    video: video?.enabled ? resolveEndpoint(config, video) : null,
+    videoPrompt: videoEntry?.videoPrompt?.trim() || DEFAULT_VIDEO_PROMPT,
+    maxVideos: clampInt(video?.maxClips, 1, 1, 5),
     // 读文件：单个文件最多读多少字。开关由调用方自己看 role.fileRead.enabled，
     // 这里只把上限钳一下（读文件不经过任何 endpoint，所以没有对应的 resolve）
     maxDocChars: clampInt(role?.fileRead?.maxChars, 2000, 100, 20000),
@@ -934,6 +1004,7 @@ function normalizeRole(input, id, legacy) {
   const fb = normalizeModelRef(input?.fallbackModel, legacy?.fallbackRef);
   const vision = normalizeModelRef(input?.visionModel, legacy?.visionRef);
   const audio = normalizeModelRef(input?.audioModel, null);
+  const video = normalizeModelRef(input?.videoModel, null);
 
   return {
     id,
@@ -975,6 +1046,18 @@ function normalizeRole(input, id, legacy) {
       enabled: Boolean(input?.audioModel?.enabled),
       maxClips: clampInt(input?.audioModel?.maxClips, 2, 1, 10),
       emotion: Boolean(input?.audioModel?.emotion),
+    },
+    /*
+     * 看视频。同样没有 legacy 分支，同样默认**关**。
+     *
+     * 上限默认 1 而不是 2（听音那个是 2）：一段视频的 token 量比一条语音大
+     * 一个量级，而且上传本身要几十秒。一轮里真发来两段的话默认只看第一段，
+     * 想看全的自己往上调。
+     */
+    videoModel: {
+      ...video,
+      enabled: Boolean(input?.videoModel?.enabled),
+      maxClips: clampInt(input?.videoModel?.maxClips, 1, 1, 5),
     },
     /*
      * 读文件。默认**开** —— 解压和抽文本都是本地计算，不打模型也不花钱，

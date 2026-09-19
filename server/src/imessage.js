@@ -3,7 +3,13 @@ import { cardHintFor, isCardUrl, mapsUrlFor, renderMapsLinks } from "./card.js";
 import { watchChatBackground } from "./chatbg.js";
 import { normalizeForHistory, splitBubbles, sleep } from "./delay.js";
 import { checkLineRegistered, watchDelivery } from "./delivery.js";
-import { chatWithFallback, describeImage, faultAdvice, transcribeAudio } from "./llm.js";
+import {
+  chatWithFallback,
+  describeImage,
+  describeVideo,
+  faultAdvice,
+  transcribeAudio,
+} from "./llm.js";
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import {
   projectLabel,
@@ -20,6 +26,7 @@ import { buildEnv } from "./env.js";
 import { pickEmoji } from "./emoji.js";
 import { isDocAttachment, readDocument } from "./docread.js";
 import { notePrompt } from "./lastprompt.js";
+import { renderLinks } from "./linkmeta.js";
 import { igComposeNote, igRouteFor, publishIgTags, publishLines, tickIgQueue } from "./igrun.js";
 import { splitIg, stripIgTags } from "./igtags.js";
 import {
@@ -99,8 +106,22 @@ import { parseSearchQueries, runSearch, stripSearchTags } from "./websearch.js";
  * 对外暴露 syncBridges() / stopBridge() / stopAllBridges() / getStatus()。
  */
 
-/** 单张图最大 8MB —— 再大 base64 之后请求体会顶到中转站的上限。 */
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+/**
+ * 单张图最大 20MB。
+ *
+ * **原来是 8MB，实机撞出来的**：`图片 9.8MB，超过 8MB 上限`。iPhone 随手一张
+ * 就能过 8MB（实况照片、48MP 原图、HEIC 转出来的 JPEG），所以那道闸不是在防
+ * 异常情况，是在拒正常照片。
+ *
+ * 当初写 8MB 的理由是「再大 base64 之后请求体会顶到中转站的上限」—— 那句话
+ * 把两条路搞混了。12mb 那个限制是 **express 的 body-parser**，管的是浏览器往
+ * 后端传（试图那个按钮）；对方发来的图是**后端直接往中转站发**，压根不经过
+ * body-parser。这条路上没有 12mb 这道闸。
+ *
+ * 20MB 是照着这个文件里另外两道闸对齐的（语音、视频），而且 `spy.js` 和
+ * `spyphone.js` 收图早就是 20MB —— 同一个仓库里同一件事只有这里卡在 8。
+ */
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 /**
  * 单条语音最大 20MB。
@@ -110,6 +131,27 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
  * 真正上传给模型的是转码后的字节，所以这道闸放宽一点不会撑爆请求体。
  */
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 单段视频最大 20MB，**这是实测定出来的，不是随手取的整数**。
+ *
+ * 拿三档体积（12 / 19 / 52MB）问过用户那五家中转站：12MB 四家过一家 413，
+ * 19MB 同样四家过，52MB 只有两家过。19MB 那档是「绝大多数能过」和
+ * 「一半会被拒」的分界，所以闸设在 20MB。
+ *
+ * 另外两个理由：
+ *
+ *  - **时延**。19MB 在最慢那家要 69 秒（52MB 在能过的那家要 113 秒）。对方在
+ *    iMessage 那头看着「已读」等回复，一分多钟已经是极限了；再放宽只会让
+ *    等待变成分钟级。
+ *  - **内存**。base64 会把字节撑成 4/3，20MB 的视频进请求体是 27MB 的字符串，
+ *    加上原始 Buffer 本身，一段视频的峰值就是 47MB 上下。几条会话同时来的话
+ *    这个数字是要乘的，所以不能按「最大那家能吃多少」来定。
+ *
+ * 超了**不下载**（见 readVideo：先看 SDK 给的 size 字段），也就是说超大的视频
+ * 一个字节都不会进内存。
+ */
+const MAX_VIDEO_BYTES = 20 * 1024 * 1024;
 
 const SEEN_MAX = 2000;
 
@@ -243,6 +285,7 @@ function createRunner(projectRefId) {
     messageCount: 0,
     imageCount: 0,
     audioCount: 0,
+    videoCount: 0,
     fingerprint: "", // 凭据/模式指纹，变了才需要重连
     // 云端模式的项目凭据。存一份在 runner 上是为了投递检测（delivery.js）——
     // 它挂在 noteSent 里，而那条路上只有 runner 和 ctx，够不到 project。
@@ -488,6 +531,7 @@ export function getStatus() {
       messageCount: runner.messageCount,
       imageCount: runner.imageCount,
       audioCount: runner.audioCount,
+      videoCount: runner.videoCount,
     });
   }
   const summary = {
@@ -496,6 +540,7 @@ export function getStatus() {
     messageCount: projects.reduce((n, p) => n + p.messageCount, 0),
     imageCount: projects.reduce((n, p) => n + p.imageCount, 0),
     audioCount: projects.reduce((n, p) => n + p.audioCount, 0),
+    videoCount: projects.reduce((n, p) => n + (p.videoCount ?? 0), 0),
   };
   return { projects, summary };
 }
@@ -548,6 +593,30 @@ function isAudioAttachment(content) {
     content?.type === "attachment" &&
     typeof content.mimeType === "string" &&
     content.mimeType.startsWith("audio/")
+  );
+}
+
+/**
+ * 判断一条 attachment 内容是不是视频。
+ *
+ * SDK 里**没有** `type:"video"` 这种东西（翻过 core 的 contentSchema，音频有
+ * 独立的 `voice`，视频没有对应物），所以视频就是一条普通 attachment，只能靠
+ * mime 前缀认。这也是它以前被静默丢掉的原因：过不了图片、语音、文件三个
+ * 分类器，就一路掉到「都不是就跳过」，控制台只留一行「忽略一条 attachment
+ * 类型的消息」—— 对方发了段视频，模型完全不知道。和卡片当初那个洞一样。
+ *
+ * 和 isAudioAttachment 一样只看前缀不列白名单：iPhone 拍的是 `video/quicktime`
+ * （.mov），转发过来的可能是 `video/mp4`，Android 那边来的还可能是 `video/3gpp`。
+ * 认错了的代价只是白传一次，漏掉的代价是角色答得像什么都没收到。
+ *
+ * **必须排在 isDocAttachment 之前挑走**：docread 那边对没有后缀的附件会看
+ * mimeType 兜底，虽然它兜的三种里没有 video/*，但顺序摆对了就不用依赖那个细节。
+ */
+function isVideoAttachment(content) {
+  return (
+    content?.type === "attachment" &&
+    typeof content.mimeType === "string" &&
+    content.mimeType.startsWith("video/")
   );
 }
 
@@ -770,12 +839,19 @@ function handleUserUnsend(getConfig, runner, space, spaceId, message, peer) {
  * SDK 的 read() 是懒加载的（云端要回源下载），所以这里才是真正拿字节的地方。
  */
 async function readImage(content, scope = "桥接") {
+  const mb = (n) => (n / 1024 / 1024).toFixed(1);
+  const cap = MAX_IMAGE_BYTES / 1024 / 1024;
+
+  // 和视频一样先问 SDK 报的大小：超了压根不下载（size 是可选字段，没有就跳过这步）
+  const claimed = Number(content?.size ?? 0);
+  if (claimed > MAX_IMAGE_BYTES) {
+    throw new Error(`图片 ${mb(claimed)}MB，超过 ${cap}MB 上限（没有下载）`);
+  }
+
   const buf = await readBytes(content, scope, "图片");
   if (!buf?.length) throw new Error("附件读出来是空的");
   if (buf.length > MAX_IMAGE_BYTES) {
-    throw new Error(
-      `图片 ${(buf.length / 1024 / 1024).toFixed(1)}MB，超过 ${MAX_IMAGE_BYTES / 1024 / 1024}MB 上限`
-    );
+    throw new Error(`图片 ${mb(buf.length)}MB，超过 ${cap}MB 上限`);
   }
   return {
     base64: buf.toString("base64"),
@@ -821,6 +897,66 @@ async function readAudio(content, scope) {
     // 当文件发来的音频没这个字段，退回 ffmpeg 那个
     seconds: typeof content.duration === "number" ? content.duration : out.duration,
   };
+}
+
+/**
+ * 把视频附件读成 base64，**带一个撒手用的 release()**。
+ *
+ * ── 为什么这条路要单独管内存 ──
+ *
+ * 图片 8MB、语音转完码只剩几百 KB，都小到可以放着不管。视频是 20MB 起步，
+ * base64 之后 27MB，而它在队列里要躺满 queueWait 秒、再跟着 handleTurn 走完
+ * 整轮（打模型、发气泡、写存档），真正「用到」它的只有中间那一次上传。
+ * 不撒手的话这 27MB 会一直挂在那条会话的处理链上，几条会话同时来就是要乘的。
+ *
+ * 所以返回的对象上挂了个 `release()`：describeVideos 识别完 / 报错之后立刻调，
+ * 把 base64 置空让 GC 收走（见那个函数里的 finally）。
+ *
+ * ── 超限的不下载 ──
+ *
+ * SDK 的 attachment 上有个可选的 `size`，先看它 —— 有值就能在**一个字节都没
+ * 下载之前**判出「太大了」。拿不到（chunked、或者提供方没填）才退回「读完再量
+ * 一次」。两段式和 spy.js 那边看 Content-Length 是同一个套路。
+ *
+ * 不转码压缩：`ffmpeg -crf` 把一段 50MB 的视频压到 20MB 以内要几十秒 CPU，
+ * 而上传本身已经要几十秒了，再叠上去对方那头就是分钟级的静默。真需要的话
+ * 这里是加它的地方（media.js:toMp3ForStt 有现成的临时目录 + 收尾模式可抄）。
+ */
+async function readVideo(content, scope) {
+  const name = String(content?.name ?? "").trim();
+  const mb = (n) => (n / 1024 / 1024).toFixed(1);
+  const cap = MAX_VIDEO_BYTES / 1024 / 1024;
+
+  // 先问 SDK 报的大小：超了就压根不下载，那 20MB 一个字节都不进内存
+  const claimed = Number(content?.size ?? 0);
+  if (claimed > MAX_VIDEO_BYTES) {
+    throw new Error(`视频 ${mb(claimed)}MB，超过 ${cap}MB 上限（没有下载）`);
+  }
+
+  const buf = await readBytes(content, scope, "视频");
+  if (!buf?.length) throw new Error("附件读出来是空的");
+  // size 是可选字段，没有的话只能读完再量。这时候字节已经进内存了，
+  // 但下面立刻就没有引用了，GC 收得掉 —— 真正要防的是 base64 那份长期驻留
+  if (buf.length > MAX_VIDEO_BYTES) {
+    throw new Error(`视频 ${mb(buf.length)}MB，超过 ${cap}MB 上限`);
+  }
+
+  logInfo(
+    scope,
+    `收到视频：${mb(buf.length)}MB，mimeType=${content.mimeType ?? "（空）"}，` +
+      `文件名=${name || "（空）"}`
+  );
+
+  const item = {
+    base64: buf.toString("base64"),
+    mimeType: content.mimeType,
+    name,
+  };
+  // 识别完就撒手，别让 27MB 跟着整轮走（理由见上面的注释）
+  item.release = () => {
+    item.base64 = "";
+  };
+  return item;
 }
 
 /**
@@ -908,13 +1044,14 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
 
   const slot =
     runner.pending.get(spaceId) ??
-    { texts: [], images: [], voices: [], timer: null, space, peer };
+    { texts: [], images: [], voices: [], videos: [], timer: null, space, peer };
   slot.space = space; // 同一会话可能拿到新的 space 实例，用最新的
   if (peer) slot.peer = peer;
   if (item?.text) slot.texts.push(item.text);
   if (item?.image) slot.images.push(item.image);
-  // 老的 slot 可能是这版代码之前建的，没有 voices 字段
+  // 老的 slot 可能是这版代码之前建的，没有 voices / videos 字段
   if (item?.voice) (slot.voices ??= []).push(item.voice);
+  if (item?.video) (slot.videos ??= []).push(item.video);
   /*
    * 留一份原始 message，发已读回执要用它（read(target) 只收 Message 对象，
    * 不收 id 字符串）。一轮里可能攒了好几条，留**最后**那条就够 ——
@@ -927,11 +1064,27 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
     if (slot.timer) clearTimeout(slot.timer);
     slot.timer = null;
     runner.pending.delete(spaceId);
-    if (runner.stopped) return; // 桥接已经停了，别再发出去
+    const videos = slot.videos ?? [];
+    if (runner.stopped) {
+      // 桥接已经停了，别再发出去。攒着的视频字节顺手放掉 —— handleTurn 不跑，
+      // describeVideos 那个 finally 就没机会执行（同 stopRunner 里那段）
+      for (const v of videos) v.release?.();
+      return;
+    }
     const merged = slot.texts.join("\n").trim();
     const voices = slot.voices ?? [];
-    // 只发了图片或语音、一个字都没打，也要处理——不能因为 merged 为空就丢掉
-    if (!merged && slot.images.length === 0 && voices.length === 0) return;
+    /*
+     * 只发了图片、语音或视频、一个字都没打，也要处理——不能因为 merged 为空就丢掉。
+     *
+     * 真要在这儿返回的话，**videos 里那几十 MB 得先撒手** —— slot 马上就从
+     * runner.pending 里删掉了，但 handleTurn 压根没跑，describeVideos 那个
+     * finally 也就没机会执行。这条路实际走不到（有视频必然有 videos.length），
+     * 写在这儿是因为下次有人往这个判断里加条件时不会想起这件事。
+     */
+    if (!merged && slot.images.length === 0 && voices.length === 0 && videos.length === 0) {
+      for (const v of videos) v.release?.();
+      return;
+    }
     chain(
       runner,
       spaceId,
@@ -939,6 +1092,7 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
         handleTurn(getConfig, runner, slot.space, spaceId, merged, slot.images, slot.peer, {
           message: slot.message,
           voices,
+          videos,
         }),
       "处理这一轮消息出错"
     );
@@ -954,7 +1108,10 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
   runner.pending.set(spaceId, slot);
   const counts =
     `${slot.texts.length} 条文本 / ${slot.images.length} 张图 / ` +
-    `${(slot.voices ?? []).length} 条语音`;
+    `${(slot.voices ?? []).length} 条语音` +
+    // 视频那一段只在真有的时候才写：绝大多数轮次没有，多一句「0 段视频」
+    // 会把这行日志撑长，而它是每轮都打的
+    ((slot.videos ?? []).length ? ` / ${slot.videos.length} 段视频` : "");
 
   /*
    * 计时器只在**开窗那一下**装，后来的消息一律不碰它 —— 这就是「以第一条为
@@ -1093,6 +1250,86 @@ async function describeVoices(endpoint, prompt, max, runner, voices) {
       : "";
   return {
     text: `[用户发来的语音]\n${parts.join("\n")}${skipped}`,
+    total: use.length,
+    failed,
+    firstError,
+  };
+}
+
+/**
+ * 把这一轮收到的视频逐段交给多模态模型看，拼成一段文字。
+ *
+ * 结构和 describeVoices 一样（单段失败不拖垮整轮、超上限的截断并说明、
+ * 没启用时给一句降级文案），打的接口见 llm.js:describeVideo。
+ *
+ * ── 多出来的那件事：撒手 ──
+ *
+ * **不管识别成没成，每一段的字节都在这儿放掉**（`finally` 里的 release）。
+ * 一段视频的 base64 是 27MB 上下，而它从这个函数返回之后就再也用不到了 ——
+ * 进历史、进存档、发给聊天模型的都只是这段描述文字。不放的话它会跟着
+ * handleTurn 剩下的全程（打模型、发气泡、写存档）一直挂着，几条会话同时来
+ * 就是要乘的。超上限没识别的那几段同样要放，它们压根没被用过。
+ */
+async function describeVideos(endpoint, prompt, max, runner, videos) {
+  const scope = scopeOf(runner, "看视频");
+  if (!videos.length) return { text: "", total: 0, failed: 0, firstError: null };
+
+  /*
+   * 没开也要撒手。
+   *
+   * 这一条是真会走到的：对方发来视频、角色没开「看视频」，字节已经被
+   * readVideo 读进内存了（那一步不看角色配置，理由见调用处的注释）。
+   * 早年漏了这个 return 里的 release，那就是「关着这个功能反而更费内存」。
+   */
+  if (!endpoint) {
+    for (const v of videos) v.release?.();
+    logInfo(
+      scope,
+      `收到 ${videos.length} 段视频，但这个角色没启用视频识别（或引用的模型已失效），已跳过`
+    );
+    return {
+      text: `（用户发了 ${videos.length} 段视频，但视频识别未启用，你看不到内容）`,
+      total: videos.length,
+      failed: 0,
+      firstError: null,
+    };
+  }
+
+  const use = videos.slice(0, max);
+  if (videos.length > use.length) {
+    logWarn(scope, `这轮收到 ${videos.length} 段视频，按上限只识别前 ${use.length} 段`);
+    // 超出上限那几段这辈子都用不到了，立刻放掉
+    for (const v of videos.slice(use.length)) v.release?.();
+  }
+
+  const parts = [];
+  let failed = 0;
+  let firstError = null;
+  for (const [i, video] of use.entries()) {
+    const label = use.length > 1 ? `视频${i + 1}` : "视频";
+    try {
+      const desc = await describeVideo(endpoint, prompt, video);
+      logInfo(scope, `${label}识别完成：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`);
+      runner.videoCount += 1;
+      parts.push(`${label}内容：${desc}`);
+    } catch (e) {
+      logError(scope, `${label}识别失败`, e);
+      parts.push(`${label}：识别失败（${String(e?.message ?? e)}）`);
+      failed += 1;
+      firstError ??= e;
+    } finally {
+      // 成了也放、崩了也放 —— 描述已经拿到手（或者永远拿不到了），
+      // 这几十 MB 没有任何理由跟着后面的流程走
+      video.release?.();
+    }
+  }
+
+  const skipped =
+    videos.length > use.length
+      ? `\n（另有 ${videos.length - use.length} 段视频未识别，超出上限）`
+      : "";
+  return {
+    text: `[用户发来的视频]\n${parts.join("\n")}${skipped}`,
     total: use.length,
     failed,
     firstError,
@@ -2221,6 +2458,7 @@ async function handleTurn(
   const scope = scopeOf(runner, "桥接");
   const isReroll = Boolean(meta.reroll);
   const voices = meta.voices ?? [];
+  const videos = meta.videos ?? [];
 
   logInfo(
     scope,
@@ -2228,11 +2466,24 @@ async function handleTurn(
       userText ? `“${userText.slice(0, 80)}${userText.length > 80 ? "…" : ""}”` : "无文本"
     }${images.length ? ` + ${images.length} 张图片` : ""}${
       voices.length ? ` + ${voices.length} 条语音` : ""
-    }`
+    }${videos.length ? ` + ${videos.length} 段视频` : ""}`
   );
+
+  /*
+   * 这一轮要是提前退了，视频的字节得撒手。
+   *
+   * describeVideos 里那个 finally 是这几十 MB 的正常归宿，但它在下面好几十行
+   * 之后 —— 中间有两处 return（没绑角色、聊天模型没配好）跳过它。不放的话
+   * 那段 base64 会跟着 meta.videos 一直挂到 GC 把整条闭环收走为止，而
+   * 「配置没填好」恰恰是会反复触发的状态：对方每发一段视频就多攒 27MB。
+   */
+  const dropVideos = () => {
+    for (const v of videos) v.release?.();
+  };
 
   // 角色被解绑/删掉了：连接还在但没人该回话，说清楚而不是拿空人设硬答
   if (!role) {
+    dropVideos();
     logWarn(scope, "这个项目当前没有绑定角色，这轮不回复");
     return;
   }
@@ -2245,6 +2496,7 @@ async function handleTurn(
 
   // 聊天模型没配好（没选、被删、被关掉）就别硬打上游 —— 说清楚哪里缺
   if (!eps.chat) {
+    dropVideos();
     const why =
       "去「角色」面板的「单独配置」里选一个聊天模型；如果原来选过，可能是那个模型被删了或被关掉了。";
     logError(scope, "这个角色的聊天 API 没配好，这轮不回复", why);
@@ -2288,6 +2540,15 @@ async function handleTurn(
     runner,
     voices
   );
+  // 视频第三条，规矩同上。识别完这个函数内部就把字节放掉了（见 describeVideos），
+  // 所以从这行往下，这一轮只剩几百字的描述在手上
+  const video = await describeVideos(
+    eps.video,
+    eps.videoPrompt,
+    eps.maxVideos,
+    runner,
+    videos
+  );
   /*
    * 正则第一路：对方发来的原话。
    *
@@ -2310,7 +2571,9 @@ async function handleTurn(
         "对方的消息"
       ).text;
 
-  const said = [cleanUserText, vision.text, voice.text].filter(Boolean).join("\n\n");
+  const said = [cleanUserText, vision.text, voice.text, video.text]
+    .filter(Boolean)
+    .join("\n\n");
   if (!said) {
     // 正则把对方的话整段吃掉、这轮又没有图也没有语音，等于没有输入可发。
     // 判的是**前缀之外**的部分 —— 环境前缀总是非空的，算进来这个分支就永远走不到
@@ -2356,32 +2619,35 @@ async function handleTurn(
   const combined = isReroll ? said : timePrefix + said;
 
   /*
-   * 一个字没打、而且这轮收到的图和语音**全都**识别失败：模型拿到的只是几行
-   * 「识别失败（…）」，硬答出来的东西必然是瞎猜的。直接把真正的原因发回去，
-   * 别让对方以为 AI 看到/听到了。
+   * 一个字没打、而且这轮收到的图 / 语音 / 视频**全都**识别失败：模型拿到的
+   * 只是几行「识别失败（…）」，硬答出来的东西必然是瞎猜的。直接把真正的原因
+   * 发回去，别让对方以为 AI 看到/听到了。
    *
-   * 判的是「全都」——有文本、或者两路里有任意一路成功了，就照常回：
+   * 判的是「全都」——有文本、或者三路里有任意一路成功了，就照常回：
    * 那半轮是有效的（发了图又发语音，图挂了但语音听清了，还是能接上话）。
+   *
+   * 三路是**按表遍历**而不是写死 `a.total + b.total`：加第四路多媒体时只要
+   * 往表里加一行，这段判断和下面那句人话都自动跟上。原来那个两路版本写的是
+   * 嵌套三目（`图 && !语音 ? … : 语音 && !图 ? … : …`），加第三路就得写六种
+   * 组合，而漏掉一种的后果是对方收到一句词不达意的道歉。
    */
-  const mediaTotal = vision.total + voice.total;
-  const mediaFailed = vision.failed + voice.failed;
+  const lanes = [
+    { r: vision, unit: (n) => `${n} 张图`, alone: "这几张图没能看清" },
+    { r: voice, unit: (n) => `${n} 条语音`, alone: "这条语音没能听清" },
+    { r: video, unit: (n) => `${n} 段视频`, alone: "这段视频没能看清" },
+  ];
+  const got = lanes.filter((l) => l.r.total > 0);
+  const mediaTotal = got.reduce((n, l) => n + l.r.total, 0);
+  const mediaFailed = got.reduce((n, l) => n + l.r.failed, 0);
   if (!cleanUserText && mediaTotal > 0 && mediaFailed === mediaTotal) {
-    const what = [
-      vision.total ? `${vision.total} 张图` : "",
-      voice.total ? `${voice.total} 条语音` : "",
-    ]
-      .filter(Boolean)
-      .join("、");
-    const why = vision.firstError ?? voice.firstError;
+    const what = got.map((l) => l.unit(l.r.total)).join("、");
+    const why = got.find((l) => l.r.firstError)?.r.firstError ?? null;
     logError(scope, `这轮 ${what}全部识别失败，不发给模型`, why);
     await notifyFailure(
       runner,
       space,
-      vision.total && !voice.total
-        ? "这几张图没能看清"
-        : voice.total && !vision.total
-          ? "这条语音没能听清"
-          : "这轮的图和语音都没能识别出来",
+      // 只有一路的时候说得具体些；好几路一起挂就报个总数，别硬凑组合句
+      got.length === 1 ? got[0].alone : `这轮的${what}都没能识别出来`,
       why
     );
     return;
@@ -4531,7 +4797,11 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             const parts = flattenContent(message.content);
             const imageParts = parts.filter(isImageAttachment);
             const audioParts = parts.filter(isAudioAttachment);
-            // txt / md / json / docx / pdf。图片和语音上面已经挑走了，
+            // 视频。SDK 里没有 type:"video"，只能靠 mime 前缀认 ——
+            // 以前这一类过不了任何分类器，一路掉到下面「都不是就跳过」，
+            // 对方发了段视频而模型完全不知道（见 isVideoAttachment）
+            const videoParts = parts.filter(isVideoAttachment);
+            // txt / md / json / docx / pdf。图片、语音、视频上面已经挑走了，
             // 剩下认得出的文件在这儿（见 docread.js:isDocAttachment）
             const docParts = parts.filter(isDocAttachment);
             /*
@@ -4575,8 +4845,14 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             });
             const userText = [cardHint, plainText].filter(Boolean).join("\n") || null;
 
-            // 文本、图片、语音、能读的文件都不是（贴纸、位置…）就跳过
-            if (!imageParts.length && !audioParts.length && !docParts.length && !userText) {
+            // 文本、图片、语音、视频、能读的文件都不是（贴纸、位置…）就跳过
+            if (
+              !imageParts.length &&
+              !audioParts.length &&
+              !videoParts.length &&
+              !docParts.length &&
+              !userText
+            ) {
               logDebug(scope, `忽略一条 ${message.content?.type ?? "未知"} 类型的消息`);
               continue;
             }
@@ -4630,6 +4906,7 @@ async function startRunner(getConfig, project, meta, retries = 0) {
               userText &&
               !imageParts.length &&
               !audioParts.length &&
+              !videoParts.length &&
               !docParts.length &&
               isCommandMessage(userText)
             ) {
@@ -4813,6 +5090,57 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             }
 
             /*
+             * 视频，同样进队列。
+             *
+             * ── 为什么不在这儿看角色开关 ──
+             *
+             * 图片和语音都是先读进来、到 handleTurn 才按 eps.vision / eps.audio
+             * 判「这个角色开没开」。视频照这个规矩走，好处是关着的时候模型也能
+             * 收到一句「对方发了段视频但你看不到」（describeVideos 的降级文案），
+             * 而不是当成什么都没发生 —— 那正是这个功能之前的毛病。
+             *
+             * 代价是关着也白读一遍字节。**这就是 describeVideos 里
+             * 「没开也要 release」那段存在的理由**：读进来的 27MB 在那一步立刻
+             * 放掉，不会因为「功能关着」反倒把内存攒起来。
+             *
+             * ── 超上限的那条错误要发给模型 ──
+             *
+             * 和读图失败那一路同一个套路（见上面那段长注释）：只记日志的话，
+             * 对方发了个 4K 视频、这边一声不响，角色答得像没收到东西。所以
+             * 把原因换成一句模型看得懂的话进队列。**话里不提「20MB」这个数字** ——
+             * 那是我们的实现细节，模型转述出来只会让对方莫名其妙；说「太长了」
+             * 才是对方能照着做的（重发个短的）。
+             */
+            let videosSent = 0;
+            for (const part of videoParts) {
+              try {
+                const video = await readVideo(part, scope);
+                logInfo(
+                  scope,
+                  `收到视频附件${video.name ? `「${video.name}」` : ""}，进队列等识别`
+                );
+                enqueue(getConfig, runner, space, spaceId, { video, message }, peer);
+                videosSent += 1;
+              } catch (e) {
+                logError(scope, "读取视频附件失败", e);
+                videosSent += 1; // 这轮确实要去打模型（下面塞了一句提示），算进去
+                enqueue(
+                  getConfig,
+                  runner,
+                  space,
+                  spaceId,
+                  {
+                    text:
+                      `[{{user}}发来一段视频，但太大或者没能加载出来，你看不到里面的内容。` +
+                      `别猜视频里是什么，就当没看清，可以让对方剪短一点再发或者说说视频里是什么。]`,
+                    message,
+                  },
+                  peer
+                );
+              }
+            }
+
+            /*
              * 文件（txt / md / json / docx / pdf）：抽出正文，当成**一条普通文本**
              * 进队列。
              *
@@ -4869,7 +5197,7 @@ async function startRunner(getConfig, project, meta, retries = 0) {
              * 攒着的背景变更和 tapback 提示就白等这一轮了。
              */
             const gotSomething = Boolean(
-              imagesSent || failedImages || voicesSent || docsSent || userText
+              imagesSent || failedImages || voicesSent || videosSent || docsSent || userText
             );
 
             /*
@@ -4916,7 +5244,20 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                * 「[reply:…]/del」这种引用着发的指令认不出来。
                */
               const quoted = quotedTextOf(message);
-              const text = quoted ? `[reply:${quoted}]${userText}` : userText;
+              /*
+               * 正文里的链接解开成一句人话（见 linkmeta.js）。
+               *
+               * **只在这一份上做**，不动 userText 本身 —— 上面那几处要的都是原文：
+               * 指令识别（`/del` 那道闸）、去重、noteInbound（`[reply:原文]` 要
+               * 靠它把这条消息找回来）。补过说明的文本只往队列里去，也就是只给
+               * 模型看。
+               *
+               * 放在这儿而不是 plainText 那一步，还有个好处是**没链接的消息一分钱
+               * 不花**：renderLinks 第一行就是「正文里没有 http 就原样返回」。
+               * 真有链接时最多等 FETCH_TIMEOUT_MS，解不开就原样进队列。
+               */
+              const shown = await renderLinks(userText, scopeOf(runner, "链接"));
+              const text = quoted ? `[reply:${quoted}]${shown}` : shown;
               enqueue(getConfig, runner, space, spaceId, { text, message }, peer);
             }
 
@@ -5038,6 +5379,15 @@ async function stopRunner(runner) {
   // 清掉未触发的合并定时器，避免桥接停掉后还去发消息
   for (const slot of runner.pending.values()) {
     if (slot.timer) clearTimeout(slot.timer);
+    /*
+     * 攒在队列里的视频字节要撒手。
+     *
+     * 这一批消息永远不会被处理了（定时器刚撤掉，下面整张表也清了），所以
+     * describeVideos 那个 finally 不会执行。一段视频是 27MB 的 base64，
+     * 而停连接恰恰是会连着发生好几次的操作 —— 改一次配置 syncBridges 就把
+     * 所有号码停掉重连一遍。
+     */
+    for (const v of slot.videos ?? []) v.release?.();
   }
   runner.pending.clear();
 

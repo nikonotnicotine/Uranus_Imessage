@@ -12,7 +12,7 @@
  *     ProxyAgent 压根不支持它。放过去的话所有出网会静默退回直连。
  *  2. **脱敏**。代理串常是 `http://user:pass@host:port`，那就是一组凭据。
  *     日志、界面、接口响应里都不许出现原文。
- *  3. **类别清单**。九类，默认只勾 IG 和天气。这个默认值是用户实测定的
+ *  3. **类别清单**。十类，默认只勾 IG 和天气。这个默认值是用户实测定的
  *     （Photon 直连通、IG 和天气不通），改动它要有新的实测依据。
  *  4. **落盘位置**。地址进 data.config.json（跟密钥一起），勾选留在
  *     config.json。而且**抹空时只抹地址、留勾选** —— 勾选丢了很难查。
@@ -128,16 +128,16 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
 {
   console.log("\n3. 类别清单");
 
-  check("九类", P.PROXY_SCOPES.length, 9);
+  check("十类", P.PROXY_SCOPES.length, 10);
   check(
     "key 和顺序",
     P.SCOPE_KEYS,
-    ["ig", "weather", "llm", "search", "tts", "cloud", "update", "music", "photon"]
+    ["ig", "weather", "llm", "search", "tts", "cloud", "update", "music", "link", "photon"]
   );
 
   const d = P.defaultScopes();
   check("默认只勾 IG 和天气", Object.entries(d).filter(([, v]) => v).map(([k]) => k), ["ig", "weather"]);
-  checkThat("九类都有默认值（不能有 undefined）", P.SCOPE_KEYS.every((k) => typeof d[k] === "boolean"));
+  checkThat("十类都有默认值（不能有 undefined）", P.SCOPE_KEYS.every((k) => typeof d[k] === "boolean"));
 
   // 用户实测定的：Photon 直连就通，勾上反而可能连不上
   check("Photon 默认不勾", d.photon, false);
@@ -151,7 +151,7 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
   }
 
   const status = P.proxyStatus();
-  check("给界面的清单也是九条", status.catalog.length, 9);
+  check("给界面的清单也是十条", status.catalog.length, 10);
   checkThat(
     "给界面的清单不含地址原文字段",
     status.catalog.every((c) => !("url" in c)),
@@ -328,6 +328,7 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
     ["server/src/igreal.js", 1], // 把远端图片拉回本地
     ["server/src/cloud/net.js", 1], // 两家云的所有请求都从这一个 call() 出去
     ["server/src/media.js", 5], // TTS ×2（SoVITS 是本机，不挂）+ 生图 ×3
+    ["server/src/linkmeta.js", 3], // 跟重定向的 HEAD + 抓网页的 GET + B 站 API
   ];
 
   for (const [file, n] of expect) {
@@ -406,7 +407,7 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
   );
 
   const ui = src("client/src/panels/proxy.jsx");
-  checkThat("界面照 catalog 渲染（不硬编码九类）", /catalog\.map/.test(ui));
+  checkThat("界面照 catalog 渲染（不硬编码十类）", /catalog\.map/.test(ui));
   checkThat("界面说了当场生效", /当场生效/.test(ui));
   checkThat("界面提了 socks 用不了", /socks/.test(ui));
   checkThat("界面给了 Clash / v2rayN 的默认端口", /7890/.test(ui) && /10809/.test(ui));

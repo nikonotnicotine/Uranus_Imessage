@@ -258,6 +258,9 @@ function blankRole(projectRef = "") {
     visionModel: { enabled: true, provider: "", modelId: "", maxImages: 3 },
     // 听音默认关：它按秒计费，得用户自己点开（和后端 DEFAULT_CONFIG 一致）
     audioModel: { enabled: false, provider: "", modelId: "", maxClips: 2, emotion: false },
+    // 看视频默认关，上限默认 1（听音那个是 2）：一段视频的 token 量比一条语音
+    // 大一个量级，上传本身还要几十秒。和后端 DEFAULT_CONFIG 一致
+    videoModel: { enabled: false, provider: "", modelId: "", maxClips: 1 },
     // 读文件默认开：本地解压 / 抽文本，不打模型也不花钱（和识图一致）
     fileRead: { enabled: true, maxChars: 2000 },
     maxContext: 20,
@@ -1425,13 +1428,13 @@ export function ConfigProvider({ children }) {
   /**
    * 把一个角色的 API 配置复制给别的角色（「应用到其他角色」）。
    *
-   * 复制 API 相关的八项：四条模型引用 + 读文件 + 上下文限制两项 + 用的哪份预设。
+   * 复制 API 相关的九项：五条模型引用 + 读文件 + 上下文限制两项 + 用的哪份预设。
    * 预设算进来是因为它就是「这个角色怎么说话」的一部分（生成参数 + 提示词
    * 结构），和模型一起复制才配得上。
    *
-   * 听音和读文件跟着识图一起复制：这三条都是**被动**的 —— 只有对方真发了图、
-   * 发了语音、发了文件才会动，不会自己找上门（读文件连钱都不花，纯本地解析）。
-   * 下面不复制的那几项是反过来的。
+   * 听音、看视频、读文件跟着识图一起复制：这四条都是**被动**的 —— 只有对方
+   * 真发了图、发了语音、发了视频、发了文件才会动，不会自己找上门（读文件连钱
+   * 都不花，纯本地解析）。下面不复制的那几项是反过来的。
    *
    * 人设、绑定的项目、对话存档、挂的世界书一律不动 —— 那些是每个角色
    * 自己的东西，世界书更是「这个角色的设定集」，复制过去等于串设定。
@@ -1464,6 +1467,11 @@ export function ConfigProvider({ children }) {
                   fallbackModel: structuredClone(from.fallbackModel),
                   visionModel: structuredClone(from.visionModel),
                   audioModel: structuredClone(from.audioModel),
+                  // 老配置里可能压根没这个字段（这个功能是后加的），给个兜底 ——
+                  // structuredClone(undefined) 会把目标角色的设置抹成 undefined
+                  videoModel: structuredClone(
+                    from.videoModel ?? { enabled: false, provider: "", modelId: "", maxClips: 1 }
+                  ),
                   fileRead: structuredClone(from.fileRead ?? { enabled: true, maxChars: 2000 }),
                   maxContext: from.maxContext,
                   dropCount: from.dropCount,

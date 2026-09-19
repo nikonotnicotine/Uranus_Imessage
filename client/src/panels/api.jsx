@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CATEGORY_LABELS,
+  IMAGE_RATIOS,
   MODEL_CATEGORIES,
   modelLabel,
   providerLabel,
@@ -13,6 +14,7 @@ import { ParamSlider } from "./preset.jsx";
 import {
   Brain,
   Check,
+  Clapperboard,
   Download,
   Eye,
   EyeOff,
@@ -245,7 +247,7 @@ export function CustomModelDialog({ provider, onClose }) {
  * 开关管「在不在配置里生效」，分类管「能出现在角色的哪个下拉里」——
  * 所以开着的模型不一定用于聊天，也可以只拿来识图。
  */
-export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
+export function ModelRow({ provider, entry, defaultPrompt, defaultAudio, defaultVideo }) {
   const { updateModel, removeModel, toggleModelCategory } = useConfig();
   const [open, setOpen] = useState(false);
   const [testState, setTestState] = useState("idle");
@@ -256,6 +258,8 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
   // 听音测试的文件框。和上面那个分开：accept 不一样，共用一个会让
   // 选图的弹窗里也列出音频文件
   const audioRef = useRef(null);
+  // 看视频测试的文件框。同理，accept 是 video/*
+  const videoRef = useRef(null);
 
   const cats = entry.categories ?? [];
   const patch = (p) => updateModel(provider.id, entry.id, p);
@@ -327,6 +331,39 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
     } catch (e) {
       setTestState("fail");
       setTestMsg(String(e?.message ?? e));
+    }
+  }
+
+  /**
+   * 试看一段视频。这个按钮比另外两个更值得点一次。
+   *
+   * 理由是**上游吃不吃得下跟中转站强相关**：实测五家里有一家网关连 12MB 都
+   * 直接 413（而它听语音是好的）。等到对方真发来视频才发现这家不行，那一轮
+   * 已经白等了几十秒。
+   *
+   * 成功和失败都把体积和耗时显示出来 —— 「19MB / 69 秒」这种数才是用户判断
+   * 「这家能不能用」的依据，光一句「成功」看不出它慢到什么程度。
+   */
+  async function runVideoTest(video) {
+    const mb = (video.base64.length * 3) / 4 / 1024 / 1024;
+    setTestState("loading");
+    setTestMsg(`正在识别「${video.name}」（${mb.toFixed(1)}MB，可能要一分多钟）…`);
+    try {
+      const r = await api("/api/llm/video-test", {
+        method: "POST",
+        body: {
+          endpoint: endpointOf(provider, entry.model),
+          prompt: entry.videoPrompt || undefined,
+          video,
+        },
+      });
+      setTestState("ok");
+      setTestMsg(
+        `识别结果（${(r.bytes / 1024 / 1024).toFixed(1)}MB，${(r.ms / 1000).toFixed(1)} 秒）：${r.text}`
+      );
+    } catch (e) {
+      setTestState("fail");
+      setTestMsg(`${String(e?.message ?? e)}（传的是 ${mb.toFixed(1)}MB）`);
     }
   }
 
@@ -437,6 +474,45 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
         return;
       }
       runAudioTest({ base64, mimeType: file.type, name: file.name });
+    };
+    reader.onerror = () => {
+      setTestState("fail");
+      setTestMsg("读取文件失败");
+    };
+    reader.readAsDataURL(file);
+  }
+
+  /**
+   * 选中本地视频 → 转 base64 → 发去识别。
+   *
+   * 这儿的上限**故意比真实链路的 20MB 宽**（32MB）：试的时候用户想拿一段更大的
+   * 探探这家中转站的底（「30MB 会不会过」是个合理的问题），没有理由拦。后端那条
+   * 路由的请求体上限是 48mb，32MB 的视频撑成 base64 是 43MB，刚好在里面。
+   *
+   * 不校验后缀，只看 MIME 前缀 —— .mov / .mkv / .webm 都直接交给上游，它认不出
+   * 来再说；先在本地拦一遍反而会拦掉某些其实能用的格式。
+   */
+  function onPickVideo(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (file.size > 32 * 1024 * 1024) {
+      setTestState("fail");
+      setTestMsg(
+        `视频 ${(file.size / 1024 / 1024).toFixed(1)}MB，测试最多传 32MB` +
+          `（真实聊天里的上限是 20MB）`
+      );
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = String(reader.result ?? "").split(",")[1];
+      if (!base64) {
+        setTestState("fail");
+        setTestMsg("读不出这个文件的内容");
+        return;
+      }
+      runVideoTest({ base64, mimeType: file.type, name: file.name });
     };
     reader.onerror = () => {
       setTestState("fail");
@@ -599,6 +675,38 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
             </Field>
           )}
 
+          {cats.includes("video") && (
+            <Field label="视频识别提示词" hint="留空就用后端那句默认的">
+              <textarea
+                className={`${inputCls} min-h-[90px] resize-y leading-relaxed`}
+                value={entry.videoPrompt ?? ""}
+                onChange={(e) => patch({ videoPrompt: e.target.value })}
+                placeholder={
+                  defaultVideo || "例如：描述画面里有什么、发生了什么、出现过的文字…"
+                }
+              />
+              {entry.videoPrompt && (
+                <button
+                  type="button"
+                  onClick={() => patch({ videoPrompt: "" })}
+                  className="mt-2 inline-flex items-center gap-1.5 text-meta text-ink-soft transition-colors duration-150 hover:text-ink"
+                >
+                  <Undo2 size={13} /> 清空，回到默认提示词
+                </button>
+              )}
+              {/*
+                * 这段说的是「能不能用」而不是「怎么写」。看视频这条路有两道坎，
+                * 而第二道（中转站的体积闸）只有传一次才知道，所以必须在这儿指出来
+                */}
+              <p className="mt-2 text-meta leading-relaxed text-ink-faint">
+                和听音同一条 Gemini 原生接口，所以同样只有 Gemini 系的模型看得到。
+                另外体积这关跟中转站强相关：实测有的网关连 12MB 都直接拒，
+                而它听语音是好的。右下角「传视频试试」传一段就知道这家行不行。
+                真实聊天里超过 20MB 的视频不会下载。
+              </p>
+            </Field>
+          )}
+
           {cats.includes("image") && (
             <>
               <Field
@@ -623,6 +731,26 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
                   placeholder="例如：lowres, bad anatomy, watermark…"
                 />
               </Field>
+              <Field
+                label="出图比例"
+                hint="size 和 aspect_ratio 两个字段一起发（各家认的不是同一个）。默认「不指定」就一个字都不传，和以前一样让模型用自己的默认尺寸"
+              >
+                <select
+                  className={inputCls}
+                  value={entry.imageRatio ?? ""}
+                  onChange={(e) => patch({ imageRatio: e.target.value })}
+                >
+                  {/* 和服务端 config.js:IMAGE_RATIOS 对齐，加档位两处一起改 */}
+                  {IMAGE_RATIOS.map((r) => (
+                    <option key={r.key} value={r.key}>
+                      {r.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-meta leading-relaxed text-ink-faint">
+                  选了之后要是这个模型报「不支持这个尺寸」，退回「不指定」就行。
+                </p>
+              </Field>
               {imageData && (
                 <img
                   src={`data:${imageData.mimeType};base64,${imageData.base64}`}
@@ -638,6 +766,8 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
               测试会真发一次请求，不用先保存。
               {cats.includes("audio") &&
                 "听音没有「空跑」的按钮 —— 识图能拿一张内置纯色图凑合，声音没有等价物，得自己传一段。"}
+              {cats.includes("video") &&
+                "看视频同理，得自己传一段；这一条尤其值得试，中转站吃不吃得下差别很大。"}
               {cats.includes("image") && "「测试出图」除外 —— 生图模型是全局挑的，要先保存。"}
               {cats.includes("embedding") &&
                 "「测试向量」除外 —— 它测的是「记忆库 → 设置」里选中的那个向量模型，要先保存。"}
@@ -686,6 +816,24 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
                   </Button>
                 </>
               )}
+              {cats.includes("video") && (
+                <>
+                  <input
+                    ref={videoRef}
+                    type="file"
+                    accept="video/*"
+                    className="hidden"
+                    onChange={onPickVideo}
+                  />
+                  <Button
+                    variant="outline"
+                    onClick={() => videoRef.current?.click()}
+                    disabled={testState === "loading"}
+                  >
+                    <Clapperboard size={14} /> 传视频试试
+                  </Button>
+                </>
+              )}
               {cats.includes("image") && (
                 <Button
                   variant="outline"
@@ -723,7 +871,7 @@ export function ModelRow({ provider, entry, defaultPrompt, defaultAudio }) {
 }
 
 /** 右下「模型」区：计数 + 搜索 + 获取列表 / 自定义 + 已配置的模型。 */
-export function ModelSection({ provider, defaultPrompt, defaultAudio }) {
+export function ModelSection({ provider, defaultPrompt, defaultAudio, defaultVideo }) {
   const [query, setQuery] = useState("");
   const [dialog, setDialog] = useState(null); // null | "list" | "custom"
 
@@ -804,6 +952,7 @@ export function ModelSection({ provider, defaultPrompt, defaultAudio }) {
             entry={m}
             defaultPrompt={defaultPrompt}
             defaultAudio={defaultAudio}
+            defaultVideo={defaultVideo}
           />
         ))}
       </div>
@@ -826,7 +975,7 @@ export function ProviderSettings({ provider }) {
 
   // 引用了这个源的角色 —— 改 ID 会让它们的引用失效，先说清楚
   const users = (config.roles ?? []).filter((r) =>
-    [r.chatModel, r.fallbackModel, r.visionModel, r.audioModel].some(
+    [r.chatModel, r.fallbackModel, r.visionModel, r.audioModel, r.videoModel].some(
       (ref) => ref?.provider === provider.id
     )
   );
@@ -1330,6 +1479,7 @@ export function ProviderPanel() {
   const { itemId } = useSection();
   const defaultPrompt = useDefaultVisionPrompt();
   const defaultAudio = useDefaultAudioPrompt();
+  const defaultVideo = useDefaultVideoPrompt();
 
   /*
    * 这个面板的 ID 是可编辑的（`ProviderSettings` 里那个输入框），
@@ -1365,6 +1515,7 @@ export function ProviderPanel() {
         provider={provider}
         defaultPrompt={defaultPrompt}
         defaultAudio={defaultAudio}
+        defaultVideo={defaultVideo}
       />
       <TtsSection />
       <StreamSection />
@@ -1397,4 +1548,18 @@ export function useDefaultAudioPrompt() {
       .catch(() => {});
   }, []);
   return prompts;
+}
+
+/**
+ * 默认看视频提示词。只有一套 —— 听音那边的第二套是「识别情绪与环境音」开关
+ * 带来的，视频本来就要求描述动作和先后顺序，没有对应的档位。
+ */
+export function useDefaultVideoPrompt() {
+  const [prompt, setPrompt] = useState("");
+  useEffect(() => {
+    api("/api/video/default-prompt")
+      .then((r) => setPrompt(r.prompt ?? ""))
+      .catch(() => {});
+  }, []);
+  return prompt;
 }

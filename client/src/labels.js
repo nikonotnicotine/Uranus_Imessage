@@ -128,6 +128,10 @@ export function modelLabel(entry) {
  *
  * 「听音」打的是 Gemini 原生的 generateContent（中转站不透传 OpenAI 那个
  * input_audio 字段），所以只有 Gemini 系的模型挂这个分类才有意义。
+ *
+ * 「看视频」走的是和听音**完全同一条**原生路径、同一个请求形状，只有 mime
+ * 不一样。仍然分成两类是因为「听得到声音」和「吃得下几十 MB 的视频」是两件
+ * 事：实测五家中转站里有一家网关连 12MB 的视频都直接 413，而它听语音是好的。
  */
 export const CATEGORY_LABELS = {
   chat: "聊天",
@@ -135,9 +139,26 @@ export const CATEGORY_LABELS = {
   image: "生图",
   embedding: "向量",
   audio: "听音",
+  video: "看视频",
 };
 
-export const MODEL_CATEGORIES = ["chat", "vision", "image", "embedding", "audio"];
+export const MODEL_CATEGORIES = ["chat", "vision", "image", "embedding", "audio", "video"];
+
+/**
+ * 出图比例的档位。`server/src/config.js:IMAGE_RATIOS` 的镜像，加档位两处一起改。
+ *
+ * 这边只要 key 和显示名 —— 像素值是服务端发请求时才用的，界面上不提它：
+ * 用户要挑的是「横的还是竖的」，`1024x576` 这种串对他没有意义，而且真正发出去
+ * 的字段还得看上游认哪个（见服务端那张表的注释）。
+ */
+export const IMAGE_RATIOS = [
+  { key: "", label: "不指定（用模型自己的默认尺寸）" },
+  { key: "1:1", label: "正方形 1:1" },
+  { key: "3:4", label: "竖图 3:4" },
+  { key: "4:3", label: "横图 4:3" },
+  { key: "9:16", label: "竖屏 9:16" },
+  { key: "16:9", label: "宽屏 16:9" },
+];
 
 /** 顺着 {provider, modelId} 找到那条模型（找不到返回 null）。 */
 export function findModel(config, ref) {

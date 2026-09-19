@@ -563,13 +563,14 @@ export function ProjectDetail({ project, conn, statusError, loaded, onRefresh, o
             </div>
             <div>
               {/*
-                图和语音挤在同一格里：这排是四列的固定布局，为语音单开一格会
-                把「开始时间」挤到下一行。语音是 0 的时候干脆不提。
+                图、语音、视频挤在同一格里：这排是四列的固定布局，各自单开一格会
+                把「开始时间」挤到下一行。是 0 的时候干脆不提。
               */}
               <p className="text-meta text-ink-faint">已识别</p>
               <p className="mt-0.5 text-ink">
                 {conn?.imageCount ?? 0} 张图
                 {(conn?.audioCount ?? 0) > 0 ? ` · ${conn.audioCount} 条语音` : ""}
+                {(conn?.videoCount ?? 0) > 0 ? ` · ${conn.videoCount} 段视频` : ""}
               </p>
             </div>
             <div>
@@ -675,10 +676,19 @@ export function ImessagePanel({ bridge }) {
           <div>
             <p className="text-eyebrow uppercase text-ink-faint">累计识图</p>
             <p className="mt-2 font-serif text-h2 text-ink">{summary?.imageCount ?? 0}</p>
-            {/* 听音不单开一格：四个大数字排成一行正好，第五个会掉到下一行 */}
-            {(summary?.audioCount ?? 0) > 0 && (
+            {/*
+              听音和看视频都不单开一格：四个大数字排成一行正好，第五个会掉到
+              下一行。两个都挂在识图这格底下，哪个是 0 就不提哪个
+            */}
+            {((summary?.audioCount ?? 0) > 0 || (summary?.videoCount ?? 0) > 0) && (
               <p className="mt-1 text-meta text-ink-faint">
-                另有 {summary.audioCount} 条语音
+                另有{" "}
+                {[
+                  (summary?.audioCount ?? 0) > 0 && `${summary.audioCount} 条语音`,
+                  (summary?.videoCount ?? 0) > 0 && `${summary.videoCount} 段视频`,
+                ]
+                  .filter(Boolean)
+                  .join("、")}
               </p>
             )}
           </div>

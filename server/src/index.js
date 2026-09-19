@@ -19,6 +19,7 @@ import {
   DEFAULT_VISION_PROMPT,
   DEFAULT_AUDIO_PROMPT,
   DEFAULT_AUDIO_PROMPT_RICH,
+  DEFAULT_VIDEO_PROMPT,
 } from "./config.js";
 import {
   applyBundle,
@@ -62,6 +63,7 @@ import {
   listModels,
   testEndpoint,
   transcribeAudio,
+  describeVideo,
 } from "./llm.js";
 import {
   assistantGreeting,
@@ -235,6 +237,15 @@ app.use(cors());
 // 几百条就十几兆，12mb 挡不住。必须**挂在全局那个之前** —— body-parser
 // 解析完会在 req 上留个记号，后面全局那个看见就跳过，不会解析两遍
 app.use("/api/memories/:key/import", express.json({ limit: "64mb" }));
+/*
+ * 试看视频那条也要单独放宽，同样得**排在全局那个之前**。
+ *
+ * 真实链路的闸是 20MB（imessage.js:MAX_VIDEO_BYTES），而 base64 会把字节撑成
+ * 4/3 —— 20MB 的视频发上来是 27MB 的请求体，全局那个 12mb 会在路由之前就
+ * 413 掉。那种 413 是 body-parser 回的，长得和「中转站的网关拒了」一模一样，
+ * 用户会以为是自己的中转站不行，白折腾半天。48mb 给的是 27MB 加一倍余量。
+ */
+app.use("/api/llm/video-test", express.json({ limit: "48mb" }));
 /*
  * 查岗手机那条腿的收图口子：iPhone 的快捷指令把截图 POST 到这儿。
  *
@@ -611,6 +622,14 @@ app.get("/api/vision/default-prompt", (_req, res) => {
  */
 app.get("/api/audio/default-prompt", (_req, res) => {
   res.json({ prompt: DEFAULT_AUDIO_PROMPT, rich: DEFAULT_AUDIO_PROMPT_RICH });
+});
+
+/**
+ * 看视频的默认提示词。只有一套 —— 听音那边的第二套是「识别情绪与环境音」
+ * 开关带来的，视频本来就要求描述动作和先后顺序，没有对应的档位。
+ */
+app.get("/api/video/default-prompt", (_req, res) => {
+  res.json({ prompt: DEFAULT_VIDEO_PROMPT });
 });
 
 // ---- 备份导出 / 导入 ----
@@ -1310,6 +1329,48 @@ app.post("/api/llm/audio-test", async (req, res) => {
     const error = String(e?.message ?? e);
     logWarn("听音", "测试识别失败", error);
     res.status(400).json({ ok: false, error });
+  }
+});
+
+/**
+ * 测试看视频。这个按钮比识图、听音那两个都更值得点一次。
+ *
+ * 理由是**上游吃不吃得下跟中转站强相关，而且失败得很晚**：实测五家里有一家
+ * 网关连 12MB 都直接 413（它听语音是好的），52MB 那档五家里两家拒。等到对方
+ * 真发来一段视频才发现这家不行，那一轮已经上传了几十秒、还占着 27MB 内存。
+ *
+ * 不转码、不压缩，原样发 —— 和真实链路一致（imessage.js:readVideo 也不转），
+ * 所以这次成了就说明那条路真的能走通。
+ *
+ * 这条路由**不自己卡体积**：请求体的上限已经由上面那个 48mb 的中间件管着，
+ * 而「20MB 以内」是真实链路的闸；试的时候用户想拿一段更大的探探这家的底
+ * （比如想知道 30MB 会不会过），没有理由拦。
+ */
+app.post("/api/llm/video-test", async (req, res) => {
+  const base64 = String(req.body?.video?.base64 ?? "");
+  if (!base64) {
+    return res.status(400).json({ ok: false, error: "没收到视频，先选一个文件" });
+  }
+  const name = String(req.body?.video?.name ?? "");
+  const mimeType = String(req.body?.video?.mimeType ?? "") || "video/mp4";
+  // base64 串长 × 3/4 就是原始字节数，够准了（用来在日志和回复里报个体积）
+  const bytes = Math.floor((base64.length * 3) / 4);
+
+  const started = Date.now();
+  try {
+    const text = await describeVideo(bodyEndpoint(req), req.body?.prompt, {
+      base64,
+      mimeType,
+      name,
+    });
+    const ms = Date.now() - started;
+    logInfo("看视频", `测试识别成功（${(bytes / 1024 / 1024).toFixed(1)}MB，${ms}ms）`, text);
+    res.json({ ok: true, text, ms, bytes, mimeType });
+  } catch (e) {
+    const error = String(e?.message ?? e);
+    logWarn("看视频", "测试识别失败", error);
+    // 把体积和耗时一起回去：413 那类失败里，这两个数就是唯一有用的线索
+    res.status(400).json({ ok: false, error, ms: Date.now() - started, bytes });
   }
 });
 

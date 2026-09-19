@@ -118,6 +118,13 @@ export const PROXY_SCOPES = [
     default: false,
   },
   {
+    key: "link",
+    label: "链接预览",
+    domains: "对方发来的链接指向哪儿就是哪儿",
+    hint: "国内站直连更快，YouTube / Instagram 这类要走代理才读得到标题",
+    default: false,
+  },
+  {
     key: "photon",
     label: "Photon",
     domains: "iMessage 桥接的管理接口",
