@@ -24,6 +24,7 @@
  * 起不来。txt / md / json 压根不需要任何依赖。
  */
 
+import { readBytes } from "./attachread.js";
 import { logInfo } from "./logs.js";
 
 /**
@@ -106,7 +107,7 @@ export async function readDocument(content, opts = {}) {
   const scope = opts.scope ?? "桥接";
   const name = String(content?.name ?? "").trim() || "未命名文件";
 
-  const buf = await content.read();
+  const buf = await readBytes(content, scope, "文件");
   if (!buf?.length) throw new Error("附件读出来是空的");
   if (buf.length > MAX_DOC_BYTES) {
     throw new Error(

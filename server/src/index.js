@@ -209,6 +209,7 @@ import {
 import {
   clearLogs,
   getLogs,
+  logDebug,
   logError,
   logInfo,
   logWarn,
@@ -250,12 +251,38 @@ app.use("/api/memories/:key/import", express.json({ limit: "64mb" }));
 app.use((req, res, next) => {
   const api = loadConfig()?.spyApi ?? {};
   const want = String(api.webhookPath || DEFAULT_WEBHOOK_PATH);
-  if (req.path !== want) return next();
+  if (req.path !== want) {
+    /*
+     * 路径没对上的 POST 会一路穿到 Express 的兜底 404，谁都不打日志 ——
+     * 而快捷指令收到 404 照样显示成功。于是「URL 填错」和「请求根本没到」
+     * 在控制台上长得一模一样，没法排查。这里把差一点点的那些喊出来：
+     * 只挑带 secret 痕迹或路径形似的，避免把正常的前端 POST 也刷进日志。
+     */
+    const looksLikeShot =
+      /screenshot|phone/i.test(req.path) ||
+      req.query?.secret != null ||
+      req.headers["x-spy-secret"] != null;
+    if (looksLikeShot && (req.method === "POST" || req.method === "PUT")) {
+      logWarn(
+        "查岗",
+        `有个 ${req.method} 打到 ${req.path}，但收图口子在 ${want} —— ` +
+          `快捷指令里的 URL 路径对不上，请求会被当成 404 丢掉`
+      );
+    }
+    return next();
+  }
   if (req.method !== "POST" && req.method !== "PUT") return next();
 
   const chunks = [];
   let size = 0;
   let tooBig = false;
+
+  // 请求一进门就记一笔：后面无论是断在半路还是解析出问题，至少知道它到了
+  logInfo(
+    "查岗",
+    `收图口子来了个 ${req.method}（来源 ${req.ip || "未知"}，` +
+      `类型 ${req.headers["content-type"] || "未声明"}）`
+  );
 
   req.on("data", (c) => {
     // 边收边量：等 22MB 全进内存了再判断太大就没意义了
@@ -269,7 +296,10 @@ app.use((req, res, next) => {
   });
 
   req.on("end", () => {
-    if (tooBig) return res.status(413).type("text/plain").send("too large");
+    if (tooBig) {
+      logWarn("查岗", `上传的图超过 ${Math.round(SHOT_UPLOAD_LIMIT / 1024 / 1024)}MB 上限，已掐断`);
+      return res.status(413).type("text/plain").send("too large");
+    }
     const body = Buffer.concat(chunks);
     const parsed = parseShotUpload(body, req.headers["content-type"]);
     /*
@@ -280,6 +310,17 @@ app.use((req, res, next) => {
       parsed.secret ||
       String(req.query?.secret ?? "") ||
       String(req.headers["x-spy-secret"] ?? "");
+    /*
+     * 解析结果也报一笔。multipart 的字段名错了（比如 image 写成 photo）时，
+     * handleShotUpload 只会说「没有图」，看不出到底是没传还是传了没认出来 ——
+     * 这里把收到的字节数和有没有认出图一起讲清楚。
+     */
+    logDebug(
+      "查岗",
+      `收到 ${Math.round(body.length / 1024)}KB，` +
+        `secret ${secret ? "有" : "没有"}，` +
+        `图 ${parsed.image?.length ? `${Math.round(parsed.image.length / 1024)}KB` : "没认出来"}`
+    );
     const out = handleShotUpload({
       secret,
       image: parsed.image,
@@ -288,7 +329,14 @@ app.use((req, res, next) => {
     res.status(out.status).type("text/plain").send(out.text);
   });
 
-  req.on("error", () => {
+  /*
+   * 传到一半断了（手机切后台、Wi-Fi 抖、被 destroy 掉）。原来这里一声不响，
+   * 于是「上传中断」在控制台上和「请求根本没来」完全一样 —— 现在有了进门那条
+   * 日志，这条能接上去，看得出是断在半路。
+   */
+  req.on("error", (e) => {
+    if (tooBig) return; // 上面主动掐断的，已经报过了
+    logWarn("查岗", `收图的连接断在半路（收了 ${Math.round(size / 1024)}KB，${e?.code || e?.message || e}）`);
     if (!res.headersSent) res.status(400).type("text/plain").send("bad request");
   });
 });

@@ -76,6 +76,29 @@ const TURN_CHUNK = 20;
 const NEAR_TOP_PX = 600;
 
 /**
+ * 「还算贴着底」的容差。超过这个距离就认为用户是自己翻上去看旧内容的，
+ * 流进来的字不再把视口往下拽。
+ *
+ * 120px 大约是三四行正文：留这么宽是因为字是一个 token 一个 token 到的，
+ * 钉底之后内容还会继续长高，判定跑在长高之后 —— 容差太小的话「明明贴着底」
+ * 会被当成「已经翻上去了」，钉底当场失效。
+ */
+const STICK_PX = 120;
+
+/**
+ * 手一碰（滑动 / 滚轮）之后，这么久之内不自动钉底。
+ *
+ * 光靠上面那个距离阈值不够：划了 80px 还没够 STICK_PX，下一个 token 就把画面
+ * 按回去了 —— 手机上就是「划一下被弹回来一下」，用户报的那个「输出的时候
+ * 上滑不了」。所以只要手真的在动，这段时间里钉底整个让开。
+ *
+ * 700ms 是为了盖住**惯性滑动**：手指离开屏幕之后页面还在自己滑，那会儿把它
+ * 按回底部和在手指底下按回去一样难受。惯性停下来时最后一次 scroll 会重算
+ * 那道闸，所以这个窗口过期之后该不该跟着滚已经是对的了。
+ */
+const TOUCH_HOLD_MS = 700;
+
+/**
  * 渲染块的高度保险丝 —— **不是**版式上的上限。
  *
  * 框子报多高就画多高，正则渲染出来的东西要像页面自己的一部分那样铺开，不该
@@ -1333,6 +1356,22 @@ export function OfflinePanel({ onGoto }) {
    * 匹配出来的更是乱的。收完一眨眼就被正式那条顶掉。
    */
   const [streaming, setStreaming] = useState(null);
+  /*
+   * 刚发出去、还没等到后端回话的那句自己的话（`null` = 没有）。
+   *
+   * 和 `streaming` 是一对：那条是角色正在写的，这条是**你刚说的**。
+   * 后端是「先把你那句落盘，再去打模型」（server/src/offline.js），落盘到
+   * 模型写完之间有几十秒，而这一页只认后端回的整份 state —— 不先在本地画一条，
+   * 那几十秒里屏幕上就没有你刚打的字，像是没发出去。
+   *
+   * 只画给眼睛看，不进 `state.story.turns`。渲染条件是 `busy && pending`：
+   * 正式 state 落地和 `busy` 归位是同一次 render（都在 `run` 的同一段同步代码里），
+   * 所以不会出现「正式那条和这条同时在屏幕上」的重影。
+   *
+   * 显示的是**你打的原文**，落盘那份过了 userInput 正则 —— 两者可能差几个字，
+   * 正式 state 一到就被顶掉，不值得为这个在前端再跑一遍正则。
+   */
+  const [pending, setPending] = useState(null);
 
   const [input, setInput] = useState("");
   const [menuKey, setMenuKey] = useState("");
@@ -1364,6 +1403,25 @@ export function OfflinePanel({ onGoto }) {
   const bottom = useRef(null);
   // 列表最上面那个空哨兵：滚到它就说明该往回补了
   const topSentinel = useRef(null);
+  /*
+   * 「现在还该不该跟着往下滚」。
+   *
+   * 生成期间每来一个 token 都要把视口贴回底部，否则写到第三段就滚出屏幕了。
+   * 但**用户自己往上翻的时候不能拽他回来** —— 那就是「输出的时候卡死不能上滑」：
+   * 手指往上划一点，下一个 token 立刻把画面按回底部，看着就像页面死了。
+   *
+   * 存在 ref 里而不是 state：它一秒钟要改好几次（每个 token 一次判定），
+   * 用 state 等于每个 token 多一次整页重渲染，而它本身不影响任何一处渲染。
+   */
+  const stick = useRef(true);
+  /*
+   * 最后一次「手真的在动」是什么时候（滑动、手指还按着、滚轮）。
+   *
+   * 上面那道闸是按**距离**判的，而距离要划够 STICK_PX 才翻 —— 划了 80px 的时候
+   * 闸还开着，下一个 token 就把画面按回去了。所以再加一条按**时间**的：
+   * 手刚碰过，这一会儿谁都别动滚动位置。两条是或的关系，任一条成立就让开。
+   */
+  const touchedAt = useRef(0);
 
   const refreshRows = useCallback(async () => {
     try {
@@ -1418,8 +1476,9 @@ export function OfflinePanel({ onGoto }) {
     setLoadedMore(0);
     setShowSummary(false);
     setShowPrompt(false);
-    // 上一个角色那轮要是还在流，半截正文不能跟着显示在这个角色的剧情里
+    // 上一个角色那轮要是还在流，半截正文和那条乐观气泡都不能跟着换到这个角色底下
     setStreaming(null);
+    setPending(null);
     if (!itemId) return undefined;
     (async () => {
       try {
@@ -1444,6 +1503,9 @@ export function OfflinePanel({ onGoto }) {
   );
 
   const story = state?.story ?? null;
+  // 布尔而不是 `story` 本身：那份对象每次 setState 都是新引用，拿它当依赖的话
+  // 底下那个滚动监听每收一份 state 就要摘一次挂一次
+  const hasStory = Boolean(story);
   const turns = story?.turns ?? [];
   const roleName = state?.roleName?.trim() || (role ? roleLabel(role) : "未命名角色");
   const userName = state?.userName?.trim() || "你";
@@ -1454,6 +1516,42 @@ export function OfflinePanel({ onGoto }) {
     }
     return null;
   }, [turns]);
+  const lastTurn = turns.length ? turns[turns.length - 1] : null;
+  /*
+   * 「你说了一句，角色还没回」—— 生成失败、被你按停、或者你手动删掉了末尾那条
+   * 回复之后，存档就是这个样子。
+   *
+   * 你那句**已经落盘了**（server/src/offline.js 是先存你这句、再去打模型），
+   * 所以这种局面不用重打一遍：`/reroll` 删掉末尾 0 条回复，按同一份上文再生成。
+   * 下面那个「再来一次」就挂在这上面。
+   */
+  const awaiting = lastTurn?.role === "user";
+
+  /**
+   * 重新拉一份 state，当「刚那次到底成没成」的判据。
+   *
+   * 只在**没收到后端回话**时用（流断在半路、请求抛异常）。那种时候屏幕上这份是
+   * 旧的，而「你那句落没落盘」只有后端知道 —— 而这件事决定了接下来是该重新生成
+   * 还是该把字还回输入框。
+   *
+   * 回的形状对齐 `/turn` 失败时那份（`ok:false` + 整份 state），调用方两条路共用
+   * 一套判断。拉不动（还是断网）就回 `null`：调用方会当「什么都没发生」处理，
+   * 也就是把字还回去 —— 宁可多还一次，也别让你重打一遍。
+   */
+  const resync = useCallback(
+    async (when) => {
+      if (!when || !itemId) return null;
+      try {
+        const fresh = await api(`/api/offline/${encodeURIComponent(itemId)}`);
+        if (!fresh?.roleKey) return null;
+        setState(fresh);
+        return { ok: false, ...fresh };
+      } catch {
+        return null;
+      }
+    },
+    [itemId]
+  );
 
   /**
    * 所有写操作的唯一入口。
@@ -1469,26 +1567,41 @@ export function OfflinePanel({ onGoto }) {
    * （收 state、判 `ok:false`、`refreshRows`）两条路共用。
    *
    * 改一条、隐藏、删除这些不打模型，照旧走 `api()`。
+   *
+   * `options.said` 是**你这一轮打的那句原文**，只给这里自己用（不往请求体里带）：
+   * 有它就先在屏幕上画一条你的气泡，别让你盯着几十秒的空白等模型。
    */
   const run = useCallback(
     async (path, options = {}) => {
       if (!itemId) return null;
+      const { said = null, ...rest } = options;
       const url = `/api/offline/${encodeURIComponent(itemId)}${path}`;
+      // 会打模型的那两条。除了「要不要走 SSE」，「要不要重新贴底」也看它
+      const generating = rest.method === "POST" && (path === "/turn" || path === "/reroll");
       // 严格等 off 才关掉：认不出的值（老配置、手改坏的）当默认的「跟随模型」
-      const wantStream =
-        (config.stream?.mode ?? "auto") !== "off" &&
-        options.method === "POST" &&
-        (path === "/turn" || path === "/reroll");
+      const wantStream = (config.stream?.mode ?? "auto") !== "off" && generating;
 
       setBusy(true);
       setError("");
       setNote("");
+      if (said) setPending(said);
       if (wantStream) setStreaming("");
+      /*
+       * 自己动手添的内容要看得见：把「跟着往下滚」重新打开（翻旧剧情会关掉它）。
+       *
+       * 时间戳也一并清掉 —— 手机上按「发送」那一下本身就是个 touchstart，
+       * 而按钮在同一个滚动容器里，不清的话开头 700ms 会白白让开。
+       * 刚按下发送的人显然是想看结果的。
+       */
+      if (generating) {
+        stick.current = true;
+        touchedAt.current = 0;
+      }
       try {
         let r = null;
         if (wantStream) {
           await apiStream(url, {
-            body: { ...(options.body ?? {}), stream: true },
+            body: { ...(rest.body ?? {}), stream: true },
             onEvent: (name, payload) => {
               if (name === "delta") setStreaming((s) => (s ?? "") + (payload?.text ?? ""));
               // 换副 API 了：主 API 吐的那半截作废，它会从头再说一遍
@@ -1497,25 +1610,41 @@ export function OfflinePanel({ onGoto }) {
             },
           });
         } else {
-          r = await api(url, options);
+          r = await api(url, rest);
         }
         if (r?.roleKey) setState(r);
         if (r?.ok === false) setError(r.error || "这一步没成");
-        // 流走完了却一条 done/error 都没收到：多半是管子中途断了（网关超时、
-        // 断网）。这时候正式 state 没来，不能默默把那半截留在屏幕上当结果
-        if (wantStream && !r) setError("生成中断了 —— 连接断在半路。点「重 roll」再来一次");
+        // 流走完了却一条 done/error 都没收到：管子中途断了（网关超时、断网）。
+        // 正式 state 没来，不能默默把那半截留在屏幕上当结果
+        if (wantStream && !r) {
+          setError("生成中断了 —— 连接断在半路");
+          r = await resync(generating);
+        }
         refreshRows();
         return r;
       } catch (e) {
         setError(String(e?.message ?? e));
-        return null;
+        /*
+         * 抛到这儿的有两种，而它们对「你那句话在哪」的含义正好相反：
+         * 请求根本没出去（断网、后端没起来）—— 那句只在输入框里；
+         * 出去了但读流读断了 —— 后端早把它落盘了。**从这个异常本身分不出是哪种**，
+         * 所以去问一次后端。拉回来的那份就是判据：`send()` 靠它决定要不要
+         * 把字还回输入框，不然就会出现「存档里有一句，输入框里还有一句」。
+         */
+        return await resync(generating);
       } finally {
+        /*
+         * 三个一起归位。`setState(r)` 在上面同一段同步代码里跑过了，React 把这一批
+         * 合成一次渲染 —— 所以正式那条气泡出现和这条乐观气泡消失是同一帧，
+         * 中间不会闪一下重影。
+         */
         setStreaming(null);
+        setPending(null);
         setBusy(false);
         setStopping(false);
       }
     },
-    [itemId, refreshRows, config.stream?.mode]
+    [itemId, refreshRows, resync, config.stream?.mode]
   );
 
   /**
@@ -1563,21 +1692,92 @@ export function OfflinePanel({ onGoto }) {
   useEffect(() => {
     setLoadedMore(0);
     anchor.current = null;
+    // 新开一条剧情从底部看起，上一条翻到一半的状态不带过来
+    stick.current = true;
+    // 切剧情那一下点击也算「手碰过」，不清的话新剧情开头不会滚到底
+    touchedAt.current = 0;
   }, [sid]);
 
-  // 新一轮落地之后滚到底。剧情是从上往下读的，不像 iMessage 那种倒序
+  /*
+   * 新一轮落地之后滚到底。剧情是从上往下读的，不像 iMessage 那种倒序。
+   *
+   * 这里也要看那两道闸，原因和流式那边一样、而且更容易被忽略：生成期间翻上去
+   * 看旧剧情，最后正式 state 落地时 `turns.length` 变了，这个 effect 会把人
+   * 一把拽回底部 —— 前面拦住了每个 token，却在最后一下破功。
+   *
+   * 刚进一条剧情那次（length 0 → N）不受影响：换 sid 时两道闸都是重置过的。
+   */
   useEffect(() => {
-    if (turns.length) bottom.current?.scrollIntoView({ block: "nearest" });
+    if (!turns.length) return;
+    if (Date.now() - touchedAt.current < TOUCH_HOLD_MS) return;
+    if (stick.current) bottom.current?.scrollIntoView({ block: "nearest" });
   }, [turns.length]);
 
   /*
-   * 流进来的字把那条临时气泡撑长，也要跟着往下滚 —— 不然生成到第三段就滚出
-   * 屏幕了，用户得自己拖。`block: "nearest"` 让已经往上翻去看旧轮次的时候不被
-   * 硬拽回来（那时候 bottom 不在视口里，浏览器不会动）。
+   * 流进来的字把那条临时气泡撑长，得跟着往下滚 —— 不然生成到第三段就滚出屏幕了。
+   *
+   * 关键是那道 `stick.current` 闸：只在「用户本来就贴着底」时才动滚动位置。
+   *
+   * 以前这儿是裸一句 `scrollIntoView({ block: "nearest" })`，指望「翻上去之后
+   * bottom 不在视口里、浏览器就不会动」。这个指望是错的：`nearest` 的语义是
+   * **把目标滚进视口**，目标在下方视口外时它照样会滚 —— 于是每个 token 都把
+   * 画面按回底部，手指划上去一下就被弹回来，就是用户说的「卡死不能上滑」。
+   *
+   * 闸由下面那个 scroll 监听翻：往上离底超过 STICK_PX 就关，自己滑回底部就开，
+   * 和聊天软件一个手感。
    */
   useEffect(() => {
-    if (streaming) bottom.current?.scrollIntoView({ block: "nearest" });
-  }, [streaming]);
+    if (!streaming && !pending) return;
+    // 手刚碰过就整个让开 —— 哪怕只划了一点、距离上还算「贴着底」
+    if (Date.now() - touchedAt.current < TOUCH_HOLD_MS) return;
+    if (stick.current) bottom.current?.scrollIntoView({ block: "nearest" });
+  }, [streaming, pending]);
+
+  /*
+   * 听滚动，维护上面那道闸。
+   *
+   * 滚动容器是壳子那个 `<main>`（shell.jsx 的 `[data-scroll]`），和往上补历史
+   * 那个 effect 找的是同一个 —— 这一页自己不滚。
+   *
+   * 挂载条件是 `story`（不是 `streaming`）：用户完全可以在生成开始**之前**就
+   * 先翻上去看旧内容，那时候这个监听必须已经在听了，不然那次上翻不算数。
+   *
+   * 判定放在 scroll 事件里，靠的是浏览器的一条保证：程序改 `scrollTop`
+   * （`scrollIntoView`）也会发 scroll。所以钉底自己那一下也会走进来重算一次，
+   * 算出来还是「贴着底」—— 闸保持开着，不会自己把自己关掉。
+   */
+  useEffect(() => {
+    if (!hasStory) return undefined;
+    const box = bottom.current?.closest("[data-scroll]");
+    if (!box) return undefined;
+    const onScroll = () => {
+      const gap = box.scrollHeight - box.scrollTop - box.clientHeight;
+      stick.current = gap <= STICK_PX;
+    };
+    /*
+     * 「手真的在动」只认这三个事件，**不认 scroll**。
+     *
+     * scroll 是分不出人和程序的 —— 上面钉底那一下自己也会发一个。拿 scroll 记
+     * 时间戳的话，第一次钉底就把自己锁在让开状态里，再也不跟着滚了。
+     * touchstart / touchmove / wheel 只有人能发出来，所以用它们。
+     *
+     * touchstart 也记：手指按住不动也是「我在看这儿」，这时候不该把画面抽走。
+     * 惯性滑动阶段没有 touchmove，靠 TOUCH_HOLD_MS 这个窗口盖过去。
+     */
+    const onTouch = () => {
+      touchedAt.current = Date.now();
+    };
+    box.addEventListener("scroll", onScroll, { passive: true });
+    box.addEventListener("touchstart", onTouch, { passive: true });
+    box.addEventListener("touchmove", onTouch, { passive: true });
+    box.addEventListener("wheel", onTouch, { passive: true });
+    return () => {
+      box.removeEventListener("scroll", onScroll);
+      box.removeEventListener("touchstart", onTouch);
+      box.removeEventListener("touchmove", onTouch);
+      box.removeEventListener("wheel", onTouch);
+    };
+  }, [hasStory]);
 
   /*
    * 往上滚到头就再补一批更早的。
@@ -1658,16 +1858,47 @@ export function OfflinePanel({ onGoto }) {
     setNote(`语音没合成出来：${m}`);
   }, []);
 
+  /**
+   * 发你这一轮。
+   *
+   * 输入框先清空、`said` 让它立刻以气泡的形式出现在剧情末尾 —— 不然接下来
+   * 几十秒屏幕上没有你刚打的字，像是没发出去。
+   *
+   * **一句话都没落盘的那种失败要把字还回来。** 判据是「后端那份存档里，末尾
+   * 现在是不是你这句」：
+   *  - 是：它已经在存档里了，界面上看得见 —— 这时候再往输入框里塞一份，就成了
+   *    同一句话出现两遍，一不小心发出去就是重复的一轮。该按的是「再来一次」。
+   *  - 不是（请求根本没出去、后端在落盘之前就报错了）：那句字只存在于这个输入框
+   *    里，清掉它等于让你重打一遍。所以还回去。
+   *
+   * 判的是**存档**而不是「有没有报错」：模型报错和写盘失败都是 `ok:false`，
+   * 但前者你那句在、后者不在，光看错误分不出来。
+   */
   async function send() {
     const text = input.trim();
     if (!text) return;
     setInput("");
-    await run("/turn", { method: "POST", body: { text, storyId: sid } });
+    const r = await run("/turn", { method: "POST", body: { text, storyId: sid }, said: text });
+    if (r?.ok) return;
+    const saved = r?.story?.turns ?? [];
+    const tail = saved.length ? saved[saved.length - 1] : null;
+    if (tail?.role !== "user") setInput((cur) => cur || text);
   }
 
   async function pickChoice(index) {
-    await run("/turn", { method: "POST", body: { choiceIndex: index, storyId: sid } });
+    // 选项那一路不回填：正文是从上一轮的 options 上取的，本来就还在屏幕上
+    await run("/turn", {
+      method: "POST",
+      body: { choiceIndex: index, storyId: sid },
+      said: lastAssistant?.options?.[index - 1] ?? "",
+    });
   }
+
+  /** 重新生成末尾那条回复。你那句留在存档里，按同一份上文再来一次。 */
+  const reroll = useCallback(
+    () => run("/reroll", { method: "POST", body: { storyId: sid } }),
+    [run, sid]
+  );
 
   /*
    * 气泡上那几个回调。
@@ -1919,12 +2150,20 @@ export function OfflinePanel({ onGoto }) {
               {error && (
                 <p className="mb-6 whitespace-pre-wrap border-l-2 border-warn py-1.5 pl-3 text-meta leading-relaxed text-warn">
                   {error}
-                  {/* 自己按停的不是故障：原地给一条路回去（你那句还在存档里） */}
-                  {error.includes("按停") && (
+                  {/*
+                    * 「你那句还在，角色没回上」—— 原地给一条路回去。
+                    *
+                    * 判的是**存档现在长什么样**（末尾是不是你那句），不是错误文案里
+                    * 有没有「按停」。这两件事在这儿是一回事：按停、模型报错、
+                    * 连接断在半路，落到存档上都是同一个形状 —— 你那句在，回复没有。
+                    * 以前只认「按停」那一种，于是模型报错之后屏幕上就没有出路了，
+                    * 只能把自己那句重打一遍。
+                    */}
+                  {awaiting && state.open && (
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={() => run("/reroll", { method: "POST", body: { storyId: sid } })}
+                      onClick={reroll}
                       className="link-slide ml-1 text-warn"
                     >
                       再来一次
@@ -1998,25 +2237,77 @@ export function OfflinePanel({ onGoto }) {
                         onVoiceError={voiceError}
                       />
 
-                      {/* 末尾那条助手回复才给重 roll 和选项 */}
-                      {lastAssistant?.id === t.id && (
+                      {/*
+                        * 末尾那条助手回复才给重 roll 和选项。
+                        *
+                        * 判的是 `lastTurn`（整条剧情的最后一轮）而不是 `lastAssistant`
+                        * （最后一条**助手**轮次）—— 生成失败之后末尾是你那句，
+                        * 最后一条助手轮次成了上一轮：那一轮的四条选项早就被你的
+                        * 下一句接掉了，重 roll 也不是在重 roll 它。
+                        */}
+                      {lastTurn?.id === t.id && t.role === "assistant" && (
                         <div className="grid grid-cols-1 gap-3 pl-12">
                           {state.choices && (t.options ?? []).length > 0 && (
                             <ChoiceRow options={t.options} busy={busy} onSend={pickChoice} />
                           )}
                           <div>
-                            <Button
-                              variant="outline"
-                              disabled={busy || !state.open}
-                              onClick={() => run("/reroll", { method: "POST", body: { storyId: sid } })}
-                            >
+                            <Button variant="outline" disabled={busy || !state.open} onClick={reroll}>
                               <RotateCcw size={14} /> 重 roll 这次回复
                             </Button>
                           </div>
                         </div>
                       )}
+
+                      {/*
+                        * 你说了一句、角色没回上（按停 / 模型报错 / 连接断了）。
+                        *
+                        * 出口挂在**你那条气泡底下**，不是只放在页面顶上那条红字里：
+                        * 演久了的剧情，顶上那行早就滚出屏幕了；而且刷新一次错误提示
+                        * 就没了，存档还是这个样子 —— 出路得跟着存档在。
+                        *
+                        * 生成中不显示：那会儿正在写的就是这一轮，`streaming` 那条
+                        * 临时气泡紧跟在下面。
+                        */}
+                      {awaiting && lastTurn?.id === t.id && !busy && state.open && (
+                        <div className="flex flex-wrap items-center gap-3 pl-12">
+                          <Button variant="outline" onClick={reroll}>
+                            <RotateCcw size={14} /> 再来一次
+                          </Button>
+                          <span className="text-meta text-ink-meta">
+                            这句已经存下来了 —— 不用重打，按同一份上文再生成一次
+                          </span>
+                        </div>
+                      )}
                     </div>
                   ))}
+
+                  {/*
+                    * 你刚发出去、后端还没回话的那句。
+                    *
+                    * 为什么非要有这条：后端是「先把你那句落盘，再去打模型」，而这一页
+                    * 只认后端回的那份完整 state —— 中间几十秒屏幕上没有你刚打的字，
+                    * 输入框又清空了，看着就像这句话没发出去。
+                    *
+                    * 和下面那条流式气泡同一个路子：不走 `Bubble`（没有 turn.id，
+                    * 编辑/删除都无从谈起），只借外形。`flex-row-reverse` + `ml-auto`
+                    * 是你那侧的版式，和 `Bubble` 里 `mine` 那几条对齐。
+                    */}
+                  {busy && pending && (
+                    <div className="flex flex-row-reverse items-start gap-3">
+                      <Avatar file={state.userAvatar} name={userName} />
+                      <div className="min-w-0 max-w-[min(52rem,88%)] flex-1">
+                        <div className="flex flex-wrap items-baseline justify-end gap-x-2 gap-y-0.5">
+                          <span className="text-eyebrow uppercase text-ink-faint">{userName}</span>
+                          <span className="text-meta text-ink-meta">发出去了</span>
+                        </div>
+                        <div className="mt-1.5 ml-auto w-fit max-w-[34rem] border border-line bg-sunken px-3.5 py-3">
+                          <p className="whitespace-pre-wrap break-words text-ui leading-relaxed text-ink-soft">
+                            {pending}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   {/*
                     * 正在流进来的那半截。

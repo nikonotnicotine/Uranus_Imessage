@@ -321,6 +321,8 @@ function DiarySettings({ onGoto }) {
   const patch = (p) => updateMemories({ diary: p });
   const schedule = cfg.schedule ?? {};
   const limit = cfg.limit ?? {};
+  // 注意这两条是日记自己的：`recent` = 注入近 N 天**记忆**，`self` = 回看近 N 天**日记**
+  const recent = cfg.recentInject ?? {};
   const self = cfg.selfInject ?? {};
   const books = config.worldBooks ?? [];
   const refs = cfg.worldBookRefs ?? [];
@@ -423,6 +425,48 @@ function DiarySettings({ onGoto }) {
               label="启用手动日记"
             />
           </label>
+        </div>
+
+        {/*
+          * 写这一篇时注入近 N 天的记忆。
+          *
+          * 编号里没有它：1~8 是照用户那份日记规范排的，这条是后来补的旋钮，
+          * 硬塞一个号会把后面全推歪、和规范对不上。挨着下面那条放，因为
+          * 两条都是「写的时候往提示词里注入什么」。
+          */}
+        <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
+          <label className="flex items-start justify-between gap-4">
+            <span className="min-w-0">
+              <span className="block text-ui text-ink">写的时候注入近 N 天的记忆</span>
+              <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                从记忆库里按日期捞近几天的记忆，进这一篇的
+                <strong className="text-ink-soft">「近N天记忆」</strong>那一段。
+                和上面「记忆」那块里同名的那个开关<strong className="text-ink-soft">是两个数</strong>
+                ：那个管聊天时发给模型的，这个只管写日记。
+                以前两边共用一个，所以调小省 token 会连着让日记写漏事。
+              </span>
+            </span>
+            <Switch
+              checked={recent.enabled !== false}
+              onChange={(v) => patch({ recentInject: { ...recent, enabled: v } })}
+              label="写日记时注入近 N 天记忆"
+            />
+          </label>
+
+          {recent.enabled !== false && (
+            <div className="border-l-2 border-line pl-4">
+              <NumberField
+                label="近几天"
+                value={recent.days ?? 3}
+                min={0}
+                max={30}
+                step={1}
+                onChange={(v) => patch({ recentInject: { ...recent, days: v } })}
+                hint="填 0 = 开着但不注入，等于临时关"
+                suffix="天"
+              />
+            </div>
+          )}
         </div>
 
         {/* 2. 生成时回看自己近 N 天的日记 */}

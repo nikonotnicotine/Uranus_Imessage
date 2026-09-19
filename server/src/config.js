@@ -603,6 +603,9 @@ export const DEFAULT_CONFIG = {
       todoPrompt: DEFAULT_TODO_PROMPT,
       schedule: { enabled: false, days: 0, hours: 0, minutes: 0 },
       manual: true,
+      // 写日记时注入近 N 天的**记忆**。默认 3 天 —— 以前这一路借记忆链那份
+      // recentInject，那边的默认就是 3，所以老配置升上来行为不变
+      recentInject: { enabled: true, days: 3 },
       selfInject: { enabled: true, days: 1 },
       limit: { enabled: false, min: 800, max: 3000, retry: false, retries: 3 },
       useRoleWorldBooks: true,
@@ -2170,6 +2173,17 @@ function normalizeMemories(input) {
       },
       // 手动日记（/diary、/日记），默认开
       manual: diary.manual === undefined ? true : Boolean(diary.manual),
+      /*
+       * 写日记时注入近 N 天的**记忆**，默认 3 天。
+       *
+       * 这一路原先是直接读记忆链那份 `memory.recentInject` 的，于是「聊天时
+       * 回看几天记忆」和「写日记时回看几天记忆」被同一个数字绑死 —— 前者调小
+       * 是为了省 token，后者调大是为了让日记写得全，两个诉求反着来。
+       *
+       * 默认值刻意和记忆链那份一样（3 天）：老配置里没有这个字段，升上来
+       * 就是 `{enabled: true, days: 3}`，行为和以前逐字节一致。
+       */
+      recentInject: inject(diary.recentInject, 3),
       // 生成日记时回看自己近 N 天的日记，默认近 1 天
       selfInject: inject(diary.selfInject, 1),
       /*

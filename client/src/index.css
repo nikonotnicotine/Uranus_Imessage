@@ -224,6 +224,32 @@ input[type="range"]::-moz-range-thumb {
 }
 
 /*
+ * 手机上点输入框不要放大页面。
+ *
+ * iOS Safari 的硬规则：聚焦一个**字号小于 16px** 的输入控件，它会自动把整页
+ * 放大到让那行字有 16px 那么大，而且**退出输入时不缩回去** —— 于是点一下
+ * 输入框，整个界面就永远歪在放大状态里，三栏布局全错位。
+ *
+ * 常见的偷懒解法是往 viewport 里塞 `maximum-scale=1`，那等于把**双指缩放**
+ * 也一起禁掉了 —— 看不清的人再也放不大，是条无障碍倒退。这里改字号，
+ * 只动「聚焦时会不会自动缩放」这一件事，捏合缩放照旧。
+ *
+ * 只在 `pointer: coarse` 下生效：桌面端 14px 的紧凑表单是设计的一部分
+ * （语义字号 ui = 14px），而桌面浏览器压根没有这个自动放大行为。
+ * 16px 是 iOS 的阈值，不是设计尺寸，所以不进 tailwind 的 fontSize 那张表。
+ *
+ * `font-size: 16px` 而不是 1rem：根字号被用户在系统里调小过的话，
+ * 1rem 可能还不到 16px，照样触发放大。
+ */
+@media (pointer: coarse) {
+  input:not([type="range"]):not([type="checkbox"]):not([type="radio"]),
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
+/*
  * 唯一的入场动画：opacity + 8px translateY，350ms ease-out，只跑一次。
  *
  * 类名由 Reveal 组件加在元素上（见 ui.jsx）。用 CSS 而不是 JS 里写 style，

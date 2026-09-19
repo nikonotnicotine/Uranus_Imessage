@@ -1,3 +1,4 @@
+import { readBytes } from "./attachread.js";
 import { cardHintFor, isCardUrl, mapsUrlFor, renderMapsLinks } from "./card.js";
 import { watchChatBackground } from "./chatbg.js";
 import { normalizeForHistory, splitBubbles, sleep } from "./delay.js";
@@ -768,8 +769,8 @@ function handleUserUnsend(getConfig, runner, space, spaceId, message, peer) {
  * 把 attachment 读成 base64。
  * SDK 的 read() 是懒加载的（云端要回源下载），所以这里才是真正拿字节的地方。
  */
-async function readImage(content) {
-  const buf = await content.read();
+async function readImage(content, scope = "桥接") {
+  const buf = await readBytes(content, scope, "图片");
   if (!buf?.length) throw new Error("附件读出来是空的");
   if (buf.length > MAX_IMAGE_BYTES) {
     throw new Error(
@@ -794,7 +795,7 @@ async function readImage(content) {
  * 语音，答案就在这行里。
  */
 async function readAudio(content, scope) {
-  const buf = await content.read();
+  const buf = await readBytes(content, scope, content.type === "voice" ? "语音" : "音频");
   if (!buf?.length) throw new Error("附件读出来是空的");
   if (buf.length > MAX_AUDIO_BYTES) {
     throw new Error(
@@ -4749,10 +4750,13 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             // 图文混发时两样都要进队列：合并队列会在 queueWait 内攒成一轮，
             // 文字是「看这张图里的字」这种指令时缺一半就答不对
             let imagesSent = 0;
+            // 读崩了的图有几张。它也算「这轮收到东西了」—— 见下面 gotSomething
+            let failedImages = 0;
             for (const part of imageParts) {
-              // 读附件可能要回源下载，失败就当没收到这张图
+              // 读附件要回源下载（断流会自己重试，见 attachread.js）。
+              // 试完还是不行才当没收到这张图
               try {
-                const image = await readImage(part);
+                const image = await readImage(part, scope);
                 logInfo(
                   scope,
                   `收到图片附件${image.name ? `「${image.name}」` : ""}，进队列等识别`
@@ -4761,6 +4765,30 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                 imagesSent += 1;
               } catch (e) {
                 logError(scope, "读取图片附件失败", e);
+                /*
+                 * 重试也没救回来时，**得告诉模型这里本来有张图**。
+                 *
+                 * 以前这儿只记一条日志就完了 —— 那轮发给模型的是「1 条文本 /
+                 * 0 张图」，模型压根不知道有过一张图，于是角色答得像对方什么都
+                 * 没发（用户报的「识图出 bug」就是这个观感）。图读不到是没办法，
+                 * 但「没看见」和「看见了看不清」是两种回法，后者才对得上现实。
+                 *
+                 * 走 text 进队列，和读文件那一路同一个套路：下游 handleTurn、
+                 * 提示词、上下文存档都不用改。`{{user}}` 由 applyVars 换成用户的
+                 * 名字（和撤回提示一致，见 handleUserUnsend）。
+                 */
+                failedImages += 1;
+                enqueue(
+                  getConfig,
+                  runner,
+                  space,
+                  spaceId,
+                  {
+                    text: `[{{user}}发来一张图片，但没能加载出来，你看不到内容。别猜图里是什么，就当没看清，可以让对方再发一次或者说说图里是什么。]`,
+                    message,
+                  },
+                  peer
+                );
               }
             }
 
@@ -4832,8 +4860,17 @@ async function startRunner(getConfig, project, meta, retries = 0) {
               }
             }
 
-            // 这轮到底收到东西没有：下面几处提示要靠它决定兑不兑现
-            const gotSomething = Boolean(imagesSent || voicesSent || docsSent || userText);
+            /*
+             * 这轮到底收到东西没有：下面几处提示要靠它决定兑不兑现。
+             *
+             * `failedImages` 也算 —— 那张图虽然读崩了，但上面已经往队列里塞了
+             * 一句「有张图没加载出来」，这轮**确实**要去打模型。不算的话，
+             * 对方只发了一张图（没配文字）而它正好读失败时，gotSomething 是假，
+             * 攒着的背景变更和 tapback 提示就白等这一轮了。
+             */
+            const gotSomething = Boolean(
+              imagesSent || failedImages || voicesSent || docsSent || userText
+            );
 
             /*
              * 换过背景就先垫一句系统提示。

@@ -707,10 +707,13 @@ function fillDiaryPrompt(cfg, fill) {
  *
  * 世界书这条链单独一套：默认跟角色已绑的走，也可以在设置里另选几本
  * （useRoleWorldBooks / worldBookRefs）。
+ *
+ * 「近 N 天记忆」的天数也是这条链自己的（`diary.recentInject`）—— 不再借记忆链
+ * 那份。写日记要回看几天和聊天时要回看几天是两个诉求：后者调小是为了省 token，
+ * 前者调大是为了让这一篇写得全。
  */
 export function buildDiaryMessages(config, role, key, opts = {}) {
   const cfg = config?.memories?.diary ?? {};
-  const memCfg = config?.memories?.memory ?? {};
   const now = opts.now ?? new Date();
   const log = String(opts.log ?? readDiaryLog(key));
 
@@ -722,7 +725,8 @@ export function buildDiaryMessages(config, role, key, opts = {}) {
     : worldBooksFor(config, role);
   const b = commonBlocks(config, role, log, books);
 
-  const inject = memCfg.recentInject ?? {};
+  // 写这一篇时注入近 N 天的记忆（默认近 3 天，和以前借记忆链那份时一样）
+  const inject = cfg.recentInject ?? {};
   const recent = inject.enabled === false
     ? []
     : filterRecent(readMemories(key), inject.days ?? 3, now.getTime());
