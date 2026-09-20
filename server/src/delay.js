@@ -108,8 +108,9 @@ function restoreBrackets(text, kept) {
  * 将一条消息按分隔符拆成多条气泡，返回每条气泡的文本及相对延迟。
  *
  * 默认只按 `chat.separator`（默认 `$`）切，一字不差地尊重模型给的格式。
- * 开了 `chat.forceSeparator` 则改走上面那套强制切点，`separator` 不再参与 ——
- * 那两个是互斥的两条路，不是叠加。
+ * 开了 `chat.forceSeparator` 则改走上面那套强制切点 —— 那时**不再依赖** separator
+ * （模型不吐它也照样切），但它仍然算一个切点，否则模型照提示词吐的 `$` 会原样
+ * 发给对方。两条路不是叠加，是「强制那条把标点也算进切点集合」。
  *
  * @param {string} message
  * @param {object} chat config
@@ -137,8 +138,23 @@ function forceSegments(text, chat) {
   }
   /* 方括号段先挖走，切完填回去 —— 里面的逗号是台词，不是切点 */
   const { masked, kept } = protectBrackets(text ?? "");
+  /*
+   * separator 也得当切点，哪怕这条路「不再由它做主」。
+   *
+   * 提示词里教过模型用 `$` 分气泡，模型照做了 —— 强制分隔只是不再**依赖**它，
+   * 不代表它该原样发给对方。只按 FORCE_BREAK 切的话 `$` 不在切点集合里，于是
+   * 一路留到气泡正文，对方看到的就是「在家$刚吃完饭$你呢」这种带钱号的句子。
+   *
+   * 切点合并成一个正则，不是切两遍：`$` 和标点连在一起时（`好的。$`）切一遍
+   * 才不会中间剩个空段。separator 可以是用户自定义的任意字符，先转义再拼。
+   */
+  const sep = String(chat?.separator ?? "$");
+  const escaped = sep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const breaks = sep
+    ? new RegExp(`(?:${escaped}|${FORCE_BREAK.source})+`)
+    : FORCE_BREAK;
   return masked
-    .split(FORCE_BREAK)
+    .split(breaks)
     .map((s) => restoreBrackets(s, kept).trim())
     .filter((s) => s.length > 0);
 }

@@ -26,7 +26,7 @@ import { buildEnv } from "./env.js";
 import { pickEmoji } from "./emoji.js";
 import { isDocAttachment, readDocument } from "./docread.js";
 import { notePrompt } from "./lastprompt.js";
-import { renderLinks } from "./linkmeta.js";
+import { fetchLinkImages, fetchLinkVideos, renderLinks } from "./linkmeta.js";
 import { igComposeNote, igRouteFor, publishIgTags, publishLines, tickIgQueue } from "./igrun.js";
 import { splitIg, stripIgTags } from "./igtags.js";
 import {
@@ -4791,6 +4791,35 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             const peer = message.sender?.id ?? "";
 
             /*
+             * 这条消息在路上走了多久。
+             *
+             * 排查「对方说他早就发了，我们这边怎么才收到」时，光看我们自己的
+             * 日志时间戳是分不清两种情况的：
+             *
+             *   a) 对方 3 分钟前就发了，推送刚到 —— 慢在 Photon / iMessage 那头
+             *   b) 推送早到了，我们处理慢 —— 慢在我们这头
+             *
+             * 实机撞到过一次：对方 15 分发的一段 2MB 视频，18 分才进日志，而从
+             * 推送到达到攒批完成全程只花了几毫秒（也就是 a）。当时这条差完全没
+             * 记录，只能靠比对两头的表才看出来。
+             *
+             * `dateCreated` 是消息在对方设备上建立的时刻，`isDelayed` 是 Apple
+             * 自己标的「这条是延迟送达的」。只在差得明显（超过 30 秒）时才打一行，
+             * 正常消息不占日志。
+             */
+            const bornAt = message.dateCreated ? new Date(message.dateCreated).getTime() : 0;
+            const lagMs = bornAt ? Date.now() - bornAt : 0;
+            if (lagMs > 30000 || message.isDelayed) {
+              logInfo(
+                scope,
+                `这条消息在路上走了 ${Math.round(lagMs / 1000)}s` +
+                  `（对方发出时间 ${new Date(bornAt).toLocaleTimeString("zh-CN")}` +
+                  `${message.isDelayed ? "，Apple 标了延迟送达" : ""}）—— ` +
+                  `慢在网络或 Photon 那头，不是这边处理慢`
+              );
+            }
+
+            /*
              * 记下「现在能往哪儿发消息」。
              *
              * 放在这么靠前的位置是有意的：下面已读回执 / 撤回 / tapback 那几个
@@ -5361,11 +5390,104 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                *
                * 放在这儿而不是 plainText 那一步，还有个好处是**没链接的消息一分钱
                * 不花**：renderLinks 第一行就是「正文里没有 http 就原样返回」。
-               * 真有链接时最多等 FETCH_TIMEOUT_MS，解不开就原样进队列。
+               * 真有链接时解不开就原样进队列。
+               *
+               * 带图的链接（抖音）比别的慢一截：解析两个来回 + 下图，实测一条
+               * 4 图的图文作品前后 4 秒上下。对方那头看着已读和打字指示器，
+               * 这点等待换来「模型真看见了那几张图」，划得来。
                */
-              const shown = await renderLinks(userText, scopeOf(runner, "链接"));
-              const text = quoted ? `[reply:${quoted}]${shown}` : shown;
+              const linkScope = scopeOf(runner, "链接");
+              const {
+                text: shown,
+                images: linkImageUrls,
+                videos: linkVideoUrls,
+                covers: linkCoverUrls,
+              } = await renderLinks(userText, linkScope);
+
+              /*
+               * 链接里的视频（抖音视频作品，够短的那些）走识视频那条路。
+               *
+               * **先看角色开没开视频识别**，没开就一个字节都不下 —— 这和对方
+               * 直接发视频那条路的规矩一致（见上面 videoOn 那段）：几 MB 的东西
+               * 下回来没人看是纯浪费。现读现判，因为用户随时可能改配置。
+               *
+               * 放在下图之前，因为下面要的「封面还是视频」取决于这一步的结果。
+               */
+              const linkVideoOn = linkVideoUrls.length
+                ? Boolean(
+                    resolveRoleEndpoints(getConfig(), currentRole(getConfig(), runner)).video
+                  )
+                : false;
+              if (linkVideoUrls.length && !linkVideoOn) {
+                logInfo(
+                  linkScope,
+                  `链接里有 ${linkVideoUrls.length} 段视频，但这个角色没启用视频识别，只看封面`
+                );
+              }
+              const linkVideos = linkVideoOn
+                ? await fetchLinkVideos(linkVideoUrls, linkScope)
+                : [];
+
+              /*
+               * 链接里带图的（抖音图文、小红书笔记）把图真下下来，走识图那条路。
+               *
+               * 视频作品的**封面只在视频没下成的时候**才加进来（角色没开视频
+               * 识别、或者下失败了）。视频下到了就不要它 —— 封面是视频第一帧，
+               * 视频模型自己看得到，再单独识一次图等于为同一帧画面多打一次模型，
+               * 还占掉对方的 maxImages 额度。
+               *
+               * 不设自己的数量上限：原样全推进队列，由 describeImages 用角色的
+               * eps.maxImages 统一截断。这样「对方发了 2 张图 + 一条 4 图抖音」
+               * 一轮最多还是 maxImages 张，不会因为一条链接把额度吃光 ——
+               * 那边本来就有现成的「超上限截断并在尾巴说明」。
+               */
+              const wantCovers = linkCoverUrls.length && !linkVideos.length;
+              const linkImages = await fetchLinkImages(
+                wantCovers ? [...linkImageUrls, ...linkCoverUrls] : linkImageUrls,
+                linkScope
+              );
+
+              /*
+               * 有图但一张都没取到时，在正文里说明一句。
+               *
+               * 直链带签名和过期时间，下不下来是常态。配文和配乐那部分跟图片
+               * 无关、照样补得上，所以只在尾巴补一句「看不见图」——
+               * 和 describeImages 没开识图时那句降级文案同一个做法：让模型知道
+               * 「有东西但你读不到」，比压根不提好。
+               */
+              const blind =
+                linkImageUrls.length && !linkImages.length
+                  ? `（这条链接里有 ${linkImageUrls.length} 张图片，但没能取到，你看不到图的内容）`
+                  : "";
+              /*
+               * 视频没看到时补一句，说清模型手里到底有什么。
+               *
+               * 两种情况都要说，但说法不同：
+               *
+               *  - 角色没开视频识别 → 封面进了队列，所以是「只看到封面那一帧」
+               *  - 开着但下失败了（风控、超时、码率撞上限）→ 封面**也**跟着补上了
+               *    （wantCovers 那一步），所以同样是这句话
+               *
+               * 真正要让模型知道的是「你手里那张是静止画面，不是整段视频」——
+               * 不说的话它会拿一帧当成整段来聊。至于为什么没下到，模型不需要
+               * 知道，那是我们的实现细节。
+               *
+               * 视频作品**没有封面可退**的情况（连封面都没取到）由上面那句
+               * `blind` 覆盖，这里不重复说。
+               */
+              const videoBlind =
+                linkVideoUrls.length && !linkVideos.length
+                  ? `（这条链接是个视频，但你只能看到封面那一帧，看不到视频里的动态内容和声音）`
+                  : "";
+              const body = `${shown}${blind}${videoBlind}`;
+              const text = quoted ? `[reply:${quoted}]${body}` : body;
               enqueue(getConfig, runner, space, spaceId, { text, message }, peer);
+              for (const image of linkImages) {
+                enqueue(getConfig, runner, space, spaceId, { image, message }, peer);
+              }
+              for (const video of linkVideos) {
+                enqueue(getConfig, runner, space, spaceId, { video, message }, peer);
+              }
             }
 
             /*
