@@ -145,6 +145,7 @@ async function buildHarness() {
     "logWarn",
     "logError",
     "scopeOf",
+    "secsSince",
     "describeVideo",
     code
   );
@@ -157,6 +158,9 @@ async function buildHarness() {
     log("warn"),
     log("error"),
     (_runner, what) => what,
+    // 用源码里那个真的，不写个 stub —— 日志里的耗时数字也是要盯的东西
+    // eslint-disable-next-line no-new-func
+    new Function(`${extractFn("secsSince", "function")}; return secsSince;`)(),
     (...a) => describeVideoImpl(...a)
   );
 
@@ -381,11 +385,17 @@ console.log("\n[3. release 的每一条路]");
   });
 
   /*
-   * 「功能没开」这条是真会走到的，而且最反直觉：字节在入站那一步就已经读进
-   * 内存了（那一步不看角色配置，和图片 / 语音一致），所以关着这个功能反而
-   * 会攒内存 —— 除非这里放掉。
+   * 「功能没开」这条现在是**兜底**，不是正常路径。
+   *
+   * 入站那一步已经先看开关了（imessage.js 里 videoOn 那段）：关着就压根不
+   * 下载，直接把「你看不到内容」那句话塞进队列 —— 一段 15MB 的视频同步下载
+   * 会把整条线路的消息循环堵几十秒，而换回来的只是这句写死的文案。
+   *
+   * 所以正常情况下带着字节走到这儿的 videos 是空的。这条仍然要测：`/重roll`
+   * 之类的路径、以及下次有人把入站那道闸挪走时，这里是最后一道防线 ——
+   * 漏了它就是「关着这个功能反而攒内存」，不报错、看不见、重启就好。
    */
-  await okAsync("角色没开「看视频」时也放掉", async () => {
+  await okAsync("角色没开「看视频」时也放掉（兜底）", async () => {
     const v = fakeVideo();
     const out = await H.describeVideos(null, "p", 1, runner(), [v]);
     assert.equal(v.released, 1, "没开这个功能反而漏了字节");
@@ -802,6 +812,51 @@ console.log("\n[7. 挂载与镜像]");
     const at = IM_SRC.indexOf("const gotSomething = Boolean(");
     assert.ok(at > 0, "找不到 gotSomething 那个判断");
     assert.match(IM_SRC.slice(at, at + 220), /videosSent/);
+  });
+
+  /*
+   * 关着「看视频」就**一个字节都不下载**。
+   *
+   * 这条钉的是用户报的「发视频像卡死了一样」：下载是在消息循环里同步等的，
+   * 一段 15MB 要几十秒，这期间整条线路的消息全堵在 SDK 缓冲里不动 —— 而
+   * 关着这个功能时，那几十秒换回来的只是一句写死的降级文案。
+   *
+   * 按「readVideo 那个循环在开关之后、而且遍历的是 videoOn 决定的集合」来判，
+   * 不按行号：这段代码以后还会动，但「先判开关再下载」这个顺序不能倒过来。
+   */
+  okWith("关着「看视频」时压根不下载（不然要卡几十秒）", () => {
+    const gate = IM_SRC.indexOf("const videoOn =");
+    const read = IM_SRC.indexOf("await readVideo(part, scope)");
+    assert.ok(gate > 0, "入站那段没有先判开关 —— 关着也会整段下载");
+    assert.ok(read > gate, "下载排在开关判断之前，等于闸没生效");
+    // 关着那条路要自己把降级文案塞进队列，否则模型什么都不知道
+    const after = IM_SRC.slice(gate, read);
+    assert.match(after, /没启用视频识别/, "关着时没告诉模型「有视频但看不到」");
+    assert.match(after, /不下载/, "日志里要说清是「没下载」，这是排查时最想知道的事");
+    // 遍历的必须是开关筛过的集合，不能还是原始的 videoParts
+    assert.match(IM_SRC, /for \(const part of videoOn \? videoParts : \[\]\)/);
+  });
+
+  /*
+   * 下载期间控制台不能一片空白。
+   *
+   * 以前 readBytes 只在**重试时**才出声，一次顺利的 15MB 下载从头到尾一个字
+   * 都没有 —— 用户看到的是「日志停住，长时间静默，然后突然蹦出一行」，和真
+   * 卡死分不出来，也没法判断是在下载、在打模型、还是挂了。
+   */
+  okWith("下载附件前后各打一行日志（静默就等于看不出卡在哪）", () => {
+    const src_ = src("server/src/attachread.js");
+    assert.match(src_, /开始下载/, "下载开始时一声不响");
+    assert.match(src_, /下载完了/, "下载结束时一声不响");
+    // 大附件才喊，小的走 debug —— 否则每张表情包都刷一行
+    assert.match(src_, /LOUD_BYTES/, "没有分级，小附件会把日志刷满");
+  });
+
+  okWith("黑框窗口那份日志带时间（拷出来要看得出时序）", () => {
+    const src_ = src("server/src/logs.js");
+    // 网页控制台本来就有时间，stdout 这份以前只有 [来源] 内容
+    assert.match(src_, /function stamp\(\)/, "stdout 那行没有时间戳");
+    assert.match(src_, /\$\{stamp\(\)\} \[\$\{entry\.scope\}\]/, "时间戳没接到输出行上");
   });
 
   okWith("三路全失败时那句话是按路数拼的，不是嵌套三目", () => {

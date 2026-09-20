@@ -539,12 +539,18 @@ function isPeerKind(kind) {
  *
  * @param {object} what 出岔子时日志里那句话（IG 上的痕迹已经留下了，不能回滚）
  */
-async function recordSeen(config, role, task, opts, { commentLine, peerName = "", quote = "", fields = {}, what }) {
+async function recordSeen(
+  config,
+  role,
+  task,
+  opts,
+  { commentLine, peerName = "", quote = "", item = null, fields = {}, what }
+) {
   const vars = { char: String(role?.name ?? ""), user: resolveUser(config, role)?.name ?? "" };
   const outcome = {
     ...nothing(task, role, ""),
     ...fields,
-    mark: markFor(task.kind, vars, peerName, quote),
+    mark: markFor(task.kind, vars, peerName, quote, item),
     commentLine,
     // 角色之间的互动照 recordPeer 那道闸走，和评论轮同一个规矩
     record: !isPeerKind(task.kind) || role?.instagram?.recordPeer !== false,
@@ -563,16 +569,79 @@ async function recordSeen(config, role, task, opts, { commentLine, peerName = ""
   return outcome;
 }
 
-/** 上下文里代替「对方发了条消息」的那一句。 */
-function markFor(kind, vars, peerName, quote) {
+/** 一段话截到 n 字，超了加省略号。mark 是要进每一轮上下文的，不能长。 */
+function clip(text, n) {
+  const s = String(text ?? "").trim();
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+/**
+ * 帖子 / 快拍在 mark 里怎么描述。
+ *
+ * ── 为什么要有这个 ──
+ *
+ * 评论那一轮模型看得到完整快照（igprompt.js:snapshot 给了配文、识图结果、
+ * 已有评论）。但快照是**那一轮**的提示词，用完就没了；留在 iMessage 上下文里
+ * 的只有 mark 这一句。以前它是「{{user}} 发了一条新帖子，你刷到了」——
+ * 发了**什么**一个字都没有。
+ *
+ * 后果是几轮之后聊到这条帖子，模型手里只有「他发过帖」这个事实，内容全靠编。
+ * 用户报的就是这个：「聊到帖子的时候，LLM 根本就不知道用户发了啥」。
+ *
+ * ── 带什么进去 ──
+ *
+ * **配文和画面两样都带，不是二选一。** 它们是两件不同的事：配文是人自己写的
+ * 字，画面是图里有什么。一条帖子配文写「终于」、图是一张病历单，只带配文的话
+ * 模型下一轮只知道「他说了终于」，聊起来照样接不上。
+ *
+ * 缺哪样就只说有的那样，两样都没有说「没写配文也没有图」—— 把「确实什么都
+ * 没有」说出来，比留白好：留白时模型会当成信息缺失，然后自己编一个。
+ *
+ * ── 画面从哪儿来 ──
+ *
+ * `visionNote`（识图模型看着真图写的）优先，没有就退到 `alt`（当初生图用的那句
+ * 提示词）。和 igprompt.js:mediaText 同一个优先级，理由也一样：识图结果是看着
+ * 图写的，alt 只是生图时的输入。
+ *
+ * 这个退路是必需的，不是锦上添花：点赞那条路（默认 45%，最常走的一条）在
+ * `ensureVisionNote` **之前**就返回了，第一个刷到的角色手上 `visionNote` 还是
+ * 空的。只认 visionNote 的话，用户发的帖子有近一半在上下文里只剩配文。
+ *
+ * 截断分开算（配文 80、画面 60）：mark 每轮都跟着上下文走，长了会挤掉真正的
+ * 对话。画面那份是描述性长句，前半句已经够定位。
+ */
+function contentOf(item) {
+  const caption = clip(item?.caption, 80);
+  const parts = [];
+  if (caption) parts.push(`配文是「${caption}」`);
+
+  // 快拍是单张 image，帖子是 images 数组（轮播）。和 ensureVisionNote 一样
+  // 只看第一张有描述的 —— 轮播后面几张多半是同一场景的补充
+  const imgs = item?.image ? [item.image] : Array.isArray(item?.images) ? item.images : [];
+  const alt = imgs.map((im) => String(im?.alt ?? "").trim()).find(Boolean) ?? "";
+  const seen = clip(item?.visionNote, 60) || clip(alt, 60);
+  if (seen) parts.push(`画面是${seen}`);
+
+  if (!parts.length) return imgs.length ? "没写配文，图也没有描述" : "没写配文也没有图";
+  return parts.join("，");
+}
+
+/**
+ * 上下文里代替「对方发了条消息」的那一句。
+ *
+ * @param {object} [item] 这一轮的帖子 / 快拍对象，用来把内容带进去（见 contentOf）。
+ *   拿不到就退回原来那句干巴巴的话 —— 少一句内容比整轮不记强
+ */
+function markFor(kind, vars, peerName, quote, item) {
   const who = kind.startsWith("user") ? String(vars?.user ?? "") || "用户" : peerName || "对方";
-  const said = quote ? `：${quote.length > 60 ? `${quote.slice(0, 60)}…` : quote}` : "";
+  const said = quote ? `：${clip(quote, 60)}` : "";
+  const what = item ? `，${contentOf(item)}` : "";
   switch (kind) {
     case "userPost":
     case "charPost":
-      return `[Instagram] ${who} 发了一条新帖子，你刷到了`;
+      return `[Instagram] ${who} 发了一条新帖子，你刷到了${what}`;
     case "userStory":
-      return `[Instagram] ${who} 发了一条快拍，你点开看了`;
+      return `[Instagram] ${who} 发了一条快拍，你点开看了${what}`;
     case "userComment":
     case "charComment":
       return `[Instagram] ${who} 在 Instagram 上跟你说${said || "了句话"}`;
@@ -729,6 +798,9 @@ export async function runIgTask(config, task, opts = {}) {
     return recordSeen(config, role, task, opts, {
       fields: { action: "like" },
       peerName: task.kind === "charPost" ? owner : "",
+      // 内容要带进 mark：这条路是**最常走**的一条（默认 45% 只点赞不打模型），
+      // 它不带内容的话，用户发的大半帖子在上下文里都只剩「他发过帖」
+      item,
       commentLine: isStory
         ? "[Instagram] 你给这条快拍点了个赞"
         : "[Instagram] 你给这条帖子点了个赞",
@@ -841,7 +913,9 @@ export async function runIgTask(config, task, opts = {}) {
     comment: text,
     commentId: saved?.id ?? "",
     dm,
-    mark: markFor(task.kind, built.vars, peerName, isReply ? target?.text ?? "" : ""),
+    // 传 fresh（识图之后重读的那份）而不是 item —— visionNote 是
+    // ensureVisionNote 刚写进去的，item 那份还是识图前的旧快照
+    mark: markFor(task.kind, built.vars, peerName, isReply ? target?.text ?? "" : "", fresh),
     commentLine: text ? `[Instagram 评论] ${text}` : "",
     // 角色间的互动要不要让模型知道。关了就只在 IG 上留个痕，不进上下文、
     // 也不进待总结 —— 用户那边一个字都看不见，本来也不该替他攒记忆

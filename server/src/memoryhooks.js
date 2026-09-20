@@ -222,6 +222,17 @@ async function runOne(kind, config, role, key, notify) {
 
   const name = KIND_NAMES[kind];
   const started = Date.now();
+  /*
+   * 开始那行也要有。
+   *
+   * 这一步是**后台**跑的（afterTurn 里 void 掉的），回复照发，所以它不该、
+   * 也确实没有拖慢这一轮。但用户看不到这点 —— 他看到的是回复慢了，然后猜
+   * 「是不是后台在总结记忆或者备忘录」。没有开始那行的话，这个猜测既证实
+   * 不了也排除不了：总结完成那行要几十秒后才出来，而它出来时前台早就发完了。
+   *
+   * 写清「不影响这一轮回复」，看到这行的人就不用再怀疑它是不是罪魁祸首。
+   */
+  logInfo("记忆库", `${key} 开始在后台跑${name}总结（不影响这一轮回复）…`);
   try {
     const out =
       kind === "memory"

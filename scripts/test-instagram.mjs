@@ -1007,7 +1007,21 @@ const llmPort = fakeLlm.address().port;
    */
   check("点赞也交给 commit 去写上下文", committed.length, 1);
   check("点赞轮不带评论、不带短信", [committed[0]?.comment, committed[0]?.dm], ["", ""]);
-  check("点赞轮的上文旁白和评论轮同一句", likeOut.mark, "[Instagram] 小满 发了一条新帖子，你刷到了");
+  /*
+   * mark 里**必须带上帖子内容**，不能只说「他发了条帖子」。
+   *
+   * 这一句是这条帖子留在 iMessage 上下文里**唯一**的痕迹（评论轮那份完整快照
+   * 用完就没了）。不带内容的话，几轮之后聊到这条帖子，模型手里只有「他发过帖」
+   * 这个事实，发了什么全靠编 —— 用户报的就是这个。
+   *
+   * 点赞这条路尤其要紧：它是最常走的一条（默认 45% 只点赞不打模型），
+   * 漏了它，用户发的近一半帖子在上下文里都是空的。
+   */
+  check(
+    "点赞轮的 mark 带上配文（不然下一轮聊起来模型不知道发了啥）",
+    likeOut.mark,
+    "[Instagram] 小满 发了一条新帖子，你刷到了，配文是「点赞用」"
+  );
   check("点赞轮助手那侧写的是点赞", likeOut.commentLine, "[Instagram] 你给这条帖子点了个赞");
   check("对用户的点赞一律记上下文", likeOut.record, true);
 
@@ -1046,7 +1060,11 @@ const llmPort = fakeLlm.address().port;
   check("评论和短信各归各的", [out.action, out.comment, out.dm], ["comment", "这张好看", "$晚点打给你"]);
   // dm 里那个打头的分隔符是有意留着的：rest 原样保留分隔符交给私聊链路切气泡，
   // 切出来的空气泡在那边会被丢掉
-  check("上下文里替代「对方发了条消息」的那句", out.mark, "[Instagram] 小满 发了一条新帖子，你刷到了");
+  check(
+    "上下文里替代「对方发了条消息」的那句，带着配文",
+    out.mark,
+    "[Instagram] 小满 发了一条新帖子，你刷到了，配文是「模型用」"
+  );
   check("给待总结用的那行", out.commentLine, "[Instagram 评论] 这张好看");
   check("对用户的互动一律记上下文", out.record, true);
   const landed = store.readPosts("user").find((p) => p.id === mine.id)?.comments ?? [];
@@ -1105,6 +1123,81 @@ const llmPort = fakeLlm.address().port;
   check("赞照样落盘了", store.readPosts("小明").find((p) => p.id === peerLiked.id)?.likes, ["阿瑞"]);
   check("角色之间的赞不进爱心页", store.readActivity()[0].kind !== "like" || store.readActivity()[0].actor !== "阿瑞", true);
 
+  /*
+   * ── mark 里的内容：配文和画面**两样都要** ──
+   *
+   * 它们是两件不同的事。一条帖子配文写「终于」、图是一张病历单，只带配文的话
+   * 模型下一轮只知道「他说了终于」，聊起来照样接不上。
+   *
+   * 画面那份的来源有两个，优先级和 igprompt.js:mediaText 一致：visionNote
+   * （识图模型看着真图写的）优先，没有就退到 alt（生图时那句提示词）。
+   * alt 这条退路不是锦上添花 —— 点赞那条路在 ensureVisionNote 之前就返回了，
+   * 第一个刷到的角色手上 visionNote 还是空的。
+   */
+  {
+    const both = store.addPost("user", {
+      caption: "终于",
+      images: [{ file: "x.png", alt: "一张病历单" }],
+      visionNote: "桌上摊着一张体检报告，右下角有红章",
+      createdAt: new Date(TQ - 3600e3).toISOString(),
+    });
+    const o = await doTask(
+      { roleId: "r-1", kind: "userPost", postOwner: "user", postId: both.id },
+      { roll: zero }
+    );
+    check(
+      "配文和画面两样都进 mark（只带一样就接不上话）",
+      o.mark,
+      "[Instagram] 小满 发了一条新帖子，你刷到了，配文是「终于」，画面是桌上摊着一张体检报告，右下角有红章"
+    );
+
+    // 没识过图：退到 alt。这是点赞那条路上最常见的形状
+    const noVision = store.addPost("user", {
+      caption: "",
+      images: [{ file: "y.png", alt: "海边的日落" }],
+      createdAt: new Date(TQ - 3600e3).toISOString(),
+    });
+    const o2 = await doTask(
+      { roleId: "r-1", kind: "userPost", postOwner: "user", postId: noVision.id },
+      { roll: zero }
+    );
+    check(
+      "没识过图就退到 alt（点赞轮最常见的形状）",
+      o2.mark,
+      "[Instagram] 小满 发了一条新帖子，你刷到了，画面是海边的日落"
+    );
+
+    // 什么都没有：要说出来。留白会让模型当成信息缺失，然后自己编一个
+    const bare = store.addPost("user", {
+      caption: "",
+      createdAt: new Date(TQ - 3600e3).toISOString(),
+    });
+    const o3 = await doTask(
+      { roleId: "r-1", kind: "userPost", postOwner: "user", postId: bare.id },
+      { roll: zero }
+    );
+    check(
+      "什么都没有时明说（留白会让模型自己编）",
+      o3.mark,
+      "[Instagram] 小满 发了一条新帖子，你刷到了，没写配文也没有图"
+    );
+
+    // 快拍是单张 image 而不是 images 数组，这条路容易漏
+    const st = store.addStory("user", {
+      caption: "路上",
+      image: { file: "z.png", alt: "地铁站台" },
+      createdAt: new Date(TQ - 600e3).toISOString(),
+    });
+    const o4 = await doTask(
+      { roleId: "r-1", kind: "userStory", postOwner: "user", storyId: st.id },
+      { roll: zero }
+    );
+    check(
+      "快拍那条路也带内容（单张 image，不是 images 数组）",
+      o4.mark,
+      "[Instagram] 小满 发了一条快拍，你点开看了，配文是「路上」，画面是地铁站台"
+    );
+  }
   // ── 线程聊够了 / 模型什么都没说 ──
   const full = store.addPost("小明", {
     caption: "聊够了用",

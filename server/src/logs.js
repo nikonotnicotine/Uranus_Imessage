@@ -161,6 +161,24 @@ const CONSOLE_FN = {
 };
 
 /**
+ * stdout 那一行开头的时间。
+ *
+ * 网页控制台每行左边本来就有时间（panels/console.jsx 的 fmtTime），但 .bat
+ * 窗口这一份以前只有 `[来源] 内容` —— 于是从黑框里拷出来的日志是一段没有
+ * 时间轴的文本，「这两行之间隔了多久」「这条是十分钟前的还是刚才的」全看不
+ * 出来，排查时正是最要紧的那个信息。
+ *
+ * 只有本地时分秒，不带日期也不带毫秒：这是给人现场看的，日期在窗口里翻不了
+ * 几屏就重复，毫秒只有对时序较真时才用得上，而那种场合该看网页控制台
+ * （那边有毫秒）。格式和网页那份的前半段一致，两边对照时不用换算。
+ */
+function stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
  * 记一条日志。
  * @param {"debug"|"info"|"warn"|"error"|"critical"} level
  *   不认识的级别降级成 info（老调用方传什么都不会炸）
@@ -183,7 +201,7 @@ export function log(level, scope, message, detail) {
   if (ring.length > RING_MAX) ring.splice(0, ring.length - RING_MAX);
 
   (CONSOLE_FN[lv] ?? console.log)(
-    `[${entry.scope}] ${entry.message}${entry.detail ? `\n  ${entry.detail}` : ""}`
+    `${stamp()} [${entry.scope}] ${entry.message}${entry.detail ? `\n  ${entry.detail}` : ""}`
   );
 
   for (const fn of subscribers) {

@@ -1309,6 +1309,8 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音") {
 
   const startedAt = Date.now();
   const id = String(voiceId ?? "").trim();
+  // 和生图同理：合成也是同步等的，只有完成那行的话中间那段没有交代
+  logInfo(scope, `开始合成语音（${source.name}，${clean.length} 字）…`);
 
   /*
    * 连接类的失败重试一次。
@@ -1451,6 +1453,13 @@ export async function generateImage(endpoint, req, scope = "生图") {
   const refFile = req?.refFile || null;
   const auth = key ? { Authorization: `Bearer ${key}` } : {};
   const startedAt = Date.now();
+  // 出图要几十秒，而且是**同步**的（对方在那头看着打字指示器等）。
+  // 以前只有成功那行日志，失败或者卡住时这段等待在控制台里没有任何痕迹
+  logInfo(
+    scope,
+    `开始出图（${endpoint?.label ?? model}${refFile ? `，参考图 ${path.basename(refFile)}` : ""}）…`,
+    desc
+  );
   // 用户没选比例时是 null，下面两条路都据此整个跳过，一个字段都不加
   const ratio = endpoint?.ratio ?? null;
 

@@ -343,6 +343,17 @@ function scopeOf(runner, base) {
 }
 
 /**
+ * 从某个时刻到现在过了几秒，保留一位小数。
+ *
+ * 每个耗时步骤的「完成」那行都带上这个。不带的话日志只能回答「做完了吗」，
+ * 回答不了「慢在哪一步」—— 而用户报上来的问题基本都是后者（「发视频要好久
+ * 才回复」）。秒而不是毫秒：这些步骤都是几秒到几十秒的量级，毫秒只是噪音。
+ */
+function secsSince(startedAt) {
+  return ((Date.now() - startedAt) / 1000).toFixed(1);
+}
+
+/**
  * 把一个地址归一成「人」的键，用来对上 chatbg.js 报上来的 peerKey。
  *
  * 两边必须算出同一个字符串，否则背景变更永远匹配不到发消息的那个人：
@@ -1165,13 +1176,20 @@ async function describeImages(endpoint, prompt, max, runner, images) {
   let firstError = null;
   for (const [i, image] of use.entries()) {
     const label = use.length > 1 ? `图片${i + 1}` : "图片";
+    // 开始那行也要有：识图要打一次模型（VISION_TIMEOUT 是 180 秒），只有
+    // 「完成」那行的话，这中间几十秒在控制台里看不出是在识别还是卡住了
+    logInfo(scope, `开始识别${label}${use.length > 1 ? `（共 ${use.length} 张）` : ""}…`);
+    const startedAt = Date.now();
     try {
       const desc = await describeImage(endpoint, prompt, image);
-      logInfo(scope, `${label}识别完成：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`);
+      logInfo(
+        scope,
+        `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
+      );
       runner.imageCount += 1;
       parts.push(`${label}内容：${desc}`);
     } catch (e) {
-      logError(scope, `${label}识别失败`, e);
+      logError(scope, `${label}识别失败（等了 ${secsSince(startedAt)}s）`, e);
       parts.push(`${label}：识别失败（${String(e?.message ?? e)}）`);
       failed += 1;
       firstError ??= e;
@@ -1231,13 +1249,18 @@ async function describeVoices(endpoint, prompt, max, runner, voices) {
   for (const [i, voice] of use.entries()) {
     const label = use.length > 1 ? `语音${i + 1}` : "语音";
     const dur = voice.seconds ? `（${voice.seconds.toFixed(1)} 秒）` : "";
+    logInfo(scope, `开始识别${label}${dur}${use.length > 1 ? `（共 ${use.length} 条）` : ""}…`);
+    const startedAt = Date.now();
     try {
       const desc = await transcribeAudio(endpoint, prompt, voice);
-      logInfo(scope, `${label}识别完成：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`);
+      logInfo(
+        scope,
+        `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
+      );
       runner.audioCount += 1;
       parts.push(`${label}${dur}内容：${desc}`);
     } catch (e) {
-      logError(scope, `${label}识别失败`, e);
+      logError(scope, `${label}识别失败（等了 ${secsSince(startedAt)}s）`, e);
       parts.push(`${label}${dur}：识别失败（${String(e?.message ?? e)}）`);
       failed += 1;
       firstError ??= e;
@@ -1307,13 +1330,21 @@ async function describeVideos(endpoint, prompt, max, runner, videos) {
   let firstError = null;
   for (const [i, video] of use.entries()) {
     const label = use.length > 1 ? `视频${i + 1}` : "视频";
+    // 视频是三路里最慢的：几十 MB 的 base64 光上传就要一阵，识别本身更久。
+    // 把体积一起报出来 —— 「等了 90 秒」配上「27MB」才知道是正常还是卡了
+    const mb = video.base64 ? ((video.base64.length * 3) / 4 / 1024 / 1024).toFixed(1) : "";
+    logInfo(scope, `开始识别${label}${mb ? `（约 ${mb}MB）` : ""}，这一步比识图慢得多…`);
+    const startedAt = Date.now();
     try {
       const desc = await describeVideo(endpoint, prompt, video);
-      logInfo(scope, `${label}识别完成：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`);
+      logInfo(
+        scope,
+        `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
+      );
       runner.videoCount += 1;
       parts.push(`${label}内容：${desc}`);
     } catch (e) {
-      logError(scope, `${label}识别失败`, e);
+      logError(scope, `${label}识别失败（等了 ${secsSince(startedAt)}s）`, e);
       parts.push(`${label}：识别失败（${String(e?.message ?? e)}）`);
       failed += 1;
       firstError ??= e;
@@ -2690,26 +2721,38 @@ async function handleTurn(
     worldHits: worldInfo.hitNames,
   };
   notePrompt(promptMeta, messages);
-  logDebug(
+  /*
+   * 这行以前是 debug —— 也就是默认那档看不见。
+   *
+   * 于是一轮里**最长**的那段等待（CHAT_TIMEOUT 是 300 秒，还要加上重试）在
+   * 控制台里是完全空白的：上一行是「收到一轮消息」，下一行就是「模型回复
+   * xx 字」，中间那一两分钟没有任何东西说明「正在等模型」。用户看到的就是
+   * 日志停住不动，分不出是在等模型、卡死了、还是压根没收到消息。
+   *
+   * 所以提到 info。每轮只多一行，换来的是「静默的这段时间在干什么」有答案。
+   */
+  logInfo(
     llmScope,
     `发给模型 ${messages.length} 条消息${user ? `（用户人设：${userLabel(user)}）` : ""}，` +
       `预设「${presetLabel(preset)}」，正在等回复…`
   );
 
   let reply;
+  const askedAt = Date.now();
   try {
     // 主模型失败自动退到这个角色自己的副 API。生成参数来自预设，主副共用
     const { content } = await chatWithFallback(eps.chat, eps.fallback, messages, params);
     reply = content;
   } catch (e) {
-    // 主副都挂了：历史里那条 user 消息留着（下轮还能带上），但要说清楚
-    logError(llmScope, "这一轮没能拿到回复", e);
+    // 主副都挂了：历史里那条 user 消息留着（下轮还能带上），但要说清楚。
+    // 带上等了多久 —— 「等 3 秒就报错」和「等满 300 秒超时」是两种毛病
+    logError(llmScope, `这一轮没能拿到回复（等了 ${secsSince(askedAt)}s）`, e);
     // 让对方知道这轮为什么没回，不用去翻控制台
     await space.responding(() => notifyFailure(runner, space, "这条消息没回上来", e));
     throw e;
   }
 
-  logInfo(llmScope, `模型回复 ${reply.length} 字`, reply);
+  logInfo(llmScope, `模型回复 ${reply.length} 字，花了 ${secsSince(askedAt)}s`, reply);
 
   /*
    * 联网搜索：回复里写了 [搜索:…] 就真去搜一趟，拿结果再问一次。
@@ -4434,7 +4477,23 @@ function effectAllowed(ctx, key, scope) {
 async function sendBubbles(runner, space, chat, text, ctx = {}) {
   const scope = scopeOf(runner, "桥接");
   const bubbles = splitBubbles(text || "（我暂时答不上来）", chat);
-  logDebug(scope, `拆成 ${bubbles.length} 条气泡，开始发送`);
+  /*
+   * 这行以前是 debug，而且不说要等多久。
+   *
+   * 「模型回复 xx 字」之后到对方真收到消息之间，是按字数算的打字停顿
+   * （delay.js:computeDelay，一条长消息几十秒是正常的）。默认那档看不见
+   * 这行的话，这段等待又是一片空白 —— 而它恰恰是**故意**等的，不是故障。
+   *
+   * 所以提到 info，并且把总时长先算出来报掉：看到「预计 42s 发完」就知道
+   * 接下来的静默是设计如此，不用去怀疑是不是卡了。
+   */
+  const totalDelay = bubbles.reduce((sum, b) => sum + (b.delay ?? 0), 0);
+  logInfo(
+    scope,
+    `拆成 ${bubbles.length} 条气泡，开始按打字节奏发` +
+      `${totalDelay >= 1 ? `（预计 ${totalDelay.toFixed(0)}s 发完）` : ""}`
+  );
+  const startedAt = Date.now();
   try {
     await space.startTyping();
   } catch {
@@ -4560,7 +4619,10 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
   } catch {
     /* ignore */
   }
-  logInfo(scope, `回复发完，共 ${bubbles.length} 条气泡、${sent} 条消息`);
+  logInfo(
+    scope,
+    `回复发完，共 ${bubbles.length} 条气泡、${sent} 条消息，花了 ${secsSince(startedAt)}s`
+  );
   return sent;
 }
 
@@ -5109,16 +5171,22 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             /*
              * 视频，同样进队列。
              *
-             * ── 为什么不在这儿看角色开关 ──
+             * ── 关着「看视频」就压根不下载 ──
              *
              * 图片和语音都是先读进来、到 handleTurn 才按 eps.vision / eps.audio
-             * 判「这个角色开没开」。视频照这个规矩走，好处是关着的时候模型也能
-             * 收到一句「对方发了段视频但你看不到」（describeVideos 的降级文案），
-             * 而不是当成什么都没发生 —— 那正是这个功能之前的毛病。
+             * 判「这个角色开没开」，视频**不跟这个规矩**。原因是体积：一段视频
+             * 15MB 起步，而下载是在消息循环里同步等的（见下面 readVideo 那行），
+             * 这几十秒里整条线路的消息全堵在 SDK 缓冲里不动 —— 用户报的
+             * 「发视频像卡死了」就是这个。
              *
-             * 代价是关着也白读一遍字节。**这就是 describeVideos 里
-             * 「没开也要 release」那段存在的理由**：读进来的 27MB 在那一步立刻
-             * 放掉，不会因为「功能关着」反倒把内存攒起来。
+             * 早年这儿是照图片语音的规矩走的，理由写的是「关着也让模型收到一句
+             * 『对方发了段视频但你看不到』」。但那句降级文案是 describeVideos 里
+             * **写死的字符串**，压根不需要字节 —— 于是代价是整段下载，换回一句
+             * 本来就不要钱的话。所以现在开关关着就在这儿直接兑现那句话。
+             *
+             * 文案和 describeVideos 那条保持一致（同一件事只该有一种说法）。
+             * 走 text 进队列，和读图失败那一路同一个套路：下游 handleTurn、
+             * 提示词、上下文存档都不用改。
              *
              * ── 超上限的那条错误要发给模型 ──
              *
@@ -5129,7 +5197,29 @@ async function startRunner(getConfig, project, meta, retries = 0) {
              * 才是对方能照着做的（重发个短的）。
              */
             let videosSent = 0;
-            for (const part of videoParts) {
+            // 现读现判：用户随时可能改角色配置，不能缓存住这一轮开始那一刻的快照
+            const videoOn = videoParts.length
+              ? Boolean(resolveRoleEndpoints(getConfig(), currentRole(getConfig(), runner)).video)
+              : false;
+            if (videoParts.length && !videoOn) {
+              logInfo(
+                scope,
+                `对方发来 ${videoParts.length} 段视频，但这个角色没启用视频识别，不下载`
+              );
+              enqueue(
+                getConfig,
+                runner,
+                space,
+                spaceId,
+                {
+                  text: `（用户发了 ${videoParts.length} 段视频，但视频识别未启用，你看不到内容）`,
+                  message,
+                },
+                peer
+              );
+              videosSent += videoParts.length;
+            }
+            for (const part of videoOn ? videoParts : []) {
               try {
                 const video = await readVideo(part, scope);
                 logInfo(

@@ -36,7 +36,7 @@
  * 只是这一轮回得晚一点 —— 而丢图的代价是角色答得像什么都没收到。
  */
 
-import { logWarn } from "./logs.js";
+import { logDebug, logInfo, logWarn } from "./logs.js";
 
 /**
  * 重试间隔（毫秒），按已经试过几次往后取。总共最多读 5 次、累计等 17.8 秒。
@@ -58,6 +58,15 @@ import { logWarn } from "./logs.js";
  * 在这儿无限等只会把这一轮永远卡住 —— 后面的消息还排在同一条处理链上（chain）。
  */
 const RETRY_MS = [800, 2000, 5000, 10_000];
+
+/**
+ * 多大才值得在控制台喊一声「开始下载」（字节）。
+ *
+ * 2MB：一张手机照片 1～3MB、一条语音几百 KB，那些下载起来一两秒，喊了只是
+ * 噪音；视频 15MB 起步，那种是真要等几十秒的。取在这儿的意思是「人能感觉到
+ * 的等待才报」。SDK 报不出 `size` 时按 debug 走，不猜。
+ */
+const LOUD_BYTES = 2 * 1024 * 1024;
 
 /**
  * 这个错误是不是「连接断了，等一下可能就好了」。
@@ -85,6 +94,18 @@ export function isTransientRead(err) {
  * 不做空字节和大小检查 —— 那两样各条路的阈值不一样（图 8MB、语音 20MB、
  * 文件 10MB），留给调用方。这里只负责「把字节拿回来」这一件事。
  *
+ * ── 下载开始和结束各打一行 ──
+ *
+ * 以前这里只在**重试时**才出声，第一次尝试一声不响。一次顺利的 15MB 下载
+ * 从头到尾控制台一个字都没有，而这几十秒消息循环是堵着的（调用方在
+ * `await` 这个函数）—— 用户看到的就是「最后一条日志停在上一轮，然后长时间
+ * 静默，然后突然蹦出一行『收到视频：15.1MB』」，和卡死一模一样，也没法
+ * 判断到底是在下载、在打模型、还是真挂了。
+ *
+ * 开始那行按体积分级：SDK 报得出 `size` 且超过 LOUD_BYTES 才用 info
+ * （那种才是人能感觉到的等待），小的走 debug 免得把每张表情包都刷成一行。
+ * 结束那行只在开始那行喊过时才打 —— 单独一行「下载完了」没有参照物。
+ *
  * @param {object} content SDK 的 attachment / voice content
  * @param {string} scope 日志前缀，例如「桥接·Dante」
  * @param {string} what 日志里的东西名：「图片」/「语音」/「文件」
@@ -92,6 +113,17 @@ export function isTransientRead(err) {
  * @throws 最后一次的错误。不可重试的当场抛，不等。
  */
 export async function readBytes(content, scope, what) {
+  const claimed = Number(content?.size ?? 0);
+  const mb = (n) => (n / 1024 / 1024).toFixed(1);
+  // 够大才值得喊一声。小附件每条都报会把日志刷满，而它们本来也不卡
+  const loud = claimed >= LOUD_BYTES;
+  if (loud) {
+    logInfo(scope, `开始下载${what}（${mb(claimed)}MB），这期间这条线路的消息要排队等`);
+  } else {
+    logDebug(scope, `开始下载${what}${claimed ? `（${mb(claimed)}MB）` : ""}`);
+  }
+
+  const startedAt = Date.now();
   let last = null;
   for (let i = 0; i <= RETRY_MS.length; i += 1) {
     if (i) {
@@ -104,7 +136,12 @@ export async function readBytes(content, scope, what) {
       await new Promise((resolve) => setTimeout(resolve, wait));
     }
     try {
-      return await content.read();
+      const buf = await content.read();
+      const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+      // 开始那行没喊的话，这行也不喊 —— 孤零零一句「下载完了」没有参照物
+      if (loud) logInfo(scope, `${what}下载完了：${mb(buf.length)}MB，花了 ${secs}s`);
+      else logDebug(scope, `${what}下载完了：${mb(buf.length)}MB，花了 ${secs}s`);
+      return buf;
     } catch (e) {
       last = e;
       if (!isTransientRead(e)) throw e;
