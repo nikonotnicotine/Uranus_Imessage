@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   CATEGORY_LABELS,
+  SPY_GROUP_NAMES,
+  SPY_GROUP_OF_FIELD,
   SPY_SWITCHES,
   describeRef,
   modelLabel,
@@ -16,6 +18,10 @@ import {
   resolveUser,
   roleBlockReason,
   roleLabel,
+  SPY_CHILD_OF_FIELD,
+  spyFeatureCount,
+  spyFeatureOn,
+  spyFeaturesInGroup,
   spySwitchesOn,
   userLabel,
   worldBookLabel,
@@ -426,10 +432,22 @@ function RoleSpyFields({ role, onGoto }) {
   // 手机里那三组任一开着，都要那套 SMTP 凭据 —— 和手机屏幕查岗走的是同一条腿
   const needsPhone = phoneOn || viewOn || controlOn || musicOn;
   const anyOn = pcOn || needsPhone;
-  // 任一条腿打开时都要把预设里那条子条目一并打开，不然开关开了也不注入
+  /*
+   * 打开一条腿时，把预设里**对着它那一条**子条目一并打开 —— 不然开关开了也不注入。
+   *
+   * 查岗在预设里是四条（屏幕 / 查看 / 控制 / 网易云），所以这儿要按字段找对应
+   * 那一条，不能笼统开一条了事：用户点开「让角色放歌」，该开的是 spyMusic，
+   * 把四条全开上等于替他同意了另外三摊他没点的事。
+   *
+   * 只在**开**的时候动，关的时候一律不碰 —— 预设是多个角色共用的（见 usePresetGate）。
+   */
   const turnOn = (patch) => {
     set(patch);
-    openGate("spy");
+    for (const [field, v] of Object.entries(patch)) {
+      if (!v) continue;
+      const kind = SPY_CHILD_OF_FIELD[field];
+      if (kind) openGate(kind);
+    }
   };
 
   /*
@@ -520,27 +538,43 @@ function RoleSpyFields({ role, onGoto }) {
           </p>
         </div>
 
-        {SPY_SWITCHES.slice(2).map((s) => (
-          <label key={s.field} className="flex items-start justify-between gap-4">
-            <span className="min-w-0">
-              <span className="block text-ui text-ink">{s.label}</span>
-              <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
-                允许这个角色写
-                <code className="mx-1 bg-sunken px-1">{s.tag}</code>
-                这样的标签。{s.hint}
-              </span>
-            </span>
-            <Switch
-              checked={Boolean(spy[s.field])}
-              onChange={(v) => turnOn({ [s.field]: v })}
-              label={`启用${s.label}`}
-            />
-          </label>
-        ))}
+        {SPY_SWITCHES.slice(2).map((s) => {
+          const group = SPY_GROUP_OF_FIELD[s.field];
+          const on = Boolean(spy[s.field]);
+          return (
+            <div key={s.field} className="grid grid-cols-1 gap-4">
+              <label className="flex items-start justify-between gap-4">
+                <span className="min-w-0">
+                  <span className="block text-ui text-ink">{s.label}</span>
+                  <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                    允许这个角色写
+                    <code className="mx-1 bg-sunken px-1">{s.tag}</code>
+                    这样的标签。{s.hint}
+                  </span>
+                </span>
+                <Switch
+                  checked={on}
+                  onChange={(v) => turnOn({ [s.field]: v })}
+                  label={`启用${s.label}`}
+                />
+              </label>
 
-        {musicOn && (
-          <PlaylistFields playlists={smtp.playlists} updateSpyApi={updateSpyApi} />
-        )}
+              {/*
+                这一组里那几件事各自的开关。只在组开关开着时显示 —— 组关着的时候
+                这些开关一个都不起作用（服务端两层都要过，见 spy.js:spyLegs），
+                摆出来只会让人以为开了就能用。
+              */}
+              {on && group && (
+                <SpyFeatureToggles group={group} spy={spy} set={set} />
+              )}
+
+              {/* 预设歌单紧跟着网易云那一组，中间不夹别的开关 */}
+              {s.field === "phoneMusicEnabled" && musicOn && (
+                <PlaylistFields playlists={smtp.playlists} updateSpyApi={updateSpyApi} />
+              )}
+            </div>
+          );
+        })}
       </div>
 
       {anyOn && (
@@ -849,6 +883,81 @@ function RoleSpyFields({ role, onGoto }) {
           </div>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 一组里那几件事各自的开关（查看类九项 / 控制类四项 / 网易云六项）。
+ *
+ * 摆在组开关底下、缩进一层、外面套个框，说的就是「这是那个开关的细分」而不是
+ * 又一批平级开关。清单从 labels.js:SPY_FEATURE_SWITCHES 读，那是服务端
+ * spyfeatures.js 的镜像。
+ *
+ * **全开是默认**（缺键当开，见 labels.js:spyFeatureOn），所以这儿的常态是「用户
+ * 来关掉几项」而不是「来挑几项开」。关掉的那一项：提示词里不教（服务端
+ * spy.js:trimSpyPrompt 从清单和示例里都删掉），模型硬写也会被挡（phonePool）。
+ *
+ * 两个批量按钮是必要的：查看类九项，用户想「只留电量」得点八下。
+ */
+function SpyFeatureToggles({ group, spy, set }) {
+  const all = spyFeaturesInGroup(group);
+  const { on, total } = spyFeatureCount(spy, group);
+  const features = spy.features ?? {};
+  const flip = (key, v) => set({ features: { ...features, [key]: v } });
+  // 批量：把这一组每一项都写成同一个值。别组的键原样留着
+  const allTo = (v) =>
+    set({ features: { ...features, ...Object.fromEntries(all.map((f) => [f.key, v])) } });
+
+  return (
+    <div className="grid grid-cols-1 gap-3 rounded border border-line p-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-ui text-ink">
+            {SPY_GROUP_NAMES[group]}这一类能用哪几项
+            <span className="ml-2 font-mono text-meta text-ink-faint">
+              {on}/{total}
+            </span>
+          </p>
+          <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
+            默认全开。关掉的那几项<strong className="text-ink-soft">不会写进提示词</strong>
+            ，角色压根不知道有这回事；它硬写标签也不会生效。
+          </p>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button variant="ghost" onClick={() => allTo(true)}>
+            全开
+          </Button>
+          <Button variant="ghost" onClick={() => allTo(false)}>
+            全关
+          </Button>
+        </div>
+      </div>
+
+      {all.map((f) => (
+        <label key={f.key} className="flex items-start justify-between gap-4">
+          <span className="min-w-0">
+            <span className="block text-ui text-ink">{f.name}</span>
+            {f.hint && (
+              <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                {f.hint}
+              </span>
+            )}
+          </span>
+          <Switch
+            checked={spyFeatureOn(spy, f.key)}
+            onChange={(v) => flip(f.key, v)}
+            label={`启用${f.name}`}
+          />
+        </label>
+      ))}
+
+      {!on && (
+        <p className="text-meta leading-relaxed text-ink-faint">
+          这一组一项都没开，等于上面那个开关是关着的 ——
+          提示词里这一整行都不会出现。
+        </p>
       )}
     </div>
   );

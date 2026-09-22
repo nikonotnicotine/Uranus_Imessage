@@ -62,28 +62,32 @@
  *
  * 认标签、挑 pool、驱动那一趟、拼给模型的话都在这个文件（`phoneTargetIn` /
  * `phonePool` / `runPhone`）；真去发邮件等回传在 spyrun.js。两类各查一份自己的
- * pool：查看类是 `viewFeatures()`，操控类是 `controlFeatures()` —— 分开是必须的，
+ * pool：查看类只找 `group === "view"` 的，操控类只找其余的 —— 分开是必须的，
  * 不然模型用查岗标签点歌会被匹配上，然后走一条不该走的路。
  *
- * ── 五个开关，不是一个 ──
+ * ── 两层开关，不是一个 ──
  *
- * 角色上是五个独立开关（`spyLegs`）：电脑屏幕、手机屏幕、查看、操控、网易云。
+ * 第一层是五个**组**开关（`spyLegs`）：电脑屏幕、手机屏幕、查看、操控、网易云。
  * 分这么细是因为**代价和外溢程度差了好几个量级** —— 看一眼桌面截图和替用户
  * 打开支付宝账单不是一回事，后者更不是「把他手机锁掉」那回事。
  *
  * 操控类**横跨两个开关**（闹钟锁屏归 control，网易云归 music），所以
  * `phonePool` 要按开关再滤一道：只开放歌的用户写 `[操控手机:锁屏]` 必须匹配
  * 不上，不然那部手机就真的被锁了，而用户从没同意过这件事。
+ *
+ * 第二层是那十九件事**各自一个开关**（`role.spy.features`，键名是
+ * spyfeatures.js 的 key）。同一组里各项的外溢程度也差得远：查看类里「电量」
+ * 只回一个数，「微信」是把聊天列表整屏念出来；控制类里「设置闹钟」是帮忙，
+ * 「关闭闹钟」能把用户定好的起床闹钟关掉。所以真正可用 = 组开着 **且** 这项
+ * 自己开着，两层都过了才进 `legs.features`。
+ *
+ * 下游一律只看 `legs.features` 这份清单，不再自己去查 `role.spy` —— 裁提示词
+ * （trimSpyPrompt）、挑 pool（phonePool）问的是同一个问题，答案只该有一份。
  */
 
 import { logDebug, logInfo, logWarn } from "./logs.js";
 import { describeImage } from "./llm.js";
-import {
-  controlFeatures,
-  featuresInGroup,
-  matchFeature,
-  viewFeatures,
-} from "./spyfeatures.js";
+import { FEATURES, GROUP_NAMES, featureByKey, matchFeature } from "./spyfeatures.js";
 import { runByName } from "./spyrun.js";
 import {
   cancelShot,
@@ -161,7 +165,7 @@ export const DEVICE_NAMES = { pc: "电脑", phone: "手机" };
 const OTHER = { pc: "phone", phone: "pc" };
 
 /**
- * 这个角色的五个查岗开关各自开没开。
+ * 这个角色的查岗开关都开成什么样：五个组 + 十九件事各自那一个。
  *
  * 前两个是屏幕（`spy.pcEnabled` / `spy.phoneEnabled`，老配置的单个 `enabled`
  * 由 config.js:normalizeSpy 迁过来），后三个管手机**里面**那十九件事，按
@@ -179,8 +183,22 @@ const OTHER = { pc: "phone", phone: "pc" };
  * （runSpy）只在 `screens` 里打转，而「这一整条子条目要不要注入」问的是 `any`。
  * 混成一个的话，只开「放歌」的用户会拿到一整段讲屏幕查岗的提示词。
  *
+ * ── `features` / `on` 这两个字段 ──
+ *
+ * `features` 是**两层都过了**的那几件事（组开着 + 这项自己开着），按表里的
+ * 顺序。`on(key)` 是查单项的函数。下游一律用它们，别再自己去翻 `role.spy` ——
+ * 「两层都要过」这条规则只该写在一个地方。
+ *
+ * 一组开着、但组里每一项都被用户关掉，是个合法状态：那一组的 `group` 字段还是
+ * true（用户确实同意过这一类），但 `features` 里没有它的项 —— 提示词里那一行
+ * 会被裁掉（trimSpyPrompt 按「这组有没有活着的项」判），pool 也是空的。
+ * 不把 `view` 直接改成 false，是因为那样会让「用户关了组」和「用户把组里的项
+ * 一个个关光了」变成同一件事，界面上就没法把他自己的选择原样显示回去。
+ *
  * @returns {{pc:boolean, phone:boolean, view:boolean, control:boolean,
- *            music:boolean, screens:boolean, any:boolean}}
+ *            music:boolean, screens:boolean, any:boolean,
+ *            features:import("./spyfeatures.js").SpyFeature[],
+ *            on:(key:string)=>boolean}}
  */
 export function spyLegs(role) {
   const spy = role?.spy ?? {};
@@ -190,8 +208,65 @@ export function spyLegs(role) {
   const control = Boolean(spy.phoneControlEnabled);
   const music = Boolean(spy.phoneMusicEnabled);
   const screens = pc || phone;
-  return { pc, phone, view, control, music, screens, any: screens || view || control || music };
+  const groups = { view, control, music };
+
+  /*
+   * 单项开关。**缺键当开** —— 和 config.js:normalizeSpyFeatures 同一条规矩，
+   * 在这儿再写一遍是因为这个函数也吃没过归一化的对象（测试、老备份、
+   * 手改过的 data.config.json）。少了这一句，那些路径下十九件事会全变成关的。
+   */
+  const picked = spy.features && typeof spy.features === "object" ? spy.features : {};
+  const on = (key) => {
+    const f = featureByKey(key);
+    if (!f || !groups[f.group]) return false;
+    return picked[key] === undefined ? true : Boolean(picked[key]);
+  };
+  const features = FEATURES.filter((f) => on(f.key));
+
+  return {
+    pc,
+    phone,
+    view,
+    control,
+    music,
+    screens,
+    any: screens || view || control || music,
+    features,
+    on,
+  };
 }
+
+/** 这一组里还有几件事是活着的（两层都过了）。裁提示词和挑 pool 都问这个。 */
+function liveInGroup(legs, group) {
+  return (legs?.features ?? []).filter((f) => f.group === group);
+}
+
+/** 这一组一共几件事。判「用户一项都没关」用的。 */
+function groupSize(group) {
+  return FEATURES.filter((f) => f.group === group).length;
+}
+
+/** 五条腿的全名单，也是不指定 kind 时的默认。 */
+const ALL_LEGS = ["pc", "phone", "view", "control", "music"];
+
+/**
+ * 四条查岗子条目各自管哪几条腿（preset.js:FORMAT_CHILD_KINDS 里那四个 kind）。
+ *
+ * 查岗在预设里是**四条**子条目，不是一条 —— 分法照角色面板和参考插件
+ * `_conf_schema.json` 的三段（view_actions / control_actions / netease_music），
+ * 屏幕单独一条。每条正文里只有自己那一段，所以裁剪也只该按自己那几条腿判：
+ * `spyMusic` 那条正文里压根没有屏幕两行，它要是跟着去看 `on.pc`，
+ * 「全开就原样返回」这类判断就会被另一组的开关带跑。
+ *
+ * 不给 kind 时（老配置里那条合在一起的 `spy`、整合查岗那一路）照旧按
+ * 五行一整段处理 —— 拆分是提示词这一层的事，别让别的调用方跟着改。
+ */
+const KIND_LEGS = {
+  spyScreen: ["pc", "phone"],
+  spyView: ["view"],
+  spyControl: ["control"],
+  spyMusic: ["music"],
+};
 
 /**
  * 三个手机组各自那一行，靠**变量占位符**认。
@@ -208,9 +283,15 @@ const GROUP_VARS = {
   music: /\{\{\s*网易云项\s*\}\}/,
 };
 
-/** 把一组功能拼成给模型看的清单。要参数的带上参数长什么样。 */
-function featureList(group, { playlists = [] } = {}) {
-  return featuresInGroup(group)
+/**
+ * 把一组功能拼成给模型看的清单。要参数的带上参数长什么样。
+ *
+ * 列的是 `legs.features` 里属于这一组的那几件 —— 用户关掉的单项**不许出现在
+ * 清单里**。清单是模型唯一的功能来源，写进去就等于教它写那个标签，而那个标签
+ * 一定会被 phonePool 挡掉：白烧一轮生成，换来角色说一句「我试了但没用」。
+ */
+function featureList(group, legs, { playlists = [] } = {}) {
+  return liveInGroup(legs, group)
     .map((f) => {
       if (!f.needsArg) return f.name;
       /*
@@ -238,22 +319,27 @@ function featureList(group, { playlists = [] } = {}) {
  * 结果就是：查看类关着，正文里却还挂着一条 `- [查岗手机:支付宝账单]`，模型照
  * 着抄一遍，白烧一轮生成。
  *
- * 判法是查真表：把标签体拿去 `matchFeature` 认出它属于哪一组，那一组关着就算
- * 这个标签死了。不按字面词判是因为示例里的词用户能改（他把「支付宝账单」换成
- * 「微信」，还是得认出来这是 view 组）。认不出来的词（比如他瞎写一个不存在的
- * 功能）不算死标签 —— 删掉看不懂的行比留着更糟。
+ * 判法是查真表：把标签体拿去 `matchFeature` 认出它是哪一件事，**那一件事关着**
+ * 就算这个标签死了（组关着、或者这一项被单独关掉，`legs.on` 一并判了）。
+ * 不按字面词判是因为示例里的词用户能改（他把「支付宝账单」换成「微信」，
+ * 还是得认出来这是哪一项）。认不出来的词（比如他瞎写一个不存在的功能）不算
+ * 死标签 —— 删掉看不懂的行比留着更糟。
+ *
+ * 按**单项**而不是按组判，是单项开关这一层必须的：默认正文里那条
+ * `- [查岗手机:支付宝账单]` 在「查看类开着、但支付宝那一项被关掉」时也是死的，
+ * 按组判的话它会留在正文里，模型照着抄一遍然后被 phonePool 挡掉。
  *
  * **一行里的标签要全死才删这一行。** 讲参数怎么写那条规则一行里挂着两个例子
  * （`[操控手机:设置闹钟 07:30]` 和 `[操控手机:放歌 稻香 周杰伦]`），分属
  * control 和 music 两组 —— 只关了一组时那行还得留着，不然另一组就没人教它参数
  * 写在哪儿了。
  */
-function deadExample(line, on) {
+function deadExample(line, legs) {
   let seen = 0;
   let dead = 0;
   for (const [re, pool] of [
-    [PHONE_VIEW_TAG, viewFeatures()],
-    [PHONE_CONTROL_TAG, controlFeatures()],
+    [PHONE_VIEW_TAG, FEATURES.filter((f) => f.group === "view")],
+    [PHONE_CONTROL_TAG, FEATURES.filter((f) => f.group !== "view")],
   ]) {
     // 带 g 的正则的 lastIndex 会跨调用留着，每次现造一个
     const scan = new RegExp(re.source, "g");
@@ -264,7 +350,7 @@ function deadExample(line, on) {
       const f = body ? matchFeature(body, pool) : null;
       if (f) {
         seen += 1;
-        if (!on[f.group]) dead += 1;
+        if (!legs.on(f.key)) dead += 1;
       }
       m = scan.exec(line);
     }
@@ -273,7 +359,33 @@ function deadExample(line, on) {
 }
 
 /**
- * 按这个角色开着哪几组，把提示词正文裁成「只有这几样」。
+ * 删掉底下一条不剩的小标题（`正确示例:` 后面那几行全被裁掉的情况）。
+ *
+ * 正文是缩进表示层级的 YAML 样子，小标题（`        正确示例:`）自己不带标签也
+ * 不带占位符，所以上面那几条规则一个都抓不到它 —— 示例全死了之后剩下一个
+ * `正确示例:` 挂在那儿，模型下面看到的是「规则」那一段，会以为示例被截断了。
+ *
+ * 判法纯看缩进：一行以 `:` 结尾、后面紧跟的行缩进都不比它深，就是空标题。
+ * 不按 `正确示例` 这个词判，因为这段正文用户能改（他把小标题改成「例子」，
+ * 空标题还是得删）。
+ */
+function dropEmptyHeadings(lines) {
+  const indent = (s) => s.length - s.trimStart().length;
+  return lines.filter((line, i) => {
+    if (!/:\s*$/.test(line)) return true;
+    const here = indent(line);
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (!lines[j].trim()) continue;
+      // 下一条有内容的行比它深 = 这个标题底下还有东西
+      return indent(lines[j]) > here;
+    }
+    // 它是最后一行，底下什么都没有
+    return false;
+  });
+}
+
+/**
+ * 按这个角色开着哪几样，把提示词正文裁成「只有这几样」。
  *
  * 五组开关（见 spyLegs）对着正文里五行，全开时一个字不动，关掉的那几组要把
  * 对应的行删掉 —— 教模型写一个注定被拒的标签，代价是白烧一轮生成。
@@ -285,34 +397,50 @@ function deadExample(line, on) {
  *     手机里那三行按变量占位符认（理由见 GROUP_VARS）。按标签/占位符认而不是
  *     按 `看电脑:` 这种小标题认，是因为这段正文用户能改：他把小标题改成别的词，
  *     标签和占位符还是得原样留着（不然功能就废了）。
+ *     **一组里所有单项都被关掉时，那一行和这一组关着一样要删** —— 留着就是一行
+ *     `能看的有：`后面空无一物的废话。
  *  2. **删掉讲自动回退的那行。** 屏幕没有两条腿都开着时压根不会倒
  *     （runSpy 拦着），留着就是一句和事实相反的话。这一条是**尽力而为**的：
  *     按默认正文里那句「自动改看另一头」的措辞认，用户改写成别的说法就认不
  *     出来了 —— 所以还有第 4 条兜底。
- *  3. **把留下来那几行的占位符换成真清单。** 清单从 spyfeatures.js 现算，
- *     不写死在正文里 —— 那张表加一条，这儿跟着就有了。
+ *  3. **把留下来那几行的占位符换成真清单。** 清单从 spyfeatures.js 现算、
+ *     只列这个角色开着的那几项，不写死在正文里 —— 那张表加一条，这儿跟着就有了。
  *  4. **在末尾补一句程序生成的话**，逐字列清这一轮到底哪几个标签能用。
  *     前三步都是删和填，删不干净的靠这一句压住：正文里「按你想知道的挑一头……
  *     该在躺着刷手机就看手机」这类话还在，模型凭它硬编一个没开的标签是有的
  *     （那种情况 imessage.js 那两趟往返会拦下来，但白烧一轮）。补在最后是因为
  *     靠后的指令压得住前面的泛泛之谈。
  *
- * 五组全开时原样返回（只换占位符），一个字不多加。
+ * 这一条管的那几条腿全开时原样返回（只换占位符），一个字不多加。
  *
  * @param {string} text 子条目正文（已经填过 {{变量}}）
  * @param {object} legs spyLegs 的结果
  * @param {object} [ctx]
  * @param {{name:string,id:string}[]} [ctx.playlists] 用户预设的歌单，填进清单里
- * @returns {string} 裁过的正文；五组全关时返回空串（调用方据此整条跳过）
+ * @param {string} [ctx.kind] 哪一条查岗子条目（`spyScreen` / `spyView` /
+ *        `spyControl` / `spyMusic`，见 KIND_LEGS）。给了就只按那一条管的腿裁、
+ *        补充那句也只说那一段的事；不给按五行一整段处理（老配置那条 `spy`）。
+ * @returns {string} 裁过的正文；这一条一样都没开时返回空串（调用方据此整条跳过）
  */
-export function trimSpyPrompt(text, legs, { playlists = [] } = {}) {
+export function trimSpyPrompt(text, legs, { playlists = [], kind = "" } = {}) {
   const src = String(text ?? "");
+  /*
+   * 这一条子条目管哪几条腿。不在名单里的腿一律当关着 —— 于是「那一组的占位符
+   * 要不要删」「补充那句要不要提它」全都自动只说自己这一段的事，不用在下面
+   * 每一处再判一次 kind。
+   */
+  const mine = KIND_LEGS[kind] ?? ALL_LEGS;
+  const has = (leg) => mine.includes(leg);
+  /*
+   * 手机那三组这儿问的是「**还有活着的项吗**」，不是「组开关开没开」：一组开着
+   * 但里面十九件事被用户一个个关光了，和这组关着对提示词是同一件事。
+   */
   const on = {
-    pc: Boolean(legs?.pc),
-    phone: Boolean(legs?.phone),
-    view: Boolean(legs?.view),
-    control: Boolean(legs?.control),
-    music: Boolean(legs?.music),
+    pc: has("pc") && Boolean(legs?.pc),
+    phone: has("phone") && Boolean(legs?.phone),
+    view: has("view") && liveInGroup(legs, "view").length > 0,
+    control: has("control") && liveInGroup(legs, "control").length > 0,
+    music: has("music") && liveInGroup(legs, "music").length > 0,
   };
   if (!on.pc && !on.phone && !on.view && !on.control && !on.music) return "";
 
@@ -331,20 +459,35 @@ export function trimSpyPrompt(text, legs, { playlists = [] } = {}) {
   // 讲自动回退的那句。只有屏幕两条腿都开着时它才是真话
   if (!(on.pc && on.phone)) gone.push(/自动改看另一头|没看到时会自动/);
 
-  let kept = src
-    .split("\n")
-    .filter((line) => !gone.some((re) => re.test(line)) && !deadExample(line, on))
+  let kept = dropEmptyHeadings(
+    src.split("\n").filter((line) => !gone.some((re) => re.test(line)) && !deadExample(line, legs))
+  )
     .join("\n")
     .trim();
   if (!kept) return "";
 
-  // 留下来那几组的占位符换成真清单
-  if (on.view) kept = kept.replace(GROUP_VARS.view, featureList("view", { playlists }));
-  if (on.control) kept = kept.replace(GROUP_VARS.control, featureList("control", { playlists }));
-  if (on.music) kept = kept.replace(GROUP_VARS.music, featureList("music", { playlists }));
+  // 留下来那几组的占位符换成真清单（只含这个角色开着的项）
+  for (const group of ["view", "control", "music"]) {
+    if (on[group]) kept = kept.replace(GROUP_VARS[group], featureList(group, legs, { playlists }));
+  }
 
-  // 全开：正文本身已经说全了，不用再补
-  if (on.pc && on.phone && on.view && on.control && on.music) return kept;
+  /*
+   * 全开：正文本身已经说全了，不用再补。
+   *
+   * 「全开」只算**这一条管的那几条腿**：`spyMusic` 那条正文里只讲网易云，
+   * 用户没开电脑屏幕跟它没有一点关系，跟着别人的开关去补一句「你这一轮能用的
+   * 标签只有 [操控手机:…]」纯属废话。
+   *
+   * 还要连**单项**一起算：组开着、但用户关掉了「关闭闹钟」—— 那时候清单里
+   * 已经没有它了，可正文里「按你想知道的挑一头」那类泛泛之谈还在，
+   * 补充那句得照样补上去。
+   */
+  const allOpen = mine.every((leg) =>
+    leg === "pc" || leg === "phone"
+      ? on[leg]
+      : liveInGroup(legs, leg).length === groupSize(leg)
+  );
+  if (allOpen) return kept;
 
   /*
    * 补充那句。**逐字列出能用的标签**，别只说「其它的别写」—— 模型对
@@ -359,15 +502,45 @@ export function trimSpyPrompt(text, legs, { playlists = [] } = {}) {
   const notes = [
     `你这一轮能用的标签只有这些：${live.join("、")}。别的写法一律不生效，写了也白写。`,
   ];
+
+  /*
+   * 一组里有几项被单独关掉时，再把那一组**还能用的项**逐字点一遍。
+   *
+   * 上面那行清单里已经列过一次了（占位符换进去的），这儿是同一份名单的第二遍 ——
+   * 刻意重复：正文里那行离标签定义很远（中间隔着一整段规则和示例），而模型抄
+   * 标签时看的是最靠后那几句。只列名字不带参数说明，那部分正文里说过了。
+   */
+  for (const [group, tag] of [
+    ["view", "[查岗手机:…]"],
+    ["control", "[操控手机:…]"],
+    ["music", "[操控手机:…]"],
+  ]) {
+    if (!on[group]) continue;
+    const live2 = liveInGroup(legs, group);
+    if (live2.length === FEATURES.filter((f) => f.group === group).length) continue;
+    notes.push(
+      `${tag} 里${GROUP_NAMES[group]}这一类你只能用这几项：` +
+        `${live2.map((f) => f.name).join("、")}，别的项没开、写了也不会发生任何事。`
+    );
+  }
+
   // 屏幕只开一条腿：额外点明不会自动改看另一头（正文里那句已经删了，这儿说清）
-  if (on.pc !== on.phone) {
+  if (has("pc") && has("phone") && on.pc !== on.phone) {
     const only = on.pc ? "pc" : "phone";
     notes.push(
       `屏幕你只能看${DEVICE_NAMES[only]}，` +
         `${DEVICE_NAMES[only]}这头没看到时也不会自动改看${DEVICE_NAMES[OTHER[only]]}。`
     );
   }
-  if (!on.pc && !on.phone) notes.push("你看不到他的屏幕，只能看他手机里那几项具体的东西。");
+  /*
+   * 「你看不到他的屏幕」这句只在**整段**那一版里说得通：四条拆开之后，
+   * 屏幕归 spyScreen 那条管，而屏幕全关时那条整条不注入（上面就返回空串了）。
+   * 在 spyView / spyMusic 那几条里说这句话，是替另一条子条目宣布它的开关状态 ——
+   * 那条可能正开着，模型会被两段话搞糊涂。
+   */
+  if (has("pc") && has("phone") && !on.pc && !on.phone) {
+    notes.push("你看不到他的屏幕，只能看他手机里那几项具体的东西。");
+  }
   return `${kept}\n        补充: "${notes.join("")}"`;
 }
 
@@ -584,28 +757,32 @@ export function hasPhoneTag(text) {
 }
 
 /**
- * 某一类该在哪些功能里找，**按这个角色开着哪几组过滤**。
+ * 某一类该在哪些功能里找，**按这个角色开着哪几样过滤**。
  *
  * 两类首先必须各查自己那份：查看类的 pool 里没有「放歌」，所以模型用
  * `[查岗手机:放歌]` 点歌会被回一句「能用的是：微信、支付宝账单…」，而不是
  * 真去放歌然后没法收尾（放完歌没有图可识，查看类那条路在等一张图）。
  * 反过来操控类里没有「支付宝账单」，`[操控手机:支付宝账单]` 同理被挡住。
  *
- * 再往下还要按开关滤一道，因为**操控类横跨两个开关**：闹钟锁屏那四件归
- * `phoneControlEnabled`，网易云那六件归 `phoneMusicEnabled`。只开放歌的用户
- * 写 `[操控手机:锁屏]` 必须匹配不上 —— 不滤的话 controlFeatures() 里有锁屏，
- * 那部手机就真的被锁了，而用户从没同意过这件事。
+ * 再往下按 `legs.features` 滤一道 —— 那份清单是「组开着 + 这项自己开着」两层都
+ * 过了的（见 spyLegs）。两层都要在这儿把住：
  *
- * 滤成空数组是合法结局（那一类一个开关都没开）：调用方据此当这轮没写标签。
+ *  - 组这一层，因为**操控类横跨两个开关**（闹钟锁屏归 `phoneControlEnabled`，
+ *    网易云归 `phoneMusicEnabled`）。只开放歌的用户写 `[操控手机:锁屏]` 必须
+ *    匹配不上 —— 不滤的话那部手机就真的被锁了，而用户从没同意过这件事。
+ *  - 单项这一层，因为提示词里没教过的标签模型照样会写（它见过别的角色、或者
+ *    干脆是猜的）。用户把「关闭闹钟」单独关掉，就是不想让角色关他的起床闹钟，
+ *    这道闸是那句话唯一真正生效的地方 —— 提示词只是不教，挡住要靠这儿。
+ *
+ * 滤成空数组是合法结局（那一类一样都没开）：调用方据此当这轮没写标签。
  *
  * @param {"view"|"control"} kind
  * @param {object} legs spyLegs 的结果
  */
 export function phonePool(kind, legs) {
-  if (kind === "view") return legs?.view ? viewFeatures() : [];
-  return controlFeatures().filter((f) =>
-    f.group === "music" ? Boolean(legs?.music) : Boolean(legs?.control)
-  );
+  const live = legs?.features ?? [];
+  if (kind === "view") return live.filter((f) => f.group === "view");
+  return live.filter((f) => f.group !== "view");
 }
 
 /**

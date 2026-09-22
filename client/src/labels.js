@@ -325,7 +325,7 @@ export const ENTRY_KIND_HINTS = {
   user: "对这个角色生效的那条用户人设，注入 <User>",
   world: "这一轮命中的世界书条目，注入 <World_Info>",
   format:
-    "怎么分气泡，以及语音 / 表情包 / 图片 / 链接卡片 / 分享位置 / 联网搜索 / 已读不回 / 引用回复 / 消息撤回 / 消息回应 / 消息特效 / Instagram / 查岗 十三个子条目",
+    "怎么分气泡，以及语音 / 表情包 / 图片 / 链接卡片 / 分享位置 / 转账 / 联网搜索 / 已读不回 / 引用回复 / 消息撤回 / 消息回应 / 消息特效 / Instagram / 查岗那四条 十七个子条目",
   context: "这条会话的上文，夹在 <Chat_History> 之间（条数受角色的「上下文限制」约束）",
   memory:
     "四个变量：{{近N天记忆}}、{{回忆起来的记忆}}、{{备忘录}}、{{近N天日记}}，各自包在 XML 标签里。哪个都受角色那三个开关约束，全关就整条不产出",
@@ -335,13 +335,14 @@ export const ENTRY_KIND_HINTS = {
     "只有线下预设有这一条。要模型在正文之后另给四条「我接下来可以怎么做」，注入 <User_Choices>。还得角色那边的「用户选项」开着才生效",
 };
 
-/** 「消息格式与功能」的十三个子条目。和 server/src/preset.js:FORMAT_CHILD_KINDS 对齐。 */
+/** 「消息格式与功能」的十七个子条目。和 server/src/preset.js:FORMAT_CHILD_KINDS 对齐。 */
 export const FORMAT_CHILD_KINDS = [
   "voice",
   "sticker",
   "image",
   "card",
   "location",
+  "transfer",
   "search",
   "leaveOnRead",
   "quote",
@@ -349,7 +350,11 @@ export const FORMAT_CHILD_KINDS = [
   "react",
   "effect",
   "instagram",
-  "spy",
+  // 查岗占四条，对着角色面板上那四摊开关（屏幕 / 查看 / 控制 / 网易云）
+  "spyScreen",
+  "spyView",
+  "spyControl",
+  "spyMusic",
 ];
 
 export const FORMAT_CHILD_LABELS = {
@@ -365,7 +370,10 @@ export const FORMAT_CHILD_LABELS = {
   react: "消息回应",
   effect: "消息特效",
   instagram: "Instagram",
-  spy: "查岗",
+  spyScreen: "查岗 · 看屏幕",
+  spyView: "查岗 · 看手机",
+  spyControl: "查岗 · 动手机",
+  spyMusic: "查岗 · 放歌",
 };
 
 /**
@@ -388,14 +396,18 @@ export const FORMAT_CHILD_TAGS = {
   react: "tapback",
   effect: "message_effect",
   instagram: "instagram",
-  spy: "查岗",
+  // 四条各用自己的标签，理由见 server/src/preset.js:FORMAT_CHILD_TAGS
+  spyScreen: "看屏幕",
+  spyView: "查看手机",
+  spyControl: "操控手机",
+  spyMusic: "放歌",
 };
 
 /**
  * 发送链路还没接的子条目：开了也只是让模型输出标记，标记会被当普通文字
  * 原样发给对方。界面上要标出来，见 panels/preset.jsx。
  *
- * 现在**一条都没有** —— 十三条的链路全接上了。
+ * 现在**一条都没有** —— 十七条的链路全接上了。
  * 留着这个数组是因为以后还可能先写提示词、后接链路。
  */
 export const FORMAT_CHILD_UNWIRED = [];
@@ -406,12 +418,15 @@ export const FORMAT_CHILD_UNWIRED = [];
  *
  * **quote 故意不在这里**：引用回复是自带的，没有角色开关。
  *
- * **spy 在这里、但服务端那张表里没有**：查岗在角色上是**五个**开关
+ * **查岗那四条在这里、但服务端那张表里没有**：查岗在角色上是五个组开关
  * （`spy.pcEnabled` / `spy.phoneEnabled` 看屏幕，另外三个管手机里那些事，
- * 见 SPY_SWITCHES），没有单个 `.enabled` 可查，所以服务端由 prompt.js 单独判
- * 「任一个开着」。前端这张表只用来判「这一条要不要显示『还得去角色那儿开』的
- * 提示」（preset.jsx），查岗当然要显示，所以留着。
- * 值写成 `spy` 只是指向角色上那个字段块，别拿它当布尔字段名用。
+ * 见 SPY_SWITCHES）外加十九件事各自一个（SPY_FEATURE_SWITCHES），没有单个
+ * `.enabled` 可查，所以服务端由 prompt.js 走 trimSpyPrompt 单独判。前端这张表
+ * 只用来判「这一条要不要显示『还得去角色那儿开』的提示」（preset.jsx），
+ * 查岗当然要显示，所以留着。
+ *
+ * 四条的值都写成 `spy`，指的是角色上那个字段块，别拿它当布尔字段名用 ——
+ * 四条各自对应块里哪几个开关见 SPY_CHILD_SWITCHES。
  */
 export const ROLE_GATED_CHILDREN = {
   search: "webSearch",
@@ -422,11 +437,41 @@ export const ROLE_GATED_CHILDREN = {
   undoSend: "undoSend",
   card: "cardSend",
   location: "locationSend",
+  transfer: "transfer",
   react: "reactSend",
   effect: "effectSend",
   instagram: "instagram",
-  spy: "spy",
+  spyScreen: "spy",
+  spyView: "spy",
+  spyControl: "spy",
+  spyMusic: "spy",
 };
+
+/**
+ * 查岗那四条子条目各自对着角色面板上哪几个开关。
+ *
+ * 面板上那句提示要说得准：`spyMusic` 那条该说「去角色那儿打开『放歌』」，
+ * 而不是笼统一句「打开查岗」—— 用户开的是五个里的哪一个，这话得对得上。
+ * 服务端那份是 spy.js:KIND_LEGS（同一件事的另一半，那边管裁剪）。
+ */
+export const SPY_CHILD_SWITCHES = {
+  spyScreen: ["pcEnabled", "phoneEnabled"],
+  spyView: ["phoneViewEnabled"],
+  spyControl: ["phoneControlEnabled"],
+  spyMusic: ["phoneMusicEnabled"],
+};
+
+/**
+ * 反过来：角色上那个开关字段 → 该跟着打开的子条目。
+ *
+ * 用在 role.jsx:turnOn —— 用户在角色面板上打开一条腿，预设里对着它那一条也要
+ * 跟着开。从 SPY_CHILD_SWITCHES 现算，别再手写一份：两份反过来的表早晚走岔。
+ */
+export const SPY_CHILD_OF_FIELD = Object.fromEntries(
+  Object.entries(SPY_CHILD_SWITCHES).flatMap(([kind, fields]) =>
+    fields.map((field) => [field, kind])
+  )
+);
 
 /**
  * 查岗那一栏的五个开关：面板上叫什么、下面那行说明写什么。
@@ -479,6 +524,123 @@ export const SPY_SWITCHES = [
     hint: "网易云那六件事：每日推荐、私人漫游、红心歌单、播放/暂停、指定歌曲、预设歌单。点歌要先去网易云搜一次；播放/暂停和锁屏一样，锁着屏也生效。",
   },
 ];
+
+/**
+ * 手机里那十九件事，**一件一个开关**：`server/src/spyfeatures.js:FEATURES` 的镜像。
+ *
+ * 上面那三个手机开关（查看 / 操控 / 网易云）是**组**开关，这张表是组里每一件事
+ * 自己那一个。真正可用 = 组开着 **且** 这一项开着（服务端 spy.js:spyLegs）。
+ *
+ * 为什么要拆到这一层：同一组里各项的外溢程度差得也很远。查看类里「电量」只回
+ * 一个数字，「微信」是把聊天列表整屏念出来；控制类里「设置闹钟」是帮忙，
+ * 「关闭闹钟」能把用户定好的起床闹钟关掉。一个组开关说不清用户同意了哪几件。
+ *
+ * 为什么在前端再写一份：这是个纯前端的开关清单，服务端没有「列一下有哪些功能」
+ * 的接口，为一张十九行的常量表加一条路由不值得。存的是 **key**，和服务端那张表
+ * 对齐 —— 显示名以后改了字，存名字的配置就全对不上了。
+ *
+ * **服务端那张表加/删/改一项时，这儿要一起改。** 少列一项的后果是用户在界面上
+ * 关不掉那一项（服务端「缺键当开」，所以它一直是开着的）；多列一项的后果是他
+ * 关掉一个不存在的功能，服务端归一化时把那个键丢掉（config.js:normalizeSpyFeatures）。
+ *
+ * `hint` 只在需要说明代价或限制时才写 —— 「微信」这种一看就懂的不用废话。
+ */
+export const SPY_FEATURE_SWITCHES = [
+  { key: "wechat", name: "微信", group: "view" },
+  { key: "alipay", name: "支付宝账单", group: "view" },
+  { key: "bilibili", name: "B站历史", group: "view" },
+  { key: "douyinMsg", name: "抖音私信", group: "view" },
+  { key: "douyinProfile", name: "抖音个人主页", group: "view" },
+  { key: "taobaoOrder", name: "淘宝订单", group: "view" },
+  { key: "taobaoCart", name: "淘宝购物车", group: "view" },
+  {
+    key: "battery",
+    name: "电量",
+    group: "view",
+    hint: "不截图、不走识图模型 —— 快捷指令直接回一个数字，所以这一项不花识图的钱。",
+  },
+  {
+    key: "location",
+    name: "位置",
+    group: "view",
+    hint: "回的是经纬度和地名，同样不走识图模型。",
+  },
+  { key: "alarmSet", name: "设置闹钟", group: "control", hint: "新建一个闹钟，要给时间。" },
+  {
+    key: "alarmOn",
+    name: "开启闹钟",
+    group: "control",
+    hint: "只能开你手机上已经有的那个闹钟，不能新建。",
+  },
+  {
+    key: "alarmOff",
+    name: "关闭闹钟",
+    group: "control",
+    hint: "能把你已经定好的闹钟关掉 —— 这一项关着比较稳。",
+  },
+  { key: "lock", name: "锁屏", group: "control", hint: "直接把你手机屏幕锁掉。" },
+  { key: "musicDaily", name: "每日推荐", group: "music" },
+  { key: "musicFm", name: "私人漫游", group: "music" },
+  { key: "musicFavorite", name: "红心歌单", group: "music" },
+  {
+    key: "musicPlayPause",
+    name: "播放暂停",
+    group: "music",
+    hint: "系统级的媒体控制，对任何音乐 App 都有效，而且锁着屏也生效。",
+  },
+  {
+    key: "musicSong",
+    name: "放歌",
+    group: "music",
+    hint: "角色报个歌名，服务端先去网易云搜一次拿到歌曲 ID 再放 —— 多一次外部请求。",
+  },
+  {
+    key: "musicPlaylist",
+    name: "预设歌单",
+    group: "music",
+    hint: "只能放你在下面「预设歌单」里填过的那几个，一个都没填时这一项用不了。",
+  },
+];
+
+/** 三个手机组各自的中文名。和 server/src/spyfeatures.js:GROUP_NAMES 对齐。 */
+export const SPY_GROUP_NAMES = { view: "查看", control: "控制", music: "网易云" };
+
+/**
+ * 组开关的字段名 → 那一组的 key。哪个组开着就显示哪一组的单项开关。
+ *
+ * 屏幕那两个开关（pcEnabled / phoneEnabled）**不在这儿** —— 它们底下没有单项，
+ * 就是一个「看不看屏幕」而已。
+ */
+export const SPY_GROUP_OF_FIELD = {
+  phoneViewEnabled: "view",
+  phoneControlEnabled: "control",
+  phoneMusicEnabled: "music",
+};
+
+/**
+ * 某一组里的单项。面板按组分块渲染（role.jsx:SpyFeatureToggles）。
+ */
+export function spyFeaturesInGroup(group) {
+  return SPY_FEATURE_SWITCHES.filter((f) => f.group === group);
+}
+
+/**
+ * 这一项开没开。**缺键当开**，和服务端 config.js:normalizeSpyFeatures 同一条
+ * 规矩 —— 老配置里压根没有 `features` 这个字段，那些角色的组开关早就打开过了，
+ * 升级之后静默关掉几项的话，用户看到的现象是「角色突然不会看我支付宝了」。
+ */
+export function spyFeatureOn(spy, key) {
+  const v = spy?.features?.[key];
+  return v === undefined ? true : Boolean(v);
+}
+
+/**
+ * 这一组里开着几项 / 一共几项。折叠标题上那个「3/9」用它。
+ */
+export function spyFeatureCount(spy, group) {
+  const all = spyFeaturesInGroup(group);
+  return { on: all.filter((f) => spyFeatureOn(spy, f.key)).length, total: all.length };
+}
 
 /** 角色上那五个查岗开关的字段名。判「有没有开着的」用它。 */
 export const SPY_SWITCH_FIELDS = SPY_SWITCHES.map((s) => s.field);

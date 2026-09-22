@@ -50,6 +50,7 @@ import {
 import {
   FORMAT_CHILD_TAGS,
   ROLE_GATED_CHILDREN,
+  SPY_CHILD_KINDS,
   formatChildLead,
   resolvePreset,
 } from "./preset.js";
@@ -199,7 +200,7 @@ function effectListText(keys) {
  *
  * 子条目全关就只剩引言，引言也空就整个条目不产出。真有子条目要注入时，
  * 在它们前面补一句程序生成的领起话（formatChildLead）—— 那句话以前
- * 写在引言里，但那十三条可以一条都不开，留在引言里会变成没有下文的空话。
+ * 写在引言里，但那十七条可以一条都不开，留在引言里会变成没有下文的空话。
  * 领起话要按这一轮真注入了哪几条挑措辞：引用、撤回和特效的标记是写在文字
  * **里**的，和「每个标记单独占一条气泡」直接冲突。
  *
@@ -263,15 +264,22 @@ function formatBlock(entry, fill, role, config) {
       text = text.replace(/\{\{\s*特效变量\s*\}\}/g, effectListText(list));
     }
     /*
-     * 查岗不在 ROLE_GATED_CHILDREN 里 —— 角色上是**五个**开关，没有单个
-     * .enabled 可查。五个都关 → 整条跳过（trimSpyPrompt 返回空串）；开了几个 →
-     * 关掉那几组的行删掉，别教模型写一个注定被拒的标签。
+     * 查岗那**四条**都不在 ROLE_GATED_CHILDREN 里 —— 角色上是五个开关加十九个
+     * 单项，没有单个 .enabled 可查。哪条腿都没开 → 整条跳过（trimSpyPrompt 返回
+     * 空串）；开了几样 → 关掉那几样的行删掉，别教模型写一个注定被拒的标签。
+     *
+     * `kind` 要传进去：四条各自只讲自己那一段（屏幕 / 查看 / 控制 / 网易云），
+     * 裁剪和末尾补充那句也只能按自己管的腿判。不传的话 spyMusic 那条会跟着
+     * 屏幕的开关走，补出一句和它正文无关的话（见 spy.js:KIND_LEGS）。
      *
      * 预设歌单要一路传进去：`[操控手机:预设歌单 睡前]` 那一项的清单是用户在
      * 全局配置里填的，写不死在正文里（见 spy.js:featureList）。
      */
-    if (child.kind === "spy") {
-      text = trimSpyPrompt(text, spyLegs(role), { playlists: config?.spyApi?.playlists });
+    if (SPY_CHILD_KINDS.includes(child.kind)) {
+      text = trimSpyPrompt(text, spyLegs(role), {
+        playlists: config?.spyApi?.playlists,
+        kind: child.kind,
+      });
       if (!text) continue;
     }
     if (!tag || !text) continue;

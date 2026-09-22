@@ -28,6 +28,8 @@ import {
 import { EFFECT_KEYS } from "./media.js";
 // 能点歌的曲库只在 music.js 列一处，这里跟着它收口
 import { MUSIC_SOURCES } from "./music.js";
+// 手机上那十九件事的总表。查岗的「单项开关」按它的 key 存（见 normalizeSpyFeatures）
+import { FEATURES as SPY_FEATURES } from "./spyfeatures.js";
 import { normalizePresets, makeDefaultPreset, defaultEntries, defaultRegexRules } from "./preset.js";
 // 三个额度的上下限只在 websearch.js 定义一处，这里跟着它收口
 import { LIMITS as SEARCH_LIMITS } from "./websearch.js";
@@ -534,15 +536,18 @@ export const DEFAULT_CONFIG = {
       // 见 normalizeSpy）。电脑那头默认指向本地截图程序的 127.0.0.1:6878；
       // 手机那头没有地址 —— 走触发邮件，凭据在全局的 spyApi 里。
       // 两份文案留空 = 用 spy.js 里的默认
-      // phoneView / phoneControl / phoneMusic 管的是手机**里面**那十八件事
+      // phoneView / phoneControl / phoneMusic 管的是手机**里面**那十九件事
       // （spyfeatures.js），和「看一眼手机屏幕」是两码事，所以另有三个开关，
       // 也全默认关 —— 理由见 normalizeSpy
+      // features 是那十九件事各自的单项开关。三个组开关全关着，所以这十九个
+      // 默认开也注入不了任何东西（见 normalizeSpyFeatures）
       spy: {
         pcEnabled: false,
         phoneEnabled: false,
         phoneViewEnabled: false,
         phoneControlEnabled: false,
         phoneMusicEnabled: false,
+        features: defaultSpyFeatures(),
         pcUrl: "127.0.0.1:6878",
         autoFallback: true,
         fallbackTemplate: "",
@@ -1751,16 +1756,29 @@ function normalizeWebSearch(input) {
  * 三个全默认 false，和 pc/phone 那两个一个道理：这一整套的代价都是外溢的，
  * 必须是用户自己一个一个点开的。**不继承老的 `enabled`** —— 那个字段的年代
  * 压根没有这十八件事，拿它当「用户同意过」的证据是假的。
+ *
+ * ── 再往下一层：每件事一个开关（`features`）──
+ *
+ * 那三个是**组**开关。组里每一件事另有一个自己的开关，存在 `spy.features` 里，
+ * 键名是 spyfeatures.js 的 `key`（见 normalizeSpyFeatures）。真正可用 =
+ * 组开关开着 **且** 这一项自己开着（spy.js:spyLegs 把两层合成一份清单）。
+ *
+ * 为什么要这一层：一组里各项的外溢程度差得也很远。查看类里「电量」只回一个
+ * 数字，「微信」是把聊天列表整屏念出来；控制类里「设置闹钟」是帮忙，「关闭闹钟」
+ * 是能把用户定好的起床闹钟关掉；网易云里「播放暂停」无害，「预设歌单」要用户
+ * 先填歌单。一个组开关说不清用户同意了哪几件。
  */
 function normalizeSpy(input) {
   const legacy = Boolean(input?.enabled);
   return {
     pcEnabled: input?.pcEnabled === undefined ? legacy : Boolean(input.pcEnabled),
     phoneEnabled: input?.phoneEnabled === undefined ? legacy : Boolean(input.phoneEnabled),
-    // 手机里那十八件事，三类各一个开关（见上面那段）。全默认关，不继承 legacy
+    // 手机里那十九件事，三类各一个开关（见上面那段）。全默认关，不继承 legacy
     phoneViewEnabled: Boolean(input?.phoneViewEnabled),
     phoneControlEnabled: Boolean(input?.phoneControlEnabled),
     phoneMusicEnabled: Boolean(input?.phoneMusicEnabled),
+    // 组里每一件事自己的开关。缺键 = 开（见 normalizeSpyFeatures）
+    features: normalizeSpyFeatures(input?.features),
     /*
      * 电脑那头：本地 Windows 截图程序（astrbot_plugin_screen_monitor_exe），
      * 默认 127.0.0.1:6878。这是角色自己的字段，因为不同角色可以查不同机器。
@@ -1776,6 +1794,44 @@ function normalizeSpy(input) {
     fallbackTemplate: str(input?.fallbackTemplate),
     bothFailedTemplate: str(input?.bothFailedTemplate),
   };
+}
+
+/**
+ * 十九件事的单项开关，全开。新角色和「没有这个字段的老配置」都用它。
+ *
+ * 全开而不是全关，是因为上面那三个**组**开关默认就是关的 —— 组关着的时候这
+ * 十九个开成什么样都注入不了东西。让新角色一打开「查看手机里的东西」就立刻有
+ * 九项可用，才是那个开关名字所承诺的事；要是单项默认全关，用户打开组开关之后
+ * 会发现什么都没有，而界面上没有任何东西告诉他还差一步。
+ */
+function defaultSpyFeatures() {
+  return Object.fromEntries(SPY_FEATURES.map((f) => [f.key, true]));
+}
+
+/**
+ * 每件事自己那个开关。键名是 spyfeatures.js 的 `key`，值是布尔。
+ *
+ * **缺键 = 开**，两个理由：
+ *
+ *  - 老配置压根没有这个字段。它们已经把组开关打开过了，那时候组里每一项都能用 ——
+ *    升级之后静默关掉几项，用户看到的现象是「角色突然不会看我支付宝了」，
+ *    而他什么都没改。
+ *  - 以后 spyfeatures.js 加一件事，老角色的 features 里不会有那个键。新功能
+ *    跟着它所在的组走，和「这一组开着就整组可用」这条老规矩一致。
+ *
+ * 所以这里只存**用户明确关掉**的那几项（值 false），其余的键干脆不落盘；
+ * 表里没有的键一律丢掉 —— 那是删掉的功能留下的垃圾，留着会在界面上变成一个
+ * 点不掉的幽灵开关。
+ */
+function normalizeSpyFeatures(input) {
+  const out = {};
+  if (!input || typeof input !== "object") return defaultSpyFeatures();
+  for (const f of SPY_FEATURES) {
+    // undefined（缺键）当开，只有明确的 false 才记下来
+    if (input[f.key] === undefined) out[f.key] = true;
+    else out[f.key] = Boolean(input[f.key]);
+  }
+  return out;
 }
 
 /**

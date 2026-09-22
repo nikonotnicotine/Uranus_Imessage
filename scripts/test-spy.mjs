@@ -178,15 +178,29 @@ console.log("\n[两个开关：normalizeSpy 的默认值和老配置迁移]");
   assert.equal(legacyUrl.phoneUrl, undefined);
   ok("老的 phoneUrl 字段被丢掉（手机腿走邮件，没有地址）");
 
+  /*
+   * 只比五个组开关那几个字段。`features` / `on` 另有一批断言（见下面「单项开关」
+   * 那一段）—— 整个对象 deepEqual 的话，往 spyLegs 里加一个字段就会把这儿
+   * 弄挂，而这几行想说的只是「五个组开关认得对」。
+   */
   const off = { pc: false, phone: false, view: false, control: false, music: false };
-  assert.deepEqual(S.spyLegs({ spy: { pcEnabled: true, phoneEnabled: false } }), {
+  const groupsOf = (legs) => ({
+    pc: legs.pc,
+    phone: legs.phone,
+    view: legs.view,
+    control: legs.control,
+    music: legs.music,
+    screens: legs.screens,
+    any: legs.any,
+  });
+  assert.deepEqual(groupsOf(S.spyLegs({ spy: { pcEnabled: true, phoneEnabled: false } })), {
     ...off,
     pc: true,
     screens: true,
     any: true,
   });
-  assert.deepEqual(S.spyLegs({ spy: {} }), { ...off, screens: false, any: false });
-  assert.deepEqual(S.spyLegs(undefined), { ...off, screens: false, any: false });
+  assert.deepEqual(groupsOf(S.spyLegs({ spy: {} })), { ...off, screens: false, any: false });
+  assert.deepEqual(groupsOf(S.spyLegs(undefined)), { ...off, screens: false, any: false });
   ok("spyLegs 五个开关齐全，角色为空也不炸");
 
   /*
@@ -281,10 +295,20 @@ console.log("\n[标签：手机那两个]");
 
 console.log("\n[提示词：五个开关各自决定注入什么]");
 {
+  /*
+   * 查岗在预设里是**四条**子条目，各带自己的标签（preset.js:FORMAT_CHILD_TAGS）。
+   * 底下判「这一段有没有注入」一律用这四个，别找已经不存在的 `<查岗>`。
+   */
+  const SCREEN = "<看屏幕>";
+  const VIEW = "<查看手机>";
+  const CONTROL = "<操控手机>";
+  const MUSIC = "<放歌>";
+  const noSpy = (s) => ![SCREEN, VIEW, CONTROL, MUSIC].some((t) => s.includes(t));
+
   const bothOff = setup();
   const s0 = await formatSection(bothOff.config, bothOff.role);
-  assert.ok(!s0.includes("<查岗>"), s0);
-  ok("五个都关：整条查岗不注入（模型压根不知道有这功能）");
+  assert.ok(noSpy(s0), s0);
+  ok("五个都关：四条查岗全不注入（模型压根不知道有这功能）");
 
   const all = {
     pcEnabled: true,
@@ -295,7 +319,10 @@ console.log("\n[提示词：五个开关各自决定注入什么]");
   };
   const both = setup({ spy: all });
   const s1 = await formatSection(both.config, both.role);
-  assert.ok(s1.includes("<查岗>"), s1);
+  // 全开时四条都该在，各带自己的标签
+  for (const t of [SCREEN, VIEW, CONTROL, MUSIC]) {
+    assert.ok(s1.includes(t), `全开时 ${t} 这一条该注入：\n` + s1);
+  }
   assert.ok(s1.includes("[查岗实时电脑屏幕]"), s1);
   assert.ok(s1.includes("[查岗实时手机屏幕]"), s1);
   assert.ok(s1.includes("自动改看另一头"), s1);
@@ -312,7 +339,11 @@ console.log("\n[提示词：五个开关各自决定注入什么]");
 
   const pcOnly = setup({ spy: { pcEnabled: true } });
   const s2 = await formatSection(pcOnly.config, pcOnly.role);
-  assert.ok(s2.includes("<查岗>"), s2);
+  assert.ok(s2.includes(SCREEN), s2);
+  // 手机那三条整条都不该注入（不只是行被删）
+  for (const t of [VIEW, CONTROL, MUSIC]) {
+    assert.ok(!s2.includes(t), `只开电脑腿时 ${t} 那一条该整条跳过：\n` + s2);
+  }
   assert.ok(s2.includes("[查岗实时电脑屏幕]"), s2);
   assert.ok(!s2.includes("[查岗实时手机屏幕]"), "手机标签必须一个字都不剩：\n" + s2);
   assert.ok(!s2.includes("自动改看另一头"), "单腿时不该说会自动改看另一头：\n" + s2);
@@ -334,27 +365,55 @@ console.log("\n[提示词：五个开关各自决定注入什么]");
    */
   const musicOnly = setup({ spy: { phoneMusicEnabled: true } });
   const s5 = await formatSection(musicOnly.config, musicOnly.role);
-  assert.ok(s5.includes("<查岗>"), s5);
-  assert.ok(s5.includes("每日推荐"), "网易云那行必须留着：\n" + s5);
-  assert.ok(!s5.includes("锁屏"), "操控那行必须删掉（锁屏没开）：\n" + s5);
+  assert.ok(s5.includes(MUSIC), s5);
+  assert.ok(s5.includes("每日推荐"), "网易云那条必须注入：\n" + s5);
+  assert.ok(!s5.includes(CONTROL), "操控那条必须整条跳过（锁屏没开）：\n" + s5);
+  assert.ok(!s5.includes("锁屏"), "操控那条一个字都不该剩：\n" + s5);
   assert.ok(!s5.includes("[查岗实时"), "屏幕那两行必须删掉：\n" + s5);
-  assert.ok(s5.includes("你看不到他的屏幕"), s5);
-  ok("只开放歌：操控那行删掉、网易云那行留着（两行共用同一个标签前缀也分得开）");
+  /*
+   * 「你看不到他的屏幕」这句归屏幕那条管，而屏幕全关时那条整条不注入 ——
+   * 所以只开放歌时**谁都不该说这句话**。放歌那条替屏幕宣布状态是错的：
+   * 用户可能同时开着电脑腿，那句话就成了假的。
+   */
+  assert.ok(
+    !s5.includes("你看不到他的屏幕"),
+    "放歌那条不该替屏幕那条宣布开关状态：\n" + s5
+  );
+  ok("只开放歌：操控那条整条跳过、网易云那条留着（共用同一个标签前缀也分得开）");
 
-  // 反过来：只开操控，网易云那行要删掉
+  // 反过来：只开操控，网易云那条要整条跳过
   const ctrlOnly = setup({ spy: { phoneControlEnabled: true } });
   const s6 = await formatSection(ctrlOnly.config, ctrlOnly.role);
-  assert.ok(s6.includes("锁屏"), "操控那行必须留着：\n" + s6);
-  assert.ok(!s6.includes("每日推荐"), "网易云那行必须删掉：\n" + s6);
-  ok("只开操控：网易云那行删掉、操控那行留着");
+  assert.ok(s6.includes(CONTROL), s6);
+  assert.ok(s6.includes("锁屏"), "操控那条必须注入：\n" + s6);
+  assert.ok(!s6.includes(MUSIC), "网易云那条必须整条跳过：\n" + s6);
+  assert.ok(!s6.includes("每日推荐"), "网易云那条一个字都不该剩：\n" + s6);
+  ok("只开操控：网易云那条整条跳过、操控那条留着");
 
-  // 预设里那条子条目关着时，开关开着也不注入（两道闸都在）
+  /*
+   * 预设里的子条目开关是**第二道闸**，四条各管自己那一摊：关掉「放歌」那条，
+   * 另外三条该照旧注入 —— 以前合成一条时关一下就全哑了，拆开之后不该再那样。
+   */
   const childOff = setup({ spy: all });
   const fmt = childOff.preset.entries.find((e) => e.kind === "format");
-  fmt.children.find((c) => c.kind === "spy").enabled = false;
+  fmt.children.find((c) => c.kind === "spyMusic").enabled = false;
   const s4 = await formatSection(childOff.config, childOff.role);
-  assert.ok(!s4.includes("<查岗>"), s4);
-  ok("预设里那条子条目关着：开关开着也不注入");
+  assert.ok(!s4.includes(MUSIC), "关掉的那条不该注入：\n" + s4);
+  assert.ok(!s4.includes("每日推荐"), "关掉的那条一个字都不该剩：\n" + s4);
+  for (const t of [SCREEN, VIEW, CONTROL]) {
+    assert.ok(s4.includes(t), `只关了放歌那条，${t} 该照旧注入：\n` + s4);
+  }
+  ok("预设里的子条目开关按条各管一摊：关掉放歌那条，另外三条照旧注入");
+
+  // 四条全关：角色开关全开也一条都不注入
+  const allChildOff = setup({ spy: all });
+  const fmt2 = allChildOff.preset.entries.find((e) => e.kind === "format");
+  for (const k of ["spyScreen", "spyView", "spyControl", "spyMusic"]) {
+    fmt2.children.find((c) => c.kind === k).enabled = false;
+  }
+  const s4b = await formatSection(allChildOff.config, allChildOff.role);
+  assert.ok(noSpy(s4b), s4b);
+  ok("四条子条目全关：角色开关全开也一条都不注入（两道闸都在）");
 
   // 预设歌单：配了就把名字列给模型，没配就明说这一项用不了
   const withList = setup({ spy: { phoneMusicEnabled: true } });
@@ -385,17 +444,64 @@ console.log("\n[提示词：五个开关各自决定注入什么]");
   assert.equal(S.trimSpyPrompt("随便什么", { pc: false, phone: false }), "");
   ok("trimSpyPrompt 两条腿都关时返回空串（调用方据此整条跳过）");
 
-  // 注意这是 legs 的形状（spyLegs 的返回值），不是上面那个角色开关的形状
-  const allLegs = { pc: true, phone: true, view: true, control: true, music: true };
+  /*
+   * legs 要用 spyLegs 现造，别手搓一个 `{pc:true,…}` —— 它还带着 `features`
+   * （十九件事里活着的那些）和 `on()`，手搓的对象里那两样是空的，
+   * trimSpyPrompt 会以为用户把所有单项都关了。
+   */
+  const allLegs = S.spyLegs({
+    spy: {
+      pcEnabled: true,
+      phoneEnabled: true,
+      phoneViewEnabled: true,
+      phoneControlEnabled: true,
+      phoneMusicEnabled: true,
+    },
+  });
   const untouched = "五个全开的时候一个字都不动";
   assert.equal(S.trimSpyPrompt(untouched, allLegs), untouched);
   ok("trimSpyPrompt 五个全开时原样返回");
 
   // 少一个就得补那句 —— 全开才是「一个字不动」的唯一条件
-  const screensOnly = S.trimSpyPrompt(untouched, { pc: true, phone: true });
+  const screensOnly = S.trimSpyPrompt(
+    untouched,
+    S.spyLegs({ spy: { pcEnabled: true, phoneEnabled: true } })
+  );
   assert.ok(screensOnly.includes("补充"), screensOnly);
   assert.ok(screensOnly.includes("只能看他手机里") === false, screensOnly);
   ok("只开屏幕两条腿：正文原样留着，末尾补一句能用的标签");
+
+  /*
+   * 给了 kind 就只按那一条管的腿判。`spyScreen` 那条正文里压根没有手机那三行，
+   * 所以手机三组关着对它来说不是「少开了几样」—— 它该原样返回，
+   * 而不是补一句「你这一轮能用的标签只有屏幕那两个」。
+   */
+  const screenKind = S.trimSpyPrompt(
+    untouched,
+    S.spyLegs({ spy: { pcEnabled: true, phoneEnabled: true } }),
+    { kind: "spyScreen" }
+  );
+  assert.equal(screenKind, untouched);
+  ok("带 kind=spyScreen：手机那三组关着也原样返回（那条正文本来就不讲手机）");
+
+  // 反过来：放歌那条不该因为屏幕没开就补话
+  const musicKind = S.trimSpyPrompt(
+    "放歌那条的正文",
+    S.spyLegs({ spy: { phoneMusicEnabled: true } }),
+    { kind: "spyMusic" }
+  );
+  assert.equal(musicKind, "放歌那条的正文");
+  ok("带 kind=spyMusic：屏幕没开也原样返回，不替屏幕那条说话");
+
+  // 单项被关掉时，那一条才补话 —— 而且只说自己那一组
+  const someOff = S.spyLegs({
+    spy: { phoneMusicEnabled: true, features: { musicFm: false } },
+  });
+  const musicTrimmed = S.trimSpyPrompt("放歌那条的正文", someOff, { kind: "spyMusic" });
+  assert.ok(musicTrimmed.includes("补充"), musicTrimmed);
+  assert.ok(!musicTrimmed.includes("私人漫游"), "关掉的那项不该出现：\n" + musicTrimmed);
+  assert.ok(musicTrimmed.includes("每日推荐"), "留着的那项该列出来：\n" + musicTrimmed);
+  ok("带 kind=spyMusic 且关了一项：补一句只讲网易云这一组能用哪几项");
 }
 
 console.log("\n[回退：不许倒进关着的那条腿]");
@@ -772,6 +878,119 @@ console.log("\n[落盘：spyApi 整块进密钥文件]");
   assert.equal(roleOnDisk.spy.phoneEnabled, true);
   assert.equal(roleOnDisk.spy.enabled, undefined, "废掉的 enabled 不许再写盘");
   ok("两个开关落在角色文件里，老的 enabled 不再写盘");
+}
+
+console.log("\n[迁移：老配置里合在一起的那条 spy → 四条]");
+{
+  /** 归一化一份只有 `spy` 那条子条目的老预设，取回四条查岗子条目。 */
+  const migrate = (child) => {
+    const out = C.normalizeConfig({
+      presets: [
+        {
+          id: "p-1",
+          name: "老预设",
+          entries: [{ id: "e-1", kind: "format", enabled: true, children: [child] }],
+        },
+      ],
+    });
+    const kids = out.presets[0].entries.find((e) => e.kind === "format").children;
+    return Object.fromEntries(
+      P.SPY_CHILD_KINDS.map((k) => [k, kids.find((c) => c.kind === k)])
+    );
+  };
+
+  // 正文没改过（拆分前那一版五行的）→ 四条全给新默认值
+  const clean = migrate({ kind: "spy", enabled: true, content: P.LEGACY_SPY_ONE_CHILD });
+  for (const k of P.SPY_CHILD_KINDS) {
+    assert.ok(clean[k], `${k} 该被建出来`);
+    assert.equal(clean[k].enabled, true, `${k} 该继承老的 enabled`);
+    assert.equal(clean[k].content, P.DEFAULT_FORMAT_CHILDREN[k], `${k} 该拿新默认正文`);
+  }
+  ok("老的 spy 正文没改过：拆成四条、全给新默认值");
+
+  // 更老那一版（只有屏幕两行的）也要认
+  const older = migrate({ kind: "spy", enabled: true, content: P.LEGACY_SPY_CHILD });
+  assert.equal(older.spyScreen.content, P.DEFAULT_FORMAT_CHILDREN.spyScreen);
+  ok("更老那版（只有屏幕两行）也认成没改过");
+
+  /*
+   * 用户改过的正文**不许丢** —— 这是整个迁移最要紧的一条：`spy` 已经不在
+   * FORMAT_CHILD_KINDS 里，不接这一手的话他改过的字会被当未知 kind 静静扔掉。
+   */
+  const mine = "      查岗:\n        我自己改的一段话";
+  const edited = migrate({ kind: "spy", enabled: true, content: mine });
+  assert.equal(edited.spyScreen.content, mine, "改过的原文该整段留在屏幕那条里");
+  for (const k of ["spyView", "spyControl", "spyMusic"]) {
+    assert.equal(edited[k].content, P.DEFAULT_FORMAT_CHILDREN[k], `${k} 该拿新默认正文`);
+    assert.ok(!edited[k].content.includes("我自己改的"), `${k} 不该跟着复制一份原文`);
+  }
+  ok("用户改过的正文：整段留在屏幕那条，另外三条给默认值（不重复注入四遍）");
+
+  // 关着的查岗不该因为拆分自己开回来
+  const wasOff = migrate({ kind: "spy", enabled: false, content: P.LEGACY_SPY_ONE_CHILD });
+  for (const k of P.SPY_CHILD_KINDS) {
+    assert.equal(wasOff[k].enabled, false, `${k} 该继承老的 enabled:false`);
+  }
+  ok("老配置里查岗是关着的：四条都跟着关（拆分不许替用户同意）");
+
+  // 已经是新结构的配置原样不动
+  const already = C.normalizeConfig({
+    presets: [
+      {
+        id: "p-1",
+        name: "新预设",
+        entries: [
+          {
+            id: "e-1",
+            kind: "format",
+            enabled: true,
+            children: [
+              { kind: "spyMusic", enabled: false, content: "我改的放歌" },
+              { kind: "spy", enabled: true, content: P.LEGACY_SPY_ONE_CHILD },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+  const kids2 = already.presets[0].entries.find((e) => e.kind === "format").children;
+  const music2 = kids2.find((c) => c.kind === "spyMusic");
+  assert.equal(music2.content, "我改的放歌", "新结构里的正文不许被老的 spy 冲掉");
+  assert.equal(music2.enabled, false, "新结构里的开关也不许被冲掉");
+  ok("已经是新结构的配置：手改出来的老 spy 冲不掉它");
+}
+
+console.log("\n[单项开关：组开着但某几项被关掉]");
+{
+  // 关掉一项：pool 里不许有它 —— 提示词只是不教，真正挡住靠这道闸
+  const legs = S.spyLegs({
+    spy: { phoneControlEnabled: true, features: { alarmOff: false } },
+  });
+  const pool = S.phonePool("control", legs);
+  assert.ok(!pool.some((f) => f.key === "alarmOff"), "关掉的项不许留在 pool 里");
+  assert.ok(pool.some((f) => f.key === "lock"), "没关的项该留着");
+  ok("单项关掉：phonePool 挡住它（模型硬写也不生效）");
+
+  // 缺 features 字段的老配置：十九件事全当开着
+  const legacy = S.spyLegs({ spy: { phoneControlEnabled: true } });
+  assert.equal(S.phonePool("control", legacy).length, 4, "缺键当开，控制类四项都在");
+  ok("老配置没有 features 字段：十九件事全当开着（缺键当开）");
+
+  // 一组里全关光：那一条整条不注入
+  const allOff = S.spyLegs({
+    spy: {
+      phoneControlEnabled: true,
+      features: { alarmSet: false, alarmOn: false, alarmOff: false, lock: false },
+    },
+  });
+  assert.equal(S.phonePool("control", allOff).length, 0);
+  assert.equal(S.trimSpyPrompt("操控那条正文", allOff, { kind: "spyControl" }), "");
+  /*
+   * 但组开关本身还是 true —— 「用户关了组」和「用户把组里的项一个个关光了」
+   * 不是同一件事，界面要把他自己的选择原样显示回去（见 spy.js:spyLegs）。
+   */
+  assert.equal(allOff.control, true, "组开关不该被单项状态改写");
+  ok("一组里全关光：那一条不注入，但组开关本身还是 true（界面要显示回去）");
 }
 
 console.log(`\n${passed} 项全部通过\n`);
