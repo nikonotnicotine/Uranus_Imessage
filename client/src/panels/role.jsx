@@ -2135,6 +2135,21 @@ const LOGO_MAX_BYTES = 2 * 1024 * 1024;
 const logoFileUrl = (file) => `/api/transfer-logo/file/${encodeURIComponent(file)}`;
 
 /**
+ * 预览格子的几何，和服务端那两档画布一一对应（`transferlogo.js` 里的 `CANVAS`）。
+ *
+ * 数字是那边的 padding 折成百分比。**icon 那档下面留得比上面宽得多** —— 那条空带子
+ * 是给卡片上那行浮字让位的，预览里照样留出来，不然用户以为 logo 是居中的。
+ *
+ * 用 `inset` 而不是 `padding`：CSS 里百分比的 padding **上下也按宽度算**，
+ * 600 宽的格子上写 `paddingTop: 16%` 得到 96px 而不是 48px。`top`/`bottom`
+ * 的百分比才是按高度算的。
+ */
+const LOGO_TILE = {
+  banner: { ratio: "600 / 300", inset: { left: "8%", right: "8%", top: "16%", bottom: "16%" } },
+  icon: { ratio: "600 / 156", inset: { left: "4%", right: "4%", top: "11.5%", bottom: "42.3%" } },
+};
+
+/**
  * 硬盘上有哪些转账 logo。
  *
  * 和表情包标签同一个道理：素材在 `data/transfer-logos/`（还有随程序自带的
@@ -2167,7 +2182,10 @@ function useTransferLogos() {
 }
 
 /**
- * 挑一张卡片缩略图 + 调它的留白底色。
+ * 挑一张卡片缩略图 + 调它多高、留白什么底色。
+ *
+ * 每个格子里那块底色**跟着选中的档位变形状**（见 `LOGO_TILE`）—— 一直画 2:1
+ * 而发出去的是 3.85:1 的窄条，等于在界面上骗人。
  *
  * ── 为什么不在浏览器里压一遍 ──
  *
@@ -2185,6 +2203,12 @@ function RoleTransferLogoPicker({ role, tr }) {
   const [confirming, setConfirming] = useState("");
   const fileRef = useRef(null);
   const current = tr.logo ?? "";
+  /*
+   * 预览格子的几何，跟服务端那两档画布对齐（transferlogo.js:CANVAS）。
+   * 写成内联 style 而不是 Tailwind 的 aspect-[…]：那个类名是编译期扫出来的，
+   * 拼出来的动态值扫不到，线上直接没这条样式。
+   */
+  const tile = LOGO_TILE[tr.logoStyle] ?? LOGO_TILE.banner;
 
   /** 选中文件 → 原样转 base64 → 传上去 → 顺手选上它。 */
   async function onPick(e) {
@@ -2242,12 +2266,12 @@ function RoleTransferLogoPicker({ role, tr }) {
     <div className="grid grid-cols-1 gap-4">
       <div>
         <span className="mb-2 block text-eyebrow uppercase tracking-wide text-ink-faint">
-          卡片左边那张图
+          卡片上那张图
         </span>
         <p className="mb-3 text-meta leading-relaxed text-ink-meta">
-          金额左边那个小方块。<b>可以不选</b> —— 不选就是一张只有文字的卡片。
-          SVG、PNG、JPG、WebP 都行，服务端会等比缩放居中放到一块 600×300 的画布上，
-          所以方图和长条图发出来的卡片一样高，四周留白填下面那个底色。
+          金额上面那一条。<b>可以不选</b> —— 不选就是一张只有文字的卡片。
+          SVG、PNG、JPG、WebP 都行，服务端会等比缩放居中放到一块固定画布上，
+          所以方图和长条图发出来的卡片一样高，留白填下面那个底色。
           <br />
           自己往 <code className="mx-1 bg-sunken px-1">data/transfer-logos/</code> 里丢文件也行，
           回来点一下「重新读取」。
@@ -2279,15 +2303,32 @@ function RoleTransferLogoPicker({ role, tr }) {
                   type="button"
                   onClick={() => updateRole(role.id, { transfer: { ...tr, logo: l.file } })}
                   title={l.builtin ? `${l.file}（自带的，删不掉）` : l.file}
-                  className="block h-full w-full overflow-hidden p-2"
-                  style={{ background: tr.logoBg || "#ffffff" }}
+                  className="flex h-full w-full items-center justify-center overflow-hidden"
                 >
-                  <img
-                    src={logoFileUrl(l.file)}
-                    alt={l.file}
-                    loading="lazy"
-                    className="h-full w-full object-contain"
-                  />
+                  {/*
+                    格子本身固定 2:1，**里面那块**才是真实画布形状。
+                    把格子也压成 3.85:1 的话，五列网格里一格只剩三十来像素高，
+                    文件名那条和删除键直接盖在 logo 上。
+                  */}
+                  <span
+                    className="relative block w-full"
+                    style={{ aspectRatio: tile.ratio, background: tr.logoBg || "#ffffff" }}
+                  >
+                    {/*
+                      inset 给的是**这个 span**，不是 img：img 是替换元素，
+                      `height: auto`（Tailwind preflight 给的）会解成它自己的
+                      固有高度，`bottom` 那条直接被忽略 —— 图就溢出画布了。
+                      套一层普通元素，高度才真的由 top/bottom 算出来。
+                    */}
+                    <span className="absolute block" style={tile.inset}>
+                      <img
+                        src={logoFileUrl(l.file)}
+                        alt={l.file}
+                        loading="lazy"
+                        className="h-full w-full object-contain"
+                      />
+                    </span>
+                  </span>
                 </button>
                 {l.builtin ? (
                   <span className="absolute left-0 top-0 bg-paper/85 px-1 text-meta text-ink-faint">
@@ -2335,9 +2376,39 @@ function RoleTransferLogoPicker({ role, tr }) {
         </div>
       </div>
 
+      {/*
+        显示得多大。
+        那张图在气泡里的位置和尺寸**全由苹果定**（它按气泡宽度铺满，高度跟着图的
+        比例走），所以「小一点」只能靠把画布压扁来表达 —— 界面上不解释这一层，
+        只给「横幅 / 小图标」两个看得懂的词。
+      */}
+      <Field label="显示得多大" hint="那张图在气泡里多宽是苹果定的，能拧的只有它多高">
+        <div className="flex flex-wrap gap-2">
+          {[
+            { key: "banner", label: "横幅", desc: "占满一条，600×300" },
+            { key: "icon", label: "小图标", desc: "压扁成窄条，600×156" },
+          ].map((s) => {
+            const on = (tr.logoStyle || "banner") === s.key;
+            return (
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => updateRole(role.id, { transfer: { ...tr, logoStyle: s.key } })}
+                className={`border px-3 py-2 text-left transition-colors duration-150 ${
+                  on ? "border-ink text-ink" : "border-line text-ink-faint hover:border-ink hover:text-ink"
+                }`}
+              >
+                <span className="block text-meta">{s.label}</span>
+                <span className="block text-meta text-ink-faint">{s.desc}</span>
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+
       <Field
         label="留白底色"
-        hint="图四周那块空白的颜色，默认白色。白字那种深色 logo 要在这儿换个深底，不然白底上看不见"
+        hint="图周围那块空白的颜色，默认白色。白字那种深色 logo 要在这儿换个深底，不然白底上看不见"
       >
         <div className="flex items-center gap-3">
           <input
@@ -2365,7 +2436,7 @@ function RoleTransferLogoPicker({ role, tr }) {
  *
  * 发出去的是 iMessage 的 miniApp 卡片（苹果那套 `MSMessageTemplateLayout`），
  * 不是生成的图片 —— 金额、备注、「待收款」三行字是真的文字槽，排版是苹果钉死的。
- * 唯一能自己画的地方是左边那张缩略图（见 RoleTransferLogoPicker）。
+ * 唯一能自己画的地方是那三行字上面那张缩略图（见 RoleTransferLogoPicker）。
  *
  * 两件事在界面上必须说清楚，因为都反直觉：
  *

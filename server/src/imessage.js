@@ -4707,7 +4707,11 @@ async function sendTransferPart(runner, space, part, ctx) {
    * 而**图和卡片必须一起送上去** —— 卡片一旦发出去就只能靠 updateCustomizedMiniApp
    * 整条换掉，没有「补一张图上去」这种操作。
    */
-  const image = await renderLogo(role.transfer.logo, { bg: role.transfer.logoBg, scope });
+  const image = await renderLogo(role.transfer.logo, {
+    bg: role.transfer.logoBg,
+    style: role.transfer.logoStyle,
+    scope,
+  });
 
   const session = await sendTransferCard({
     projectId: runner.projectId,
@@ -4756,6 +4760,7 @@ async function sendTransferPart(runner, space, part, ctx) {
     currency: role.transfer.currency,
     logo: role.transfer.logo,
     logoBg: role.transfer.logoBg,
+    logoStyle: role.transfer.logoStyle,
   });
   if (!ok) logWarn(scope, "这笔转账的句柄没存下来，之后改不了「已收款」");
 
@@ -4820,13 +4825,14 @@ async function claimTransferOnReact(runner, role, message, scope) {
    * 字节没落盘（只存了文件名），而 updateCustomizedMiniApp 是**整条 layout 换掉**
    * 而不是改某个字段 —— 这儿不给图，那张卡片收款时就会当场把图丢了。
    *
-   * 按**存下来的** logo / logoBg 渲，不读当前配置：和 appName、currency 同一个
-   * 道理，用户中途换了 logo，老卡片收款时不该当场换张脸。
+   * 按**存下来的** logo / logoBg / logoStyle 渲，不读当前配置：和 appName、
+   * currency 同一个道理，用户中途换了 logo 或者把它从横幅调成小图标，老卡片
+   * 收款时不该当场换张脸、换个高矮。
    *
    * 那个文件被删了的话 renderLogo 返回 null，卡片退化成不带图的样子 —— 认了，
    * 总比为此把 JPEG 字节塞进转账记录里好。
    */
-  const image = await renderLogo(hit.logo, { bg: hit.logoBg, scope });
+  const image = await renderLogo(hit.logo, { bg: hit.logoBg, style: hit.logoStyle, scope });
 
   const ok = await updateTransferCard({
     projectId: runner.projectId,

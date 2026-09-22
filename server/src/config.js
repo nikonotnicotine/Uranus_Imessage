@@ -31,8 +31,8 @@ import { MUSIC_SOURCES } from "./music.js";
 // 手机上那十九件事的总表。查岗的「单项开关」按它的 key 存（见 normalizeSpyFeatures）
 import { FEATURES as SPY_FEATURES } from "./spyfeatures.js";
 import { normalizePresets, makeDefaultPreset, defaultEntries, defaultRegexRules } from "./preset.js";
-// 转账卡片缩略图的背景色：合不合法只在 transferlogo.js 判一处
-import { DEFAULT_BG, normalizeColor } from "./transferlogo.js";
+// 转账卡片缩略图的背景色和画布档位：合不合法只在 transferlogo.js 判一处
+import { DEFAULT_BG, normalizeColor, normalizeLogoStyle } from "./transferlogo.js";
 // 三个额度的上下限只在 websearch.js 定义一处，这里跟着它收口
 import { LIMITS as SEARCH_LIMITS } from "./websearch.js";
 import { normalizeWorldBooks } from "./worldinfo.js";
@@ -1519,15 +1519,16 @@ function normalizeLocationSend(input) {
  * 用 ￥ 还是 $，是用户自己的决定，代码不替他选、也不预置任何真实机构的名字。
  * `appName` 空着 = 气泡上方那行署名不要；`currency` 空着 = ￥。
  *
- * ── logo / logoBg ──
+ * ── logo / logoBg / logoStyle ──
  *
- * 卡片左边那张缩略图（transferlogo.js 渲染）。`logo` 是文件名，空着 = 不带图；
- * `logoBg` 是留白处的底色。同样不预置任何真实机构的 logo 当默认值 —— 自带那
- * 两个素材是用户自己找来的，选不选由他决定。
+ * 那三行字上面那张缩略图（transferlogo.js 渲染）。`logo` 是文件名，空着 = 不带图；
+ * `logoBg` 是留白处的底色；`logoStyle` 是那条带子多高（`banner` / `icon`）——
+ * 图在气泡里多宽由苹果定，「显示得小一点」只能靠压扁画布表达。同样不预置任何
+ * 真实机构的 logo 当默认值 —— 自带那两个素材是用户自己找来的，选不选由他决定。
  *
- * 这四个字段**都要跟着每一笔一起存**（transferstore.js），改卡片时从那笔里取、
+ * 这五个字段**都要跟着每一笔一起存**（transferstore.js），改卡片时从那笔里取、
  * 不读当前配置：用户中途改了设置，一张老卡片收款时不该当场换个名字、换个符号、
- * 换张脸。
+ * 换张脸、变个高矮。
  *
  * 身份那几个字段（teamId / extensionBundleId / appStoreId）**不给用户配**，
  * 写死成 Spectrum 那个官方扩展的值（见 card.js 的 TRANSFER_TEAM_ID）——
@@ -1570,6 +1571,16 @@ function normalizeTransfer(input) {
      * 不合法的值在这儿就归成默认，不留到渲染时才发现。
      */
     logoBg: normalizeColor(input?.logoBg) ?? DEFAULT_BG,
+    /*
+     * 缩略图那条带子多高：`banner`（默认，600×300）还是 `icon`（600×156）。
+     *
+     * 这个字段表达的其实是「logo 显示得多大」—— 那张图在气泡里的尺寸由苹果按
+     * 气泡宽度定，我们唯一能拧的就是画布比例（见 transferlogo.js 的 CANVAS）。
+     *
+     * 认不出来的值归成 `banner` 而不是报错：老配置里压根没有这个字段，
+     * 而它只影响那张图长什么样。
+     */
+    logoStyle: normalizeLogoStyle(input?.logoStyle),
     // 对方贴 emoji 时要不要把卡片改成「已收款」。默认开 —— 这是这个功能
     // 最像真转账的一步，而且它只是改一张自己发出去的卡片，不外溢
     confirmOnReact: input?.confirmOnReact === undefined ? true : Boolean(input.confirmOnReact),

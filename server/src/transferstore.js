@@ -117,6 +117,7 @@ export function readTransfers(roleKey) {
  * @param {string} [entry.currency] 发的时候那个货币符号
  * @param {string} [entry.logo] 发的时候那张缩略图的**文件名**（空串 = 不带图）
  * @param {string} [entry.logoBg] 发的时候那张图的留白底色
+ * @param {string} [entry.logoStyle] 发的时候那张图用哪档画布（`banner` / `icon`）
  * @returns {boolean} 写进去了没有
  */
 export function putTransfer(roleKey, entry) {
@@ -153,6 +154,7 @@ export function putTransfer(roleKey, entry) {
     currency: String(entry.currency ?? ""),
     logo: String(entry.logo ?? ""),
     logoBg: String(entry.logoBg ?? ""),
+    logoStyle: String(entry.logoStyle ?? ""),
     at: Number(entry.at) || Date.now(),
   });
 

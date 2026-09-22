@@ -35,8 +35,11 @@
  * 几个字母。所以这里一律**等比缩放后居中放到一块固定画布上**，留白填背景色：
  * 原图是方的还是长的，出来的卡片都一样高，不会因为换个 logo 整张卡片变形。
  *
- * 渲染结果缓存在内存里（按文件路径 + mtime + 尺寸），同一个 logo 连发十笔
- * 转账只光栅化一次。缓存只是省 CPU，丢了也只是重画一遍。
+ * 画布有**两档**（`banner` / `icon`，见下面的 `CANVAS`）—— 那张图在气泡里多大
+ * 由苹果说了算，我们唯一的杠杆就是画布比例，压扁了 logo 看着就小。
+ *
+ * 渲染结果缓存在内存里（按文件路径 + mtime + 底色 + 档位），同一个 logo 连发
+ * 十笔转账只光栅化一次。缓存只是省 CPU，丢了也只是重画一遍。
  */
 
 import fs from "node:fs";
@@ -56,16 +59,47 @@ const SCOPE = "转账";
 export const LOGO_EXTS = [".svg", ".png", ".jpg", ".jpeg", ".webp"];
 
 /**
- * 画布尺寸。
+ * 两档画布。
  *
- * 600×300 是 2:1，接近 iMessage 给卡片缩略图的显示比例。再大没用 —— 那张图在
- * 气泡里就一两百像素宽，600 已经够 Retina 了，而字节是要走 gRPC 的。
+ * ── 为什么「大小」只能靠画布比例来表达 ──
+ *
+ * 那张图在气泡里的位置和尺寸**全由苹果定**：它按气泡宽度把图铺满，高度跟着图的
+ * 比例走。我们既不能说「画小一点」，也不能说「放右边」。所以**唯一的杠杆是画布
+ * 的长宽比** —— 画布越扁，那条带子越窄，同一个 logo 看着就越小。
+ *
+ * 宽度一律 600：那张图在气泡里就两三百像素宽，600 够 Retina 了，再大只是白白
+ * 多走几十 KB 的 gRPC。
+ *
+ * ── 为什么 icon 那档的留白是偏的 ──
+ *
+ * `imageTitle` 协议上必须和 `image` 一起给（见文件头），而它是**压在图下边缘的
+ * 一行浮字**。banner 那档图高 300，那行字落在图外的下缘上，碍不着谁；压到 156
+ * 之后就会直接盖在 logo 上。所以 icon 那档把留白挪到下面（上 18、下 66），
+ * logo 坐在偏上的位置，底下那条空带子留给那行字。
+ *
+ * 66 是按「气泡里显示成 ~30pt」估的，没在真机上量过 —— 真机上那行字压得更高
+ * 或更低都有可能，到时候调这一个数就行。
+ *
+ * `logo` 高度一律由 `boxH` 卡住，所以 icon 那档不管原图什么比例，出来都是同样
+ * 高的一条 —— 方图变成个小方块，长条 logo 变成一条窄横幅（Chase 那种 5.4:1
+ * 在这档里仍然占满宽度，只是矮，见界面上那句提示）。
  */
-export const CANVAS_W = 600;
-export const CANVAS_H = 300;
+const CANVAS = {
+  banner: { w: 600, h: 300, padX: 48, padTop: 48, padBottom: 48 },
+  icon: { w: 600, h: 156, padX: 24, padTop: 18, padBottom: 66 },
+};
 
-/** logo 四周留白。留白不够的话图会顶到边上，看着像截断的。 */
-const PADDING = 48;
+/** 默认哪一档。保持 1.2.3 出厂时的样子 —— 换默认值等于悄悄改了所有人的卡片。 */
+export const DEFAULT_LOGO_STYLE = "banner";
+
+/** 有哪几档（前端拿它渲那两个按钮）。 */
+export const LOGO_STYLES = Object.keys(CANVAS);
+
+/** 认不出来的值一律归成默认，不留到渲染时才发现。 */
+export function normalizeLogoStyle(raw) {
+  const t = String(raw ?? "").trim();
+  return LOGO_STYLES.includes(t) ? t : DEFAULT_LOGO_STYLE;
+}
 
 /** JPEG 质量。88 在这个尺寸下通常 10–30KB，肉眼看不出压缩痕迹。 */
 const JPEG_QUALITY = 88;
@@ -73,13 +107,13 @@ const JPEG_QUALITY = 88;
 /**
  * 字节上限，超了就不发这张图（卡片照旧发，只是没图）。
  *
- * proto 和 SDK 都没写上限，服务端的真实限制不清楚。600×300 的 JPEG 正常
- * 20KB 左右，256KB 已经远超任何合理值 —— 真到了那个数，说明输入是张
+ * proto 和 SDK 都没写上限，服务端的真实限制不清楚。这两档画布的 JPEG 正常
+ * 都在 20KB 上下，256KB 已经远超任何合理值 —— 真到了那个数，说明输入是张
  * 不该拿来当 logo 的巨图，宁可不带图也别拿整条转账去赌。
  */
 const MAX_BYTES = 256 * 1024;
 
-/** 渲染结果缓存：`路径|mtime|背景色` → JPEG Buffer。 */
+/** 渲染结果缓存：`路径|mtime|背景色|档位` → JPEG Buffer。 */
 const cache = new Map();
 
 /** 一个文件夹里合法的 logo 文件。读不了就当空的。 */
@@ -161,7 +195,8 @@ export const DEFAULT_BG = "#ffffff";
  * 一张图读不出来不该让整笔转账发不出去（口径和 linkmeta.js 一致）。
  *
  * @param {string} file 文件名（不是路径 —— 走 resolveLogo 那道白名单）
- * @param {{bg?: string, scope?: string}} [opts]
+ * @param {{bg?: string, style?: string, scope?: string}} [opts]
+ *   `style` 是画布档位（`banner` / `icon`，见上面那个 CANVAS）
  * @returns {Promise<Buffer|null>} JPEG 字节；读不出来 / 太大就是 null
  */
 export async function renderLogo(file, opts = {}) {
@@ -173,6 +208,8 @@ export async function renderLogo(file, opts = {}) {
   }
 
   const bg = normalizeColor(opts.bg) ?? DEFAULT_BG;
+  const style = normalizeLogoStyle(opts.style);
+  const box = CANVAS[style];
 
   let mtime = 0;
   try {
@@ -180,7 +217,7 @@ export async function renderLogo(file, opts = {}) {
   } catch {
     return null; // 刚被删掉
   }
-  const key = `${full}|${mtime}|${bg}`;
+  const key = `${full}|${mtime}|${bg}|${style}`;
   const hit = cache.get(key);
   if (hit) return hit;
 
@@ -198,10 +235,10 @@ export async function renderLogo(file, opts = {}) {
       return null;
     }
 
-    const canvas = createCanvas(CANVAS_W, CANVAS_H);
+    const canvas = createCanvas(box.w, box.h);
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.fillRect(0, 0, box.w, box.h);
 
     /*
      * 等比缩放到留白框里，居中。
@@ -209,12 +246,22 @@ export async function renderLogo(file, opts = {}) {
      * 两个方向都要收（`Math.min`）—— 只按宽度算的话，一张竖图会超出上下边界
      * 被裁掉头尾。**不放大**：小图拉大只会糊，宁可它在中间小小一块。
      */
-    const boxW = CANVAS_W - PADDING * 2;
-    const boxH = CANVAS_H - PADDING * 2;
+    const boxW = box.w - box.padX * 2;
+    const boxH = box.h - box.padTop - box.padBottom;
     const k = Math.min(boxW / img.width, boxH / img.height, 1);
     const w = Math.max(1, Math.round(img.width * k));
     const h = Math.max(1, Math.round(img.height * k));
-    ctx.drawImage(img, Math.round((CANVAS_W - w) / 2), Math.round((CANVAS_H - h) / 2), w, h);
+    /*
+     * 横向居中，纵向在留白框里居中 —— icon 那档上下留白不一样（下面那条空带子
+     * 留给 imageTitle），所以这儿不能拿 box.h 算，得按 padTop 起算。
+     */
+    ctx.drawImage(
+      img,
+      Math.round((box.w - w) / 2),
+      Math.round(box.padTop + (boxH - h) / 2),
+      w,
+      h
+    );
 
     const buf = await canvas.encode("jpeg", JPEG_QUALITY);
     if (!buf?.length) {
@@ -231,7 +278,10 @@ export async function renderLogo(file, opts = {}) {
 
     const out = Buffer.from(buf);
     cache.set(key, out);
-    logDebug(scope, `转账 logo 渲染好了：${file} → ${CANVAS_W}×${CANVAS_H}、${Math.round(out.length / 1024)}KB`);
+    logDebug(
+      scope,
+      `转账 logo 渲染好了：${file} → ${style} ${box.w}×${box.h}、${Math.round(out.length / 1024)}KB`
+    );
     return out;
   } catch (e) {
     logWarn(scope, `这个 logo 渲染不了：${file}（这张卡片不带图）`, e);

@@ -470,12 +470,25 @@ okWith("logoMime 认得出 svg（不能按 png 发，浏览器会解成碎图）
   });
 }
 
+/* 画布档位：认不出来的一律归成 banner，别留到渲染时才发现。 */
+okWith("normalizeLogoStyle 只认那两档", () => {
+  assert.equal(TL.normalizeLogoStyle("icon"), "icon");
+  assert.equal(TL.normalizeLogoStyle("banner"), "banner");
+  assert.equal(TL.normalizeLogoStyle(" icon "), "icon");
+  // 老配置里压根没这个字段，认不出来的值也走同一条路
+  for (const junk of [undefined, null, "", "ICON", "小图标", "tiny", 7]) {
+    assert.equal(TL.normalizeLogoStyle(junk), "banner", `${junk} 该归成 banner`);
+  }
+  assert.equal(TL.DEFAULT_LOGO_STYLE, "banner", "换默认值等于悄悄改了所有人的卡片");
+  assert.deepEqual(TL.LOGO_STYLES, ["banner", "icon"]);
+});
+
 /*
  * 真渲一张自带的 SVG 出来。
  *
  * 三件事必须成立，缺一个卡片就发不出去或者变形：
  *  - 出来的是**真 JPEG**（`ffd8` 开头）—— 服务端会验它能不能解码；
- *  - 尺寸固定 600×300，跟原图比例无关（方图和 5.4:1 的长条出来一样高）；
+ *  - 尺寸跟原图比例无关（方图和 5.4:1 的长条出来一样高），只跟档位有关；
  *  - 体积在合理范围（这是要走 gRPC 的）。
  *
  * 装不上 @napi-rs/canvas 的机器上这条会拿到 null —— 那时候整个功能退化成
@@ -485,11 +498,9 @@ okWith("logoMime 认得出 svg（不能按 png 发，浏览器会解成碎图）
   const svg = TL.listBuiltinLogos().find((l) => l.file.toLowerCase().endsWith(".svg"))?.file;
   const buf = svg ? await TL.renderLogo(svg) : null;
   if (buf) {
-    okWith("真把 SVG 渲成了 JPEG（600×300，ffd8 打头）", () => {
+    okWith("真把 SVG 渲成了 JPEG（ffd8 打头）", () => {
       assert.equal(buf.subarray(0, 2).toString("hex"), "ffd8");
       assert.ok(buf.length > 1000 && buf.length < 256 * 1024, `${buf.length} 字节不像一张 logo`);
-      assert.equal(TL.CANVAS_W, 600);
-      assert.equal(TL.CANVAS_H, 300);
     });
     const again = await TL.renderLogo(svg);
     okWith("同一张图再渲一次走缓存（同一个 Buffer 实例）", () => {
@@ -500,6 +511,29 @@ okWith("logoMime 认得出 svg（不能按 png 发，浏览器会解成碎图）
     okWith("换个背景色就是另一份（缓存键带底色）", () => {
       assert.ok(dark && dark !== buf);
       assert.equal(dark.subarray(0, 2).toString("hex"), "ffd8");
+    });
+
+    /*
+     * 「显示得多大」这件事**只能靠画布比例表达** —— 那张图在气泡里多宽由苹果
+     * 按气泡宽度定，我们唯一的杠杆是它多高。所以 icon 那档必须真的更扁，
+     * 而且不能和 banner 撞进同一个缓存格子。
+     */
+    const icon = await TL.renderLogo(svg, { style: "icon" });
+    const iconAgain = await TL.renderLogo(svg, { style: "icon" });
+    const bannerAgain = await TL.renderLogo(svg, { style: "banner" });
+    okWith("icon 那档是另一份、更扁、也走缓存（键带档位）", () => {
+      assert.ok(icon && icon !== buf, "icon 不该和 banner 共用一份");
+      assert.equal(icon.subarray(0, 2).toString("hex"), "ffd8");
+      // 同一张图画在更小的画布上，字节必然更少
+      assert.ok(icon.length < buf.length, `icon ${icon.length} 该比 banner ${buf.length} 小`);
+      assert.equal(iconAgain, icon, "icon 自己也该走缓存");
+      // 默认那档 = banner，两边得撞进同一个格子
+      assert.equal(bannerAgain, buf, "不给 style 就该拿到 banner 那份");
+    });
+
+    const bogus = await TL.renderLogo(svg, { style: "没这档" });
+    okWith("档位认不出来时退回 banner（跟 normalizeLogoStyle 一条路）", () => {
+      assert.equal(bogus, buf);
     });
 
     /*
@@ -709,7 +743,7 @@ okWith("appName 和 currency 跟着落盘（改卡片时要用发的时候那一
  * 存的是**文件名不是字节** —— 一张 JPEG 塞进记录里，500 笔就是几兆 base64
  * 躺在这个 JSON 里。
  */
-okWith("logo / logoBg 跟着落盘，而且存的是文件名不是图片字节", () => {
+okWith("logo / logoBg / logoStyle 跟着落盘，而且存的是文件名不是图片字节", () => {
   TS.putTransfer(ROLE, {
     ...session,
     messageGuid: "G-logo",
@@ -719,10 +753,13 @@ okWith("logo / logoBg 跟着落盘，而且存的是文件名不是图片字节"
     peerKey: "p1",
     logo: "Chase.svg",
     logoBg: "#07c160",
+    logoStyle: "icon",
   });
   const hit = TS.findTransfer(ROLE, "G-logo");
   assert.equal(hit?.logo, "Chase.svg");
   assert.equal(hit?.logoBg, "#07c160");
+  // 漏了这个字段，用户中途从小图标调回横幅，老卡片收款时会当场变高
+  assert.equal(hit?.logoStyle, "icon");
   assert.ok(!JSON.stringify(hit).includes("/9j/"), "图片字节不许进记录");
 });
 
@@ -738,6 +775,8 @@ okWith("没给 appName / currency / logo 时存成空串，不是 undefined", ()
   assert.equal(hit?.currency, "");
   assert.equal(hit?.logo, "");
   assert.equal(hit?.logoBg, "");
+  // 空串在 renderLogo 那儿会被 normalizeLogoStyle 归成 banner，所以不用兜底成 "banner"
+  assert.equal(hit?.logoStyle, "");
 });
 
 /*
@@ -862,10 +901,23 @@ okWith("appName 截到 40 字", () => {
   assert.equal(role.transfer.appName.length, 40);
 });
 
-okWith("默认不带缩略图，底色默认白", () => {
+okWith("默认不带缩略图，底色默认白，档位默认横幅", () => {
   const role = C.normalizeConfig({ roles: [{ id: "r0", name: "x" }] }).roles[0];
   assert.equal(role.transfer.logo, "");
   assert.equal(role.transfer.logoBg, "#ffffff");
+  // 老配置里没有这个字段，必须补成 banner —— 补成 icon 等于悄悄压扁所有人的卡片
+  assert.equal(role.transfer.logoStyle, "banner");
+});
+
+/* 档位也在配置这一层归一，理由和底色同一条。 */
+okWith("档位认不出来就归成横幅", () => {
+  const st = (v) =>
+    C.normalizeConfig({ roles: [{ id: "r0", name: "x", transfer: { logoStyle: v } }] }).roles[0]
+      .transfer.logoStyle;
+  assert.equal(st("icon"), "icon");
+  assert.equal(st("banner"), "banner");
+  assert.equal(st("小图标"), "banner");
+  assert.equal(st(""), "banner");
 });
 
 /*
@@ -1051,15 +1103,19 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
       src.indexOf("async function claimTransferOnReact(")
     );
     assert.ok(send.includes("renderLogo(role.transfer.logo"), "发的时候没渲图");
+    assert.ok(send.includes("style: role.transfer.logoStyle"), "发的时候没按配置那档渲");
     assert.ok(send.includes("logo: role.transfer.logo"), "logo 没跟着落盘");
     assert.ok(send.includes("logoBg: role.transfer.logoBg"), "logoBg 没跟着落盘");
+    assert.ok(send.includes("logoStyle: role.transfer.logoStyle"), "logoStyle 没跟着落盘");
 
     const claim = src.slice(
       src.indexOf("async function claimTransferOnReact("),
       src.indexOf("async function sendMusicPart(")
     );
     assert.ok(claim.includes("renderLogo(hit.logo"), "改的时候没按存下来那个重渲");
+    assert.ok(claim.includes("style: hit.logoStyle"), "改的时候没按存下来那档渲");
     assert.ok(!claim.includes("renderLogo(role"), "改的时候不许读当前配置");
+    assert.ok(!claim.includes("role.transfer.logoStyle"), "改的时候不许读当前配置的档位");
   });
 
   okWith("已经收过的不重复处理（重复贴表情不该让卡片闪一下）", () => {
