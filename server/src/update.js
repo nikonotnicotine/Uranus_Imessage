@@ -36,7 +36,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { netCode, proxyFor, usesProxy } from "./proxy.js";
+import { fetchVia, netCode, usesProxy } from "./proxy.js";
 
 /**
  * 项目根目录（放着那份 package.json）。
@@ -187,16 +187,20 @@ function explain(e) {
  * @returns {Promise<{tag: string, name: string, notes: string, url: string, at: string}>}
  */
 async function fetchLatest() {
-  const res = await fetch(LATEST_API, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      // GitHub 要求带 UA，不带的话直接 403
-      "User-Agent": "Uranus-iMessage",
-    },
-    signal: AbortSignal.timeout(TIMEOUT),
-    ...(await proxyFor("update")),
-  });
+  const res = await fetchVia(
+    "update",
+    LATEST_API,
+    () => ({
+      headers: {
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        // GitHub 要求带 UA，不带的话直接 403
+        "User-Agent": "Uranus-iMessage",
+      },
+      signal: AbortSignal.timeout(TIMEOUT),
+    }),
+    (why) => logDebug("更新", `查最新版本${why}`)
+  );
 
   // 404 是「这个仓库还没发过 release」，不是错误 —— 分开说，
   // 不然用户会以为是自己网络或者地址填错了

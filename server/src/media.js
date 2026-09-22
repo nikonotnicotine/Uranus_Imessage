@@ -32,11 +32,20 @@ import { formatAmount } from "./card.js";
 import { IMAGES_DIR, REF_IMAGES_DIR, ensureLayout } from "./datadir.js";
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { netCodes, proxyFor, whyNetwork } from "./proxy.js";
+import { fetchVia, netCodes, whyNetwork } from "./proxy.js";
 import { xmlBlockRanges } from "./websearch.js";
 
 /** 合成一条语音最多等多久。对方在 iMessage 那头看着打字指示器干等。 */
 const TTS_TIMEOUT = 30000;
+
+/**
+ * 三家 TTS 那几个函数记日志用的作用域。
+ *
+ * synthesizeVoice 收的那个 `scope` 是调用方给的（哪个角色在说话），但
+ * ttsMinimax / ttsElevenLabs 拿不到它 —— 它们只在「代理挂了、脱开代理重试」
+ * 那一下记一句 debug，写死一个模块级的名字就够。
+ */
+const TTS_SCOPE = "语音";
 
 /**
  * 连接失败之后再试几次。
@@ -878,7 +887,7 @@ function trimBase(url) {
  * `fetch failed`。`AggregateError`（IPv6 / IPv4 都连不上时 Node 抛的，具体
  * 原因在 `errors[]` 里）正好落在这个口子上，用户报上来的就是那一句。
  *
- * `scope` 要和这条路 `proxyFor(...)` 用的 key **一致**：合成语音走 `"tts"`、
+ * `scope` 要和这条路 `fetchVia(...)` 用的 key **一致**：合成语音走 `"tts"`、
  * 生图走 `"llm"`。whyNetwork 会照这个 key 去看「这一类到底有没有挂代理」，
  * 然后分开说 —— 同一个 ECONNREFUSED，走代理时该去看代理开没开，直连时该去看
  * 地址填对没有。传错 key 的话它会理直气壮地指错方向。
@@ -1253,30 +1262,34 @@ async function ttsMinimax(cfg, text, voiceId) {
   const group = String(cfg?.groupId ?? "").trim();
   const url = `${host}/v1/t2a_v2${group ? `?GroupId=${encodeURIComponent(group)}` : ""}`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    signal: AbortSignal.timeout(TTS_TIMEOUT),
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${String(cfg?.key ?? "").trim()}`,
-    },
-    body: JSON.stringify({
-      model: String(cfg?.model ?? "").trim() || "speech-02-hd",
-      text,
-      stream: false,
-      language_boost: "auto",
-      output_format: "hex",
-      // 音色 ID 留空时用官方的系统音色，让「没填也能出声」
-      voice_setting: {
-        voice_id: voiceId || "male-qn-qingse",
-        speed: 1,
-        vol: 1,
-        pitch: 0,
+  const res = await fetchVia(
+    "tts",
+    url,
+    () => ({
+      method: "POST",
+      signal: AbortSignal.timeout(TTS_TIMEOUT),
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${String(cfg?.key ?? "").trim()}`,
       },
-      audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3", channel: 1 },
+      body: JSON.stringify({
+        model: String(cfg?.model ?? "").trim() || "speech-02-hd",
+        text,
+        stream: false,
+        language_boost: "auto",
+        output_format: "hex",
+        // 音色 ID 留空时用官方的系统音色，让「没填也能出声」
+        voice_setting: {
+          voice_id: voiceId || "male-qn-qingse",
+          speed: 1,
+          vol: 1,
+          pitch: 0,
+        },
+        audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3", channel: 1 },
+      }),
     }),
-    ...(await proxyFor("tts")),
-  });
+    (why) => logDebug(TTS_SCOPE, `MiniMax${why}`)
+  );
 
   const body = await res.text();
   if (!res.ok) throw new Error(`MiniMax 返回 ${res.status}：${clipBody(body)}`);
@@ -1311,32 +1324,36 @@ async function ttsElevenLabs(cfg, text, voiceId) {
     `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(id)}` +
     "?output_format=mp3_44100_128";
 
-  const res = await fetch(url, {
-    method: "POST",
-    signal: AbortSignal.timeout(TTS_TIMEOUT),
-    headers: {
-      "Content-Type": "application/json",
-      "xi-api-key": String(cfg?.key ?? "").trim(),
-    },
-    body: JSON.stringify({
-      text,
-      model_id: String(cfg?.model ?? "").trim() || "eleven_multilingual_v2",
-      voice_settings: {
-        stability: Number(cfg?.stability ?? 0.5),
-        similarity_boost: Number(cfg?.similarityBoost ?? 0.75),
-        /*
-         * 风格夸张度**只在大于 0 时才发**。
-         *
-         * 这一项是 v2 系模型的（multilingual_v2 / turbo_v2_5）；eleven_v3 的
-         * voice_settings 认的是另一套，多塞一个它不认的字段有被整个请求打回的
-         * 风险。默认 0 时干脆不发，请求体和加这个功能之前一模一样 —— 不碰
-         * 已经调好的配置。官方也提醒 style > 0 会让合成变慢、更容易念飘。
-         */
-        ...(Number(cfg?.style ?? 0) > 0 ? { style: Number(cfg.style) } : {}),
+  const res = await fetchVia(
+    "tts",
+    url,
+    () => ({
+      method: "POST",
+      signal: AbortSignal.timeout(TTS_TIMEOUT),
+      headers: {
+        "Content-Type": "application/json",
+        "xi-api-key": String(cfg?.key ?? "").trim(),
       },
+      body: JSON.stringify({
+        text,
+        model_id: String(cfg?.model ?? "").trim() || "eleven_multilingual_v2",
+        voice_settings: {
+          stability: Number(cfg?.stability ?? 0.5),
+          similarity_boost: Number(cfg?.similarityBoost ?? 0.75),
+          /*
+           * 风格夸张度**只在大于 0 时才发**。
+           *
+           * 这一项是 v2 系模型的（multilingual_v2 / turbo_v2_5）；eleven_v3 的
+           * voice_settings 认的是另一套，多塞一个它不认的字段有被整个请求打回的
+           * 风险。默认 0 时干脆不发，请求体和加这个功能之前一模一样 —— 不碰
+           * 已经调好的配置。官方也提醒 style > 0 会让合成变慢、更容易念飘。
+           */
+          ...(Number(cfg?.style ?? 0) > 0 ? { style: Number(cfg.style) } : {}),
+        },
+      }),
     }),
-    ...(await proxyFor("tts")),
-  });
+    (why) => logDebug(TTS_SCOPE, `ElevenLabs${why}`)
+  );
 
   if (!res.ok) {
     throw new Error(`ElevenLabs 返回 ${res.status}：${clipBody(await res.text())}`);
@@ -1353,7 +1370,7 @@ async function ttsElevenLabs(cfg, text, voiceId) {
  * 只是预热，参数校验照样会拦下缺这个字段的请求。所以角色上那个「音色 ID」
  * 在这一家的含义是**参考音频的路径**（界面上写了这句话），留空就退回全局配的那条。
  *
- * **这一家刻意不走代理**（另外两家 TTS 都挂了 `proxyFor("tts")`）：它打的是
+ * **这一家刻意不走代理**（另外两家 TTS 都走 `fetchVia("tts", …)`）：它打的是
  * 本机或局域网地址，把 127.0.0.1 交给机场代理多半直接连不上 —— 而用户在
  * 「代理」里勾「语音合成」，想的是 ElevenLabs 那种出不了国的，不是自己电脑上
  * 跑着的这个。
@@ -1551,10 +1568,12 @@ async function readImageFrom(item, scope) {
   if (typeof url === "string" && /^https?:\/\//i.test(url)) {
     logDebug(scope, "上游返回的是图片链接，再取一次字节");
     // 跟着「模型 API」那个勾走：这条链接是出图接口自己给的，域名通常和它同一家
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(IMAGE_TIMEOUT),
-      ...(await proxyFor("llm")),
-    });
+    const res = await fetchVia(
+      "llm",
+      url,
+      () => ({ signal: AbortSignal.timeout(IMAGE_TIMEOUT) }),
+      (why) => logDebug(scope, `取图片链接${why}`)
+    );
     if (!res.ok) throw new Error(`取图片链接失败：HTTP ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   }
@@ -1657,32 +1676,45 @@ export async function generateImage(endpoint, req, scope = "生图") {
         new Blob([bytes], { type: mimeForExt(ext) }),
         path.basename(refFile)
       );
-      res = await fetch(`${base}/images/edits`, {
-        method: "POST",
-        signal: AbortSignal.timeout(IMAGE_TIMEOUT),
-        // Content-Type 不能自己写 —— multipart 的 boundary 要让 fetch 自己填
-        headers: auth,
-        body: form,
-        ...(await proxyFor("llm")),
-      });
-    } else {
-      res = await fetch(`${base}/images/generations`, {
-        method: "POST",
-        signal: AbortSignal.timeout(IMAGE_TIMEOUT),
-        headers: { "Content-Type": "application/json", ...auth },
-        body: JSON.stringify({
-          model,
-          prompt,
-          n: 1,
-          response_format: "b64_json",
-          ...(negative ? { negative_prompt: negative } : {}),
-          ...(ratio ? { size: ratio.size, aspect_ratio: ratio.key } : {}),
+      /*
+       * form 这个对象在回退那一刀里**照样能再交一遍**：FormData 里存的是
+       * Blob（上面刚从文件读出来的字节），undici 每次发请求都重新序列化一遍，
+       * 不像读流那样一次性。所以这个闭包直接引用它就行。
+       */
+      res = await fetchVia(
+        "llm",
+        `${base}/images/edits`,
+        () => ({
+          method: "POST",
+          signal: AbortSignal.timeout(IMAGE_TIMEOUT),
+          // Content-Type 不能自己写 —— multipart 的 boundary 要让 fetch 自己填
+          headers: auth,
+          body: form,
         }),
-        ...(await proxyFor("llm")),
-      });
+        (why) => logDebug(scope, `带参考图出图${why}`)
+      );
+    } else {
+      res = await fetchVia(
+        "llm",
+        `${base}/images/generations`,
+        () => ({
+          method: "POST",
+          signal: AbortSignal.timeout(IMAGE_TIMEOUT),
+          headers: { "Content-Type": "application/json", ...auth },
+          body: JSON.stringify({
+            model,
+            prompt,
+            n: 1,
+            response_format: "b64_json",
+            ...(negative ? { negative_prompt: negative } : {}),
+            ...(ratio ? { size: ratio.size, aspect_ratio: ratio.key } : {}),
+          }),
+        }),
+        (why) => logDebug(scope, `出图${why}`)
+      );
     }
   } catch (e) {
-    // 生图打的是模型 API（proxyFor("llm")），所以这里的 scope 也是 llm
+    // 生图打的是模型 API（fetchVia("llm", …)），所以这里的 scope 也是 llm
     throw new Error(`生图请求失败：${whyFetch(e, "llm", IMAGE_TIMEOUT)}`);
   }
 

@@ -44,7 +44,13 @@
  * 界面上那个「测试连通」会把这件事说清楚。
  */
 
-import { CONFIG_PATH, LEGACY_CONFIG_PATH, SECRET_PATH, readJson } from "./datadir.js";
+import {
+  CONFIG_PATH,
+  LEGACY_CONFIG_PATH,
+  LEGACY_SECRET_PATH,
+  SECRET_PATH,
+  readJson,
+} from "./datadir.js";
 import { logInfo, logWarn } from "./logs.js";
 
 const SCOPE = "代理";
@@ -57,8 +63,20 @@ const SCOPE = "代理";
  * `key` 进配置，`label` 和 `hint` 直接显示在界面上，`domains` 是给用户看的
  * 「这一类到底打哪些域名」—— 不写清楚的话没人知道该勾哪个。
  *
- * `default` 是出厂勾选状态。只有 IG 和天气是 `true`：那两类是用户实测直连不通的，
- * 其余默认直连（详见文件头那段「猜错的代价不对称」）。
+ * `default` 是出厂勾选状态。只有 IG 和搜索是 `true`：那两类是实测直连打不通的
+ * （8 秒超时，一次都没成），其余默认直连（详见文件头那段「猜错的代价不对称」）。
+ *
+ * `wall` 是「这一类的目标是不是真的被墙」。它**不进配置、也不显示**，只给
+ * `whyNetwork` 用来决定出错时那句话往哪儿指：
+ *
+ *   · `wall: true`  的类（IG、搜索）连不上，八成真是没梯子 → 提代理
+ *   · `wall: false` 的类（模型 API、Photon、云备份…）连不上，多半是密钥、
+ *     地址、或者对方站点自己挂了 → **别提代理**
+ *
+ * 加这个字段的直接原因：模型 API 一出网络错，文案就无脑劝人去勾代理，而同一个
+ * 文件的注释里写着「中转站直连本来就通，套代理反而慢还可能被风控」—— 自相矛盾，
+ * 指的方向是反的。用户的原话：「为什么我这边显示 API 也要开代理啊，我 API 在
+ * cherry 不开梯子都能直接用」。
  */
 export const PROXY_SCOPES = [
   {
@@ -67,13 +85,23 @@ export const PROXY_SCOPES = [
     domains: "graph.instagram.com、graph.facebook.com",
     hint: "Meta 的接口，国内直连不通",
     default: true,
+    wall: true,
   },
   {
     key: "weather",
+    /*
+     * 出厂**不勾**。三家天气源在国内实测都直连通（open-meteo 1.1 秒、
+     * 和风 250 毫秒、WeatherAPI 725 毫秒），原来勾着是多绕一趟代理 ——
+     * 只是 fetchJson 有回退兜着，所以没人发现它慢。
+     *
+     * `wall: true` 照旧：open-meteo 在国内确实时好时坏（env.js 那张内置坐标表
+     * 就是为它超时准备的），真连不上时提一句代理是对的。
+     */
     label: "天气",
     domains: "open-meteo.com、qweatherapi.com、weatherapi.com",
-    hint: "三家天气源和地名查询",
-    default: true,
+    hint: "三家天气源和地名查询。国内实测直连都通，一般不用勾",
+    default: false,
+    wall: true,
   },
   {
     key: "llm",
@@ -81,13 +109,22 @@ export const PROXY_SCOPES = [
     domains: "你在「连接」里填的那些地址",
     hint: "中转站在国内多半直连就通，套代理反而慢，还可能被风控",
     default: false,
+    // 打的是用户自己买的中转站，那些地址在国内直连本来就通。连不上时该看的是
+    // 密钥、接口地址、或者那家站点自己的状态 —— 提代理是把人往错的方向带
+    wall: false,
   },
   {
     key: "search",
+    /*
+     * 出厂**勾上**。DuckDuckGo 和 Brave 实测都是 8 秒超时、一次都没通，
+     * 和 IG 一个性质。原来默认不勾，用户开了联网搜索之后只有 Tavily 那一家
+     * 能用，另外两家静悄悄地全军覆没。
+     */
     label: "联网搜索",
     domains: "api.tavily.com、api.search.brave.com、duckduckgo.com",
-    hint: "DuckDuckGo 直连不通",
-    default: false,
+    hint: "DuckDuckGo 和 Brave 直连不通（Tavily 通）",
+    default: true,
+    wall: true,
   },
   {
     key: "tts",
@@ -95,6 +132,7 @@ export const PROXY_SCOPES = [
     domains: "api.minimax.chat、api.elevenlabs.io",
     hint: "ElevenLabs 直连不通",
     default: false,
+    wall: true,
   },
   {
     key: "cloud",
@@ -102,6 +140,7 @@ export const PROXY_SCOPES = [
     domains: "对象存储和 api.github.com",
     hint: "缤纷云直连通，GitHub 时好时坏",
     default: false,
+    wall: true,
   },
   {
     key: "update",
@@ -109,13 +148,16 @@ export const PROXY_SCOPES = [
     domains: "api.github.com",
     hint: "拉仓库的 Release 列表",
     default: false,
+    wall: true,
   },
   {
     key: "music",
     label: "音乐搜索",
     domains: "itunes.apple.com、music.163.com",
-    hint: "分享歌曲时查曲目信息",
+    hint: "分享歌曲时查曲目信息。两家国内直连都通",
     default: false,
+    // 苹果和网易云在国内都直连通，连不上是本机网络的事，不是墙
+    wall: false,
   },
   {
     key: "link",
@@ -123,6 +165,8 @@ export const PROXY_SCOPES = [
     domains: "对方发来的链接指向哪儿就是哪儿",
     hint: "国内站直连更快，YouTube / Instagram 这类要走代理才读得到标题",
     default: false,
+    // 打哪儿全看对方发来的链接，两种都有可能 —— 这一类提一句代理不算误导
+    wall: true,
   },
   {
     key: "photon",
@@ -130,8 +174,21 @@ export const PROXY_SCOPES = [
     domains: "iMessage 桥接的管理接口",
     hint: "实测直连就通，一般不用勾",
     default: false,
+    // spectrum.photon.codes 实测直连 200。连不上是本机出不了网或者服务方挂了
+    wall: false,
   },
 ];
+
+/**
+ * 某一类的目标是不是真被墙（出错时该不该提代理）。见 PROXY_SCOPES 的 `wall`。
+ *
+ * 清单里没有的 key 按 `true` 算 —— 新加一类忘了写 `wall` 的话，宁可多提一句
+ * 代理（顶多是句废话），也不要把一个真的被墙的类说成「跟代理无关」。
+ */
+function behindWall(scope) {
+  const found = PROXY_SCOPES.find((s) => s.key === scope);
+  return found ? found.wall !== false : true;
+}
 
 /** 所有合法的类别 key。 */
 export const SCOPE_KEYS = PROXY_SCOPES.map((s) => s.key);
@@ -366,6 +423,11 @@ function agentFor(url) {
  *
  * 返回 `{}` 而不是 `null`，就是为了让调用点能无条件展开、不用写 if。
  *
+ * **但业务代码别直接用它** —— 用下面的 `fetchVia`。差别是代理自己坏掉
+ * （没启动、换了端口、隧道被掐）时那一刀直连补救：裸用 `proxyFor` 的话，
+ * 勾了代理的类别在代理没开时就是直接失败，哪怕目标本来直连就通。
+ * 这个函数留着导出只为给 `fetchVia` 和自检脚本用。
+ *
  * @param {string} scope PROXY_SCOPES 里的 key
  * @returns {Promise<{dispatcher?: object}>}
  */
@@ -374,6 +436,79 @@ export async function proxyFor(scope) {
   if (!url || !scopes[scope]) return {};
   const agent = await agentFor(url);
   return agent ? { dispatcher: agent } : {};
+}
+
+/* ================= 代理坏了就直连 ================= */
+
+/**
+ * 「这是代理自己坏了」的典型错误码 —— 这几种脱开代理还有戏。
+ *
+ * 原来只在 env.js 里给天气用，现在搬上来给所有类别共用（`fetchVia`）。
+ *
+ * **超时刻意不在其中。** 已经白等了一整个超时，再等一轮只会让这件事更慢；
+ * 而且超时既可能是代理不通、也可能是目标本来就连不上，脱开代理重试的胜率
+ * 远不如这几种明确的「代理层面」故障。
+ */
+const PROXY_FAULT_CODES = new Set([
+  "ECONNRESET", // 隧道被中途掐断。用户报过的就是这个
+  "ECONNREFUSED", // 代理端口没开（改了端口、客户端没启动）
+  "ENOTFOUND", // 代理的域名解析不了
+  "EAI_AGAIN",
+  "EPIPE",
+  "CERT_HAS_EXPIRED", // 代理在中间做 TLS 拦截，拿自签证书顶包
+  "UND_ERR_SOCKET",
+]);
+
+/**
+ * 带代理发一个请求，**代理自己坏掉时脱开代理直连再试一次**。
+ *
+ * ── 为什么要有这一层 ──
+ *
+ * 用户的原话：「能不能就写开了才用代理，不开直接用国内多直连啊？」。
+ * 勾了代理的类别，在代理没开的时候会直接失败 —— 而那台机器上很多目标
+ * （天气、中转站、GitHub、音乐）本来就直连通。为了一个没启动的 Clash
+ * 把本来能成的事搞失败，说不过去。
+ *
+ * 这一层只做**单向**回退：勾了代理 → 代理挂了 → 直连补一刀。
+ * 反方向（没勾代理、直连失败了就偷偷试代理）**刻意不做**：那会让模型 API
+ * 在上游抖一下的时候被悄悄换成代理出口 IP，可能触发中转站风控 —— 而那种
+ * 坏法用户压根联想不到是代理干的（见文件头「猜错的代价不对称」）。
+ *
+ * 没勾代理的类别走到这儿就是一次普通 fetch，一点额外开销都没有。
+ *
+ * @param {string} scope PROXY_SCOPES 里的 key
+ * @param {string} url 要打的地址
+ * @param {() => RequestInit} init 每次重新造一份 init。**必须是函数** ——
+ *   里面多半有 `AbortSignal.timeout()`，第一发用掉之后那个 signal 已经在
+ *   计时了（甚至已经 abort 了），重试那发必须拿个新的
+ * @param {(text: string) => void} [onRetry] 要回退时说一句，进日志
+ * @returns {Promise<Response>}
+ * @throws 代理那发的原因（不是直连那发的）—— 那才是用户真正要去改的东西
+ */
+export async function fetchVia(scope, url, init, onRetry) {
+  const opts = await proxyFor(scope);
+  // 没勾 / 没配代理：一次普通请求，出错原样抛给调用方翻译
+  if (!opts.dispatcher) return fetch(url, init());
+
+  try {
+    return await fetch(url, { ...init(), ...opts });
+  } catch (e) {
+    const code = netCode(e);
+    if (!PROXY_FAULT_CODES.has(code)) throw e;
+    onRetry?.(`走代理失败（${code}），脱开代理直连再试一次`);
+    try {
+      // 这一发**刻意不带 dispatcher**：代理就是刚才坏掉的那个东西
+      return await fetch(url, init());
+    } catch (e2) {
+      /*
+       * 直连也不行。抛的是**走代理**那次的错误对象，不是直连这次的 ——
+       * 调用方会拿它去 whyNetwork，而那句话该指向代理（用户要改的是代理），
+       * 直连的结果只是补一句线索。
+       */
+      e.directRetryCode = netCode(e2) || String(e2?.message ?? e2);
+      throw e;
+    }
+  }
 }
 
 /**
@@ -421,8 +556,16 @@ export function netCode(e) {
  * 网络层出错时说人话，带上「是不是代理的问题」。
  *
  * `fetch failed` 是 undici 对一切网络问题的统称，原样抛给用户等于什么都没说。
- * 这里把最常见的几种拆开，每种都直接指向要改的东西 —— 而且会区分
- * 「走着代理出的错」和「直连出的错」，那两种要改的地方完全不同。
+ * 这里把最常见的几种拆开，每种都直接指向要改的东西。分三个维度：
+ *
+ *  1. **走着代理出的错 vs 直连出的错** —— 同一个 ECONNREFUSED，走代理时该去看
+ *     代理开没开，直连时该去看接口地址填对没有。要改的地方完全不同。
+ *  2. **这一类是不是真被墙**（`PROXY_SCOPES` 的 `wall`）—— 没走代理又失败时，
+ *     IG 和搜索该提一句「去勾代理」，而模型 API、Photon、音乐**不该**：
+ *     那几个在国内直连本来就通，提代理是把人往错的方向带。用户的原话：
+ *     「为什么我这边显示 API 也要开代理啊，我 API 在 cherry 不开梯子都能直接用」。
+ *  3. **`fetchVia` 有没有已经替他试过直连** —— 试过的话把结果缀在后面，
+ *     省掉「那我关了代理再试试」这一轮。
  *
  * @param {unknown} e 抓到的异常
  * @param {string} scope 哪一类的请求（决定提示里说不说代理）
@@ -436,6 +579,26 @@ export function whyNetwork(e, scope, timeoutMs) {
 
   const codes = netCodes(e);
   const code = codes[0] ?? "";
+
+  /*
+   * 没走代理又失败时那半句话。
+   *
+   * 被墙的类照旧指向代理；不被墙的类指向真正该查的东西 —— 这几个目标在国内
+   * 直连都通过（实测），所以连不上基本是本机出网、接口地址、或者对方站点的事。
+   */
+  const directHint = behindWall(scope)
+    ? "这一类没走代理，被墙的话去控制台的「代理」那节勾上并填地址"
+    : "这一类本来就该直连（国内实测通），先看这台机器能不能出网、接口地址填对没有";
+
+  /*
+   * `fetchVia` 已经脱开代理直连重试过一发，把那一发的结果缀上。
+   *
+   * 少了这一句，用户看到「代理不通」的第一反应是去关掉代理再试一次 ——
+   * 而那件事我们刚刚替他做过了，结果就在手里。
+   */
+  const alsoTriedDirect = e?.directRetryCode
+    ? `（脱开代理直连也不行：${e.directRetryCode}）`
+    : "";
 
   /*
    * 错误码**每一句都要带上**。
@@ -453,13 +616,13 @@ export function whyNetwork(e, scope, timeoutMs) {
   if (name === "TimeoutError" || code === "UND_ERR_HEADERS_TIMEOUT" || /timeout/i.test(msg)) {
     const secs = timeoutMs ? `（${Math.round(timeoutMs / 1000)} 秒）` : "";
     return viaProxy
-      ? `请求超时${secs} —— ${via} 可能不通`
-      : `请求超时${secs} —— 这一类没走代理，被墙的话去控制台的「代理」那节勾上`;
+      ? `请求超时${secs} —— ${via} 可能不通${alsoTriedDirect}`
+      : `请求超时${secs} —— ${directHint}`;
   }
   if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
     return viaProxy
-      ? `域名解析不了${tag} —— 检查 ${via}`
-      : `域名解析不了${tag} —— 地址是不是打错了？也可能是这台机器的 DNS 不通，或者要走代理`;
+      ? `域名解析不了${tag} —— 检查 ${via}${alsoTriedDirect}`
+      : `域名解析不了${tag} —— 地址是不是打错了？也可能是这台机器的 DNS 不通`;
   }
   if (code === "ECONNREFUSED") {
     /*
@@ -469,32 +632,31 @@ export function whyNetwork(e, scope, timeoutMs) {
      * 让它去勾代理是误导，被墙的表现是超时或者被重置，不是被拒绝。
      */
     return viaProxy
-      ? `${via} 拒绝连接${tag}（代理没开？端口错？）`
+      ? `${via} 拒绝连接${tag}（代理没开？端口错？）${alsoTriedDirect}`
       : `对方拒绝连接${tag} —— 那个端口上没有服务，接口地址和端口填对了吗？`;
   }
   if (code === "ECONNRESET") {
     return viaProxy
-      ? `连接被重置${tag} —— ${via} 不稳定？`
-      : `连接被重置${tag} —— 这一类没走代理，可能被墙了`;
+      ? `连接被重置${tag} —— ${via} 不稳定？${alsoTriedDirect}`
+      : `连接被重置${tag} —— ${behindWall(scope) ? "这一类没走代理，可能被墙了" : "对方中途断了连接，多半是那家站点自己的事"}`;
   }
   if (code === "CERT_HAS_EXPIRED" || code.startsWith("ERR_TLS") || /certificate/i.test(msg)) {
     return viaProxy
-      ? `证书校验失败${tag} —— ${via} 在中间做了 TLS 拦截？`
+      ? `证书校验失败${tag} —— ${via} 在中间做了 TLS 拦截？${alsoTriedDirect}`
       : `证书校验失败${tag} —— 中间有东西在拦（企业网关、杀毒软件的 HTTPS 扫描）`;
   }
   if (/^UND_ERR_|^ECONN|^EPIPE$|^ETIMEDOUT$/.test(code)) {
-    const hint = viaProxy
-      ? `${via} 那边连不上`
-      : "这一类没走代理，目标在国内连不上的话去控制台的「代理」那节勾上并填地址";
-    return `连不上目标${tag} —— ${hint}`;
+    return viaProxy
+      ? `连不上目标${tag} —— ${via} 那边连不上${alsoTriedDirect}`
+      : `连不上目标${tag} —— ${directHint}`;
   }
 
   // 兜底也得带点信息：`fetch failed` 这一句等于什么都没说，而这几种错误
   // 恰恰是最常见的几种，多带一两个词能省掉一轮排查
   if (/fetch failed|socket|other side closed/i.test(msg)) {
     return viaProxy
-      ? `连接失败${tag} —— 检查 ${via} 是不是还开着`
-      : `连接失败${tag} —— 目标在国内连不上，去控制台「代理」那节勾上并填地址`;
+      ? `连接失败${tag} —— 检查 ${via} 是不是还开着${alsoTriedDirect}`
+      : `连接失败${tag} —— ${directHint}`;
   }
   return codes.length ? `${msg}（${codes.join("、")}）` : msg;
 }

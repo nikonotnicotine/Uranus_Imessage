@@ -65,7 +65,7 @@ import {
 } from "./igstore.js";
 import { roleFor } from "./instagram.js";
 import { logInfo, logWarn } from "./logs.js";
-import { proxyFor, proxyStatus, usesProxy } from "./proxy.js";
+import { fetchVia, proxyStatus, usesProxy } from "./proxy.js";
 
 const SCOPE = "Instagram";
 
@@ -470,10 +470,10 @@ export async function replyOut(config, roleName, commentRemoteId, text) {
 async function downloadMedia(url) {
   if (!url) return "";
   try {
-    const res = await fetch(url, {
+    // CDN 本身国内大多直连通，所以代理挂了那一刀（fetchVia）在这儿胜率不低
+    const res = await fetchVia("ig", url, () => ({
       signal: AbortSignal.timeout(IG_TIMEOUT),
-      ...(await proxyFor("ig")),
-    });
+    }));
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error("下回来是空的");
@@ -866,7 +866,7 @@ export function realOverview(config) {
  * 代理配没配，Instagram 那一页上提示一句。**不显示地址** —— 里面可能带账号密码。
  *
  * 判据是 `usesProxy("ig")`，也就是「地址填了**并且**Instagram 这一类勾上了」——
- * 光看有没有地址不够：现在一个地址下面挂着九个勾，只勾了天气的人在这一页
+ * 光看有没有地址不够：现在一个地址下面挂着十个勾，只勾了联网搜索的人在这一页
  * 会看到「代理已配好」，然后照旧连不上 Meta，界面上还告诉他配好了。
  *
  * `from` 是这个地址读自哪儿（控制台 / 某个环境变量），照旧只给来源不给值。

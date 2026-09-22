@@ -9,7 +9,7 @@
  */
 
 import { logDebug, logWarn } from "./logs.js";
-import { proxyFor, whyNetwork } from "./proxy.js";
+import { fetchVia, whyNetwork } from "./proxy.js";
 
 const PHOTON_BASE = "https://spectrum.photon.codes";
 
@@ -46,11 +46,13 @@ export async function findSharedUser({ projectId, projectSecret, phoneNumber }) 
   const auth = Buffer.from(`${projectId}:${projectSecret}`).toString("base64");
   try {
     logDebug("Photon", `查已登记的用户（项目 ${shortId(projectId)}…）`);
-    const res = await fetch(`${PHOTON_BASE}/projects/${projectId}/users/`, {
-      headers: { Authorization: `Basic ${auth}` },
-      // Photon 实测直连就通，所以这一类出厂不勾代理（勾了也认，见 proxy.js）
-      ...(await proxyFor("photon")),
-    });
+    // Photon 实测直连就通，所以这一类出厂不勾代理（勾了也认，见 proxy.js）
+    const res = await fetchVia(
+      "photon",
+      `${PHOTON_BASE}/projects/${projectId}/users/`,
+      () => ({ headers: { Authorization: `Basic ${auth}` } }),
+      (why) => logDebug("Photon", `查已登记的用户${why}`)
+    );
     /*
      * 下面这几个 return null 以前是**完全静默**的，于是「凭据错了」「网络
      * 不通」和「这个号确实没登记过」三件完全不同的事在调用方看来一模一样，
@@ -103,15 +105,19 @@ export async function enrollSharedUser({ projectId, projectSecret, phoneNumber }
   let res;
   try {
     logDebug("Photon", `登记共享用户 ${phoneNumber}（项目 ${shortId(projectId)}…）`);
-    res = await fetch(`${PHOTON_BASE}/projects/${projectId}/users/`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${auth}`,
-      },
-      body: JSON.stringify({ type: "shared", phoneNumber }),
-      ...(await proxyFor("photon")),
-    });
+    res = await fetchVia(
+      "photon",
+      `${PHOTON_BASE}/projects/${projectId}/users/`,
+      () => ({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${auth}`,
+        },
+        body: JSON.stringify({ type: "shared", phoneNumber }),
+      }),
+      (why) => logDebug("Photon", `登记共享用户${why}`)
+    );
     logDebug("Photon", `登记共享用户：HTTP ${res.status}`);
   } catch (e) {
     /*

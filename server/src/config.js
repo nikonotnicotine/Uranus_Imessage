@@ -475,12 +475,16 @@ export const DEFAULT_CONFIG = {
    * 环境变量，见 proxy.js）。`scopes` 里没写到的类别按 proxy.js 的出厂值算 ——
    * 那边的 `PROXY_SCOPES` 是唯一的类别清单，这里刻意不重复一份（重复了迟早跑偏）。
    *
-   * 出厂只勾 IG 和天气：那两类是实测直连不通的，其余（尤其是用户自己填的
-   * 中转站地址）默认直连，理由见 proxy.js 文件头。
+   * 出厂只勾 IG 和联网搜索：那两类是实测直连不通的（都吃满 8 秒超时），其余
+   * （天气三家源、用户自己填的中转站、Photon、音乐实测直连全通）默认直连，
+   * 理由见 proxy.js 文件头。
+   *
+   * 这两个值必须和 proxy.js:PROXY_SCOPES 的 `default` 对得上 —— 这里是新装时
+   * 写进 config.json 的那一份，会盖住那边的出厂值。test-proxy.mjs 第 3 节钉着。
    */
   proxy: {
     url: "",
-    scopes: { ig: true, weather: true },
+    scopes: { ig: true, search: true },
   },
   // Photon 项目：凭据只写 data.config.json
   projects: [
@@ -2950,7 +2954,7 @@ function writeToDisk(normalized) {
      * 代理**只抹地址**，勾选表留在这儿。
      *
      * 和上面那几块不一样：`scopes` 一点不敏感，而它丢了的后果很难查 ——
-     * 用户勾了「天气走代理」，重启之后勾选没了、天气又开始超时，
+     * 用户勾了「链接预览走代理」，重启之后勾选没了、发链接又开始超时，
      * 而界面上看不出哪里变了。地址才是凭据（常带 user:pass@），只抹它。
      */
     proxy: { url: "", scopes: normalized.proxy.scopes },

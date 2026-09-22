@@ -6,21 +6,28 @@
  * 压根联想不到是几天前在控制台勾错了一个框。所以这里盯的是那些「不报错但已经
  * 错了」的情形。
  *
- * 分七块：
+ * 分九块：
  *
  *  1. **地址校验**。`socks5://` 必须拦住 —— 机场最爱给这个，而 undici 的
  *     ProxyAgent 压根不支持它。放过去的话所有出网会静默退回直连。
  *  2. **脱敏**。代理串常是 `http://user:pass@host:port`，那就是一组凭据。
  *     日志、界面、接口响应里都不许出现原文。
- *  3. **类别清单**。十类，默认只勾 IG 和天气。这个默认值是用户实测定的
- *     （Photon 直连通、IG 和天气不通），改动它要有新的实测依据。
+ *  3. **类别清单**。十类，默认只勾 IG 和联网搜索。这个默认值是用户实测定的
+ *     （天气 / 中转站 / Photon / 音乐直连都通，IG 和搜索吃满超时），
+ *     改动它要有新的实测依据。这一节还守着每一类的 `wall` ——
+ *     它决定报错时该不该提代理。
  *  4. **落盘位置**。地址进 data.config.json（跟密钥一起），勾选留在
  *     config.json。而且**抹空时只抹地址、留勾选** —— 勾选丢了很难查。
  *  5. **优先级**。界面填的 > URANUS_PROXY > HTTPS_PROXY 那几个 > 直连。
- *  6. **proxyFor 的形状**。没配 / 没勾时必须返回 `{}`，因为所有调用点都是
+ *  6. **proxyFor 的形状**。没配 / 没勾时必须返回 `{}`，因为它的调用点是
  *     无条件 `...(await proxyFor(...))` 展开的。返回 null 会让 fetch 炸。
- *  7. **挂载覆盖面**。每一处出网的 fetch 要么挂了 proxyFor、要么在注释里
- *     写明为什么不挂。漏一处的后果就是「勾了却不生效」。
+ *  7. **挂载覆盖面**。每一处出网的 fetch 要么走了 `fetchVia`、要么在注释里
+ *     写明为什么不走。漏一处的后果就是「勾了却不生效」。
+ *  8. **路由与界面**。
+ *  9. **出错时说得出原因**。两件事：错误码要从 `AggregateError` 里挖得出来；
+ *     报错文案要**按类别分档** —— 直连实测通的那几类（模型 API、音乐、Photon）
+ *     失败时不许提代理。这一节还真跑一遍 `fetchVia`：把代理指到一个死端口，
+ *     请求必须靠直连那一刀成功。
  *
  * 全程用临时 URANUS_DATA_DIR，不碰真的 data/，也不联网。
  */
@@ -136,18 +143,49 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
   );
 
   const d = P.defaultScopes();
-  check("默认只勾 IG 和天气", Object.entries(d).filter(([, v]) => v).map(([k]) => k), ["ig", "weather"]);
+  /*
+   * 出厂勾的是 **IG 和联网搜索**，不是 IG 和天气。
+   *
+   * 2026-09 在用户机器上把每一类逐个实测过一遍（环境变量里的代理全清掉、
+   * 真打一次）：三家天气源直连全通（open-meteo 1.1s、和风 250ms、
+   * WeatherAPI 725ms），而 DuckDuckGo 和 api.search.brave.com 都是直接吃满
+   * 8 秒超时。所以天气那个勾是纯白绕一道，搜索那个才是真需要。
+   */
+  check("默认只勾 IG 和联网搜索", Object.entries(d).filter(([, v]) => v).map(([k]) => k), ["ig", "search"]);
   checkThat("十类都有默认值（不能有 undefined）", P.SCOPE_KEYS.every((k) => typeof d[k] === "boolean"));
 
   // 用户实测定的：Photon 直连就通，勾上反而可能连不上
   check("Photon 默认不勾", d.photon, false);
   // 中转站在国内直连本来就通，绕代理更慢、还可能被风控
   check("模型 API 默认不勾", d.llm, false);
+  // 三家天气源国内直连全通（实测），出厂勾上等于白绕一道
+  check("天气默认不勾", d.weather, false);
+  // DuckDuckGo / Brave 实测直连吃满超时，这一类是真要代理
+  check("联网搜索默认勾上", d.search, true);
 
   for (const s of P.PROXY_SCOPES) {
     checkThat(`${s.key} 有中文名`, Boolean(s.label));
     checkThat(`${s.key} 说了打哪些域名`, Boolean(s.domains));
     checkThat(`${s.key} 有一句为什么`, Boolean(s.hint));
+    // wall 决定「这一类没走代理又失败」时该不该提代理，见第 9 节
+    checkThat(`${s.key} 说明了是不是真被墙（wall）`, typeof s.wall === "boolean");
+  }
+
+  /*
+   * 国内直连实测通的那几类，`wall` 必须是 false。
+   *
+   * 这一条就是用户那句抱怨的回归测试：「为什么我这边显示 API 也要开代理啊，
+   * 我 API 在 cherry 不开梯子都能直接用」。whyNetwork 靠 wall 决定要不要
+   * 提代理，标错了就会理直气壮地把人往错方向带。
+   */
+  for (const key of ["llm", "music", "photon"]) {
+    const s = P.PROXY_SCOPES.find((x) => x.key === key);
+    check(`${key} 不算被墙（直连实测通）`, s?.wall, false);
+  }
+  // 反过来：这几类实测直连不通，报错时该提一句去勾代理
+  for (const key of ["ig", "search"]) {
+    const s = P.PROXY_SCOPES.find((x) => x.key === key);
+    check(`${key} 算被墙`, s?.wall, true);
   }
 
   const status = P.proxyStatus();
@@ -314,7 +352,10 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
    * 每一处出网的 fetch 都得有交代。这一节是为了防「加了新功能忘了挂代理」——
    * 那种漏法用户报上来只会是「勾了却没用」，从日志里看不出来。
    *
-   * 每条给出：文件、这个文件里期望的 proxyFor 次数、以及不挂的那几处为什么。
+   * 每条给出：文件、这个文件里期望的 `fetchVia` 次数、以及不挂的那几处为什么。
+   *
+   * 数的是 `fetchVia` 而不是 `proxyFor`：业务代码一律走前者（它在代理自己
+   * 坏掉时会脱开代理补一刀直连），裸用 `proxyFor` 少的正是那一刀。
    */
   const expect = [
     ["server/src/ignet.js", 1], // igFetch，Meta 的 Graph API 全走它
@@ -338,10 +379,18 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
 
   for (const [file, n] of expect) {
     const text = src(file);
-    const hits = (text.match(/proxyFor\(/g) ?? []).length;
-    // 减去文件头注释里提到的那些（只数真正的调用：`...(await proxyFor(`）
-    const calls = (text.match(/\.\.\.\(await proxyFor\(/g) ?? []).length;
-    checkThat(`${file} 挂了 ${n} 处`, calls === n, `实际 ${calls} 处（提到 proxyFor 共 ${hits} 次）`);
+    const calls = (text.match(/await fetchVia\(/g) ?? []).length;
+    checkThat(`${file} 挂了 ${n} 处`, calls === n, `实际 ${calls} 处`);
+    /*
+     * 顺手守一条：业务文件里不许再出现裸的 `...(await proxyFor(`。
+     *
+     * 那个写法本身不报错、还照样走代理，所以一旦有人照着老代码复制一处，
+     * 唯一的症状是「代理没开时这个功能失败，别的功能都好」—— 没人查得出来。
+     */
+    checkThat(
+      `${file} 没有裸用 proxyFor（少了直连那一刀）`,
+      !/\.\.\.\(await proxyFor\(/.test(text),
+    );
   }
 
   // 刻意不挂的两处，各自要在注释里写明为什么 —— 不然下一个人会以为是漏了
@@ -377,11 +426,11 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
     const rel = path.relative(ROOT, full).replace(/\\/g, "/");
     if (KNOWN.has(rel)) continue;
     const text = fs.readFileSync(full, "utf-8");
-    const fetches = (text.match(/await fetch\(/g) ?? []).length;
-    if (!fetches) continue;
-    const calls = (text.match(/\.\.\.\(await proxyFor\(/g) ?? []).length;
+    const bare = (text.match(/await fetch\(/g) ?? []).length;
+    const calls = (text.match(/await fetchVia\(/g) ?? []).length;
+    if (!bare && !calls) continue;
     // media.js 有一处（SoVITS）故意不挂，所以是「至少挂了一处」而不是相等
-    if (calls === 0) missing.push(`${rel}（${fetches} 处 fetch，0 处代理）`);
+    if (calls === 0) missing.push(`${rel}（${bare} 处 fetch，0 处代理）`);
   }
   checkThat("没有哪个文件出网却完全没挂代理", missing.length === 0, missing.join("；"));
 }
@@ -500,14 +549,131 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
     checkThat("直连被拒绝时指向地址和端口", /端口/.test(said), said);
   }
 
-  // 超时和连不上那两档才该提代理 —— 那两种确实是被墙的典型表现
+  /*
+   * 超时和连不上那两档该提代理 —— **但只对真被墙的那几类**。
+   *
+   * 这两条原来传的是 `"llm"`，于是模型 API 连不上时那句话让人去开代理 ——
+   * 而中转站在国内直连本来就通。用户的原话：「为什么我这边显示 API 也要开
+   * 代理啊，我 API 在 cherry 不开梯子都能直接用，你逗我笑呢？」。
+   * 现在按 `PROXY_SCOPES` 的 `wall` 分档，所以这里也要分两组测。
+   */
   {
-    const timeout = Object.assign(new Error("Connect Timeout Error"), { name: "TimeoutError" });
-    checkThat("超时那句提了代理", /代理/.test(P.whyNetwork(timeout, "llm", 60000)));
-    const socket = Object.assign(new TypeError("fetch failed"), {
-      cause: Object.assign(new Error("x"), { code: "UND_ERR_SOCKET" }),
+    const timeout = () => Object.assign(new Error("Connect Timeout Error"), { name: "TimeoutError" });
+    const socket = () =>
+      Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("x"), { code: "UND_ERR_SOCKET" }),
+      });
+
+    // 被墙的类（这里用 ig，出厂就勾着；把它的勾去掉才测得到「没走代理」那半句）
+    C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: { ig: false } } });
+    checkThat("被墙的类超时那句提了代理", /代理/.test(P.whyNetwork(timeout(), "ig", 60000)));
+    checkThat("被墙的类连不上那句提了代理", /代理/.test(P.whyNetwork(socket(), "ig", 60000)));
+
+    /*
+     * 直连实测通的类**不许提代理**。这两条就是那句抱怨的回归测试：
+     * 提了代理，用户会去装 / 开一个压根不需要的梯子，而真正的原因
+     * （机器出不了网、接口地址填错）被这句话盖住了。
+     */
+    for (const [what, make] of [["超时", timeout], ["连不上", socket]]) {
+      const said = P.whyNetwork(make(), "llm", 60000);
+      checkThat(`直连就通的类${what}那句不提代理`, !/代理/.test(said), said);
+      checkThat(`直连就通的类${what}那句指向出网和地址`, /出网|地址/.test(said), said);
+    }
+    C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: {} } });
+  }
+
+  /* ---- fetchVia：代理挂了就直连补一刀 ---- */
+  {
+    checkThat("proxy.js 导出了 fetchVia", typeof P.fetchVia === "function");
+
+    const pjs = src("server/src/proxy.js");
+    /*
+     * init 必须是**函数**。传对象的话第二发会复用第一发那个
+     * `AbortSignal.timeout()` —— 那个 signal 已经在计时、甚至已经 abort 了，
+     * 于是「直连补一刀」表面上做了、实际上一定立刻失败。
+     */
+    checkThat(
+      "fetchVia 的 init 是每次重造的（不然 AbortSignal 已经烧掉了）",
+      /init\(\)/.test(pjs) && /必须是函数/.test(pjs),
+    );
+    // 回退那一发不许再带 dispatcher —— 代理就是刚坏掉的那个东西
+    checkThat("回退那一发不带 dispatcher", /刻意不带 dispatcher/.test(pjs));
+    // 超时刻意不在回退判据里：已经白等一整轮了，再等一轮只会更慢
+    checkThat("超时不触发回退（写明了为什么）", /超时刻意不在其中/.test(pjs));
+    // 只做单向：反过来「直连失败就偷偷试代理」会悄悄换掉出口 IP
+    checkThat("只做单向回退（写明了为什么不做反向）", /刻意不做/.test(pjs));
+
+    // 抛的是**走代理**那次的错，直连那次的结果只缀一条线索
+    const e = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("x"), { code: "ECONNRESET" }),
+      directRetryCode: "ENOTFOUND",
     });
-    checkThat("连不上那句提了代理", /代理/.test(P.whyNetwork(socket, "llm", 60000)));
+    C.saveConfig({ ...C.loadConfig(), proxy: { url: "http://127.0.0.1:7890", scopes: { ig: true } } });
+    const said = P.whyNetwork(e, "ig", 60000);
+    checkThat("试过直连的话报错里会说一句", /脱开代理直连也不行/.test(said), said);
+    checkThat("那句里带着直连那次的码", /ENOTFOUND/.test(said), said);
+    C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: {} } });
+  }
+
+  /* ---- 真跑一遍：代理是死的，请求照样该成 ---- */
+  {
+    /*
+     * 上面那几条都是读源码和读文案，这一条**真发请求**。
+     *
+     * 起一个本机 http 服务当「目标站点」，把代理指到 127.0.0.1:1（那个端口上
+     * 永远没有服务，必然 ECONNREFUSED）—— 也就是用户那台机器上 Clash 没启动
+     * 时的样子。整件事的承诺是「代理挂了就直连」，所以这个请求必须**成功**。
+     *
+     * 不联网：两头都在本机。
+     */
+    const http = await import("node:http");
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("直连过来的");
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const port = server.address().port;
+
+    try {
+      // 代理是死的
+      C.saveConfig({
+        ...C.loadConfig(),
+        proxy: { url: "http://127.0.0.1:1", scopes: { ig: true } },
+      });
+      let told = "";
+      const res = await P.fetchVia(
+        "ig",
+        `http://127.0.0.1:${port}/`,
+        () => ({ signal: AbortSignal.timeout(5000) }),
+        (why) => {
+          told = why;
+        },
+      );
+      check("代理挂了也能拿到响应", res.status, 200);
+      check("拿回来的是目标站点的正文", await res.text(), "直连过来的");
+      checkThat("回退时说了一声（进日志）", /直连/.test(told), told);
+      checkThat("那句话里带着代理挂掉的码", /ECONNREFUSED/.test(told), told);
+
+      /*
+       * 反过来：没勾这一类时**一次普通请求**，不许有任何额外动作 ——
+       * 连 onRetry 都不该被叫到（叫了就说明它先走了一趟代理）。
+       */
+      let quiet = true;
+      const plain = await P.fetchVia(
+        "photon",
+        `http://127.0.0.1:${port}/`,
+        () => ({ signal: AbortSignal.timeout(5000) }),
+        () => {
+          quiet = false;
+        },
+      );
+      check("没勾的类别照常直连", plain.status, 200);
+      checkThat("没勾的类别压根不碰代理", quiet);
+      await plain.body?.cancel().catch(() => {});
+    } finally {
+      await new Promise((r) => server.close(r));
+      C.saveConfig({ ...C.loadConfig(), proxy: { url: "", scopes: {} } });
+    }
   }
 
   /*

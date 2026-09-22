@@ -218,10 +218,15 @@ export function ProxyPanel() {
         <div className="grid grid-cols-1 gap-4 border-t border-line pt-6">
           <p className="text-eyebrow uppercase text-ink-faint">哪些走代理</p>
           <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">
-            出厂只勾了 Instagram 和天气 —— 那两类国内直连不通。其余默认不勾：
+            出厂只勾了 Instagram 和联网搜索 —— 那两类国内直连实测吃满超时。其余默认不勾：
             <span className="text-ink-soft">模型 API 尤其别乱勾</span>
             ，国内的中转站直连本来就通，绕一趟代理只会更慢，还可能因为出口 IP
             对不上被服务商风控。
+          </p>
+          <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">
+            勾了也不怕代理没开：勾上的类别在代理连不上时会
+            <span className="text-ink-soft">自动脱开代理直连再试一次</span>
+            ，国内本来就通的目标照样能成。反过来不会 —— 没勾的类别绝不会偷偷走代理。
           </p>
 
           <div className="grid grid-cols-1 gap-0">

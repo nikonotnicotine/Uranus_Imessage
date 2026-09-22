@@ -20,7 +20,7 @@
  */
 
 import { logDebug } from "../logs.js";
-import { netCode, proxyFor } from "../proxy.js";
+import { fetchVia, netCode } from "../proxy.js";
 
 /**
  * 最里面那个真正的错误码。
@@ -139,11 +139,30 @@ export function makeNet({ who, hint = "", scope = "云备份" }) {
       const again = tried > 1 ? `（第 ${tried} 次 / 共 ${TRIES} 次）` : "";
       logDebug(scope, `→ ${who} ${what}：${opts?.method ?? "GET"} ${where}${again}`);
 
+      /*
+       * 代理那一份设置**每次重试都重新取**（fetchVia 里做的）：中间用户可能刚
+       * 在控制台改了代理，没必要让这一轮继续用旧的（agent 本身是缓存的，重复
+       * 取不额外建连接）。代理自己坏掉时它还会脱开代理直连补一刀。
+       *
+       * init 交给它时必须是个**函数**：上传那次的 body 是读流，回退那一刀不能
+       * 把已经读完的流再交出去一遍。上面为了记日志已经取过一份，第一次就用那
+       * 份、别白开一个流。
+       */
+      let pending = opts;
+      const takeInit = () => {
+        const use = pending ?? (typeof init === "function" ? init() : init);
+        pending = null;
+        return use;
+      };
+
       const t0 = Date.now();
       try {
-        // 每次重试都重新取一遍：中间用户可能刚在控制台改了代理，没必要让这一
-        // 轮继续用旧的（agent 本身是缓存的，重复取不额外建连接）
-        const res = await fetch(url, { ...opts, ...(await proxyFor("cloud")) });
+        const res = await fetchVia(
+          "cloud",
+          url,
+          takeInit,
+          (why) => logDebug(scope, `${who} ${what}${why}`)
+        );
         const size = res.headers.get("content-length");
         logDebug(
           scope,

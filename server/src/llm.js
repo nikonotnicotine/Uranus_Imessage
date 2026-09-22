@@ -17,7 +17,7 @@
 
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import { DEFAULT_AUDIO_PROMPT, DEFAULT_VIDEO_PROMPT, DEFAULT_VISION_PROMPT } from "./config.js";
-import { netCodes, proxyFor, whyNetwork } from "./proxy.js";
+import { fetchVia, netCodes, whyNetwork } from "./proxy.js";
 
 const REQUEST_TIMEOUT = 60000;
 const TEST_TIMEOUT = 30000;
@@ -541,7 +541,7 @@ function logUpstreamFailure(label, status, text, body) {
  * ECONNREFUSED，走代理时该去看代理开没开，直连时该去看地址填对没有 ——
  * 两种要改的地方完全不同，而这里压根不知道这一类有没有挂代理。
  *
- * 传的 scope 是 `"llm"`，和这条路 `proxyFor("llm")` 用的是同一个 key ——
+ * 传的 scope 是 `"llm"`，和这条路 `fetchVia("llm", …)` 用的是同一个 key ——
  * 「挂代理看哪个开关，报错就照哪个开关说话」，两边不会各说一套。
  *
  * 每种情况都带上原始错误码：这句话会原样发到用户的 iMessage 里
@@ -571,19 +571,28 @@ async function requestJson(
   url,
   { method = "POST", key, body, timeout = REQUEST_TIMEOUT, headers, signal }
 ) {
-  const timer = AbortSignal.timeout(timeout);
-  const res = await fetch(url, {
-    method,
-    headers: headers ?? {
-      ...(body ? { "Content-Type": "application/json" } : {}),
-      ...(key ? { Authorization: `Bearer ${key}` } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: signal ? AbortSignal.any([timer, signal]) : timer,
-    // 模型 API 那一类**默认不走代理**：中转站在国内直连本来就通，套上代理多半
-    // 更慢，还可能因为落地 IP 变了被风控。要走的话在控制台的「代理」那节勾上
-    ...(await proxyFor("llm")),
-  });
+  /*
+   * 模型 API 那一类**默认不走代理**：中转站在国内直连本来就通，套上代理多半
+   * 更慢，还可能因为落地 IP 变了被风控。要走的话在控制台的「代理」那节勾上。
+   *
+   * 走 `fetchVia` 而不是自己挂 dispatcher：勾了代理的人，代理没开时会自动脱开
+   * 代理直连补一刀 —— 对这一类尤其划算，因为目标本来就直连通。
+   *
+   * `init` 每次重造：`signal` 里有 `AbortSignal.timeout`，第一发用掉就在计时了。
+   */
+  const init = () => {
+    const timer = AbortSignal.timeout(timeout);
+    return {
+      method,
+      headers: headers ?? {
+        ...(body ? { "Content-Type": "application/json" } : {}),
+        ...(key ? { Authorization: `Bearer ${key}` } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: signal ? AbortSignal.any([timer, signal]) : timer,
+    };
+  };
+  const res = await fetchVia("llm", url, init, (why) => logDebug("LLM", why));
 
   const text = await res.text();
   let data = null;
@@ -624,20 +633,22 @@ async function requestJson(
  * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
  */
 async function requestStream(url, { key, body, timeout = REQUEST_TIMEOUT, signal, onDelta }) {
-  const timer = AbortSignal.timeout(timeout);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(key ? { Authorization: `Bearer ${key}` } : {}),
-      // 有些反代靠这个头决定回不回 SSE
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify(body),
-    signal: signal ? AbortSignal.any([timer, signal]) : timer,
-    // 和 requestJson 同一条规矩：模型 API 默认不走代理
-    ...(await proxyFor("llm")),
-  });
+  // 和 requestJson 同一条规矩：模型 API 默认不走代理，勾了的话代理挂了自动直连
+  const init = () => {
+    const timer = AbortSignal.timeout(timeout);
+    return {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(key ? { Authorization: `Bearer ${key}` } : {}),
+        // 有些反代靠这个头决定回不回 SSE
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify(body),
+      signal: signal ? AbortSignal.any([timer, signal]) : timer,
+    };
+  };
+  const res = await fetchVia("llm", url, init, (why) => logDebug("LLM", why));
 
   // 错误响应不是 SSE，原样读成文本交给调用方那套错误处理
   if (!res.ok) {

@@ -43,7 +43,7 @@ import Holidays from "date-holidays";
 
 import { WEATHER_CACHE_PATH, readJson, writeJson } from "./datadir.js";
 import { logDebug, logWarn } from "./logs.js";
-import { netCode, proxyFor, usesProxy, whyNetwork } from "./proxy.js";
+import { fetchVia, whyNetwork } from "./proxy.js";
 
 /**
  * chinese-days 的 ESM 默认导出套了两层：顶层既有各个函数、又有一个
@@ -521,7 +521,14 @@ function dayTag(country, date, year, at, dow) {
  * 「请求超时」和「代理拒绝连接」要改的地方完全不同。
  */
 async function fetchJson(url, timeout, headers) {
-  // 每次都要新的 AbortSignal，所以是个函数而不是一个对象
+  /*
+   * 代理自己坏掉时脱开代理直连再试一次 —— 那一整套现在在 `fetchVia` 里，
+   * 所有类别共用（原来只有天气这一处有，是这个项目里第一个撞上它的场景：
+   * 用户报的 `连接被重置 —— 代理 http://127.0.0.1:7892 不稳定？`）。
+   *
+   * `init` 必须是函数：里面的 `AbortSignal.timeout()` 第一发用掉之后已经在
+   * 计时，重试那发要拿个新的。
+   */
   const init = () => ({
     signal: AbortSignal.timeout(timeout),
     ...(headers ? { headers } : {}),
@@ -529,46 +536,13 @@ async function fetchJson(url, timeout, headers) {
 
   let res;
   try {
-    res = await fetch(url, { ...init(), ...(await proxyFor("weather")) });
+    res = await fetchVia("weather", url, init, (why) => logDebug("环境", `查天气${why}`));
   } catch (e) {
-    /*
-     * 代理自己坏了的时候，脱开代理直连再试一次。
-     *
-     * 用户报的那条 `连接被重置 —— 代理 http://127.0.0.1:7892 不稳定？` 就是这种：
-     * 代理进程还开着、端口也通，但隧道中途被掐。这时候直连**有戏** ——
-     * 和风天气本来就该直连，Open-Meteo 在国内也时好时坏。多赔一次请求换一份
-     * 真数据，比直接退回一小时前那份划算。
-     *
-     * 只认这几种「代理层面」的错。超时**不**在其中：已经白等了 5 秒，再等一轮
-     * 只会让这条消息更慢，而 weatherAt 那边本来就有旧数据兜着。
-     */
-    const code = netCode(e);
-    if (!usesProxy("weather") || !PROXY_FAULT_CODES.has(code)) {
-      throw new Error(whyNetwork(e, "weather", timeout));
-    }
-    logDebug("环境", `走代理查天气失败（${code}），脱开代理直连再试一次`);
-    try {
-      // 这一发**刻意不走代理**：代理就是刚才坏掉的那个东西
-      res = await fetch(url, init());
-    } catch (e2) {
-      // 直连也不行。报的还是**走代理**那次的原因 —— 那才是用户真正要去改的东西
-      throw new Error(`${whyNetwork(e, "weather", timeout)}（直连也不行：${netCode(e2) || e2?.message}）`);
-    }
+    throw new Error(whyNetwork(e, "weather", timeout));
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
-
-/** 「代理自己坏了」的典型错误码。见 fetchJson —— 这几种脱开代理还有戏。 */
-const PROXY_FAULT_CODES = new Set([
-  "ECONNRESET", // 隧道被中途掐断。用户报的就是这个
-  "ECONNREFUSED", // 代理端口没开
-  "ENOTFOUND", // 代理的域名解析不了
-  "EAI_AGAIN",
-  "EPIPE",
-  "CERT_HAS_EXPIRED", // 代理在中间做 TLS 拦截，拿自签证书顶包
-  "UND_ERR_SOCKET",
-]);
 
 /**
  * 内置坐标表：常见城市不打网络也能解析。

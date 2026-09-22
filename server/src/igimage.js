@@ -39,9 +39,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
-import { logInfo, logWarn } from "./logs.js";
+import { logDebug, logInfo, logWarn } from "./logs.js";
 import { IG_TIMEOUT, maskToken } from "./ignet.js";
-import { proxyFor, whyNetwork } from "./proxy.js";
+import { fetchVia, whyNetwork } from "./proxy.js";
 
 const SCOPE = "Instagram";
 
@@ -297,12 +297,12 @@ export async function uploadToHost(buffer, imageHost) {
   let netErr = null;
   for (let attempt = 1; attempt <= UPLOAD_TRIES; attempt += 1) {
     try {
-      res = await fetch(url, {
-        method: "POST",
-        body: form,
-        signal: AbortSignal.timeout(IG_TIMEOUT),
-        ...(await proxyFor("ig")),
-      });
+      res = await fetchVia(
+        "ig",
+        url,
+        () => ({ method: "POST", body: form, signal: AbortSignal.timeout(IG_TIMEOUT) }),
+        (why) => logDebug(SCOPE, `传图床${why}`)
+      );
       netErr = null;
       break;
     } catch (e) {
@@ -357,14 +357,11 @@ export async function deleteFromHost(publicId, imageHost) {
   form.append("signature", signature);
 
   try {
-    const res = await fetch(
+    const res = await fetchVia(
+      "ig",
       `https://api.cloudinary.com/v1_1/${encodeURIComponent(cloud)}/image/destroy`,
-      {
-        method: "POST",
-        body: form,
-        signal: AbortSignal.timeout(IG_TIMEOUT),
-        ...(await proxyFor("ig")),
-      }
+      () => ({ method: "POST", body: form, signal: AbortSignal.timeout(IG_TIMEOUT) }),
+      (why) => logDebug(SCOPE, `删图床上那张临时图${why}`)
     );
     const data = await res.json().catch(() => null);
     if (data?.result === "ok" || data?.result === "not found") return true;
