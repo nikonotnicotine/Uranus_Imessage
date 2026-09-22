@@ -41,7 +41,7 @@ import path from "node:path";
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logInfo, logWarn } from "./logs.js";
 import { IG_TIMEOUT, maskToken } from "./ignet.js";
-import { proxyFor } from "./proxy.js";
+import { proxyFor, whyNetwork } from "./proxy.js";
 
 const SCOPE = "Instagram";
 
@@ -313,7 +313,9 @@ export async function uploadToHost(buffer, imageHost) {
       }
     }
   }
-  if (netErr) throw new Error(`图床上传失败：${String(netErr?.message ?? netErr)}`);
+  // 这句会进日志、也会成为「这条帖子没发出去」的原因。原来是 e.message，
+  // 也就是一句 fetch failed；图床和 IG 同一个代理开关，所以 scope 用 "ig"
+  if (netErr) throw new Error(`图床上传失败：${whyNetwork(netErr, "ig", IG_TIMEOUT)}`);
 
   const raw = await res.text();
   let data = null;

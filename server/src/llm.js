@@ -17,7 +17,7 @@
 
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import { DEFAULT_AUDIO_PROMPT, DEFAULT_VIDEO_PROMPT, DEFAULT_VISION_PROMPT } from "./config.js";
-import { proxyFor } from "./proxy.js";
+import { netCodes, proxyFor, whyNetwork } from "./proxy.js";
 
 const REQUEST_TIMEOUT = 60000;
 const TEST_TIMEOUT = 30000;
@@ -77,20 +77,32 @@ const UPSTREAM_DETAIL_MAX = 1200;
  * 只重试「再打一次可能就好了」的：连不上、超时、被掐断、以及上游的
  * 429/500/502/503/504。密钥错、模型名错、请求体不合法这类重试一百次也一样，
  * 白等而已。
+ *
+ * **错误码用 netCodes 挖**（不是 `error.cause.code`）。这不是讲究：原来只挖
+ * 一层，于是 `AggregateError`（IPv6 / IPv4 都连不上时 Node 抛的那种，具体原因
+ * 在 `errors[]` 里）整个读不到码，一律被当成「不值得重试」—— 一次本该自动
+ * 重试就过去的连接抖动，变成了当场换副 API、甚至整轮失败。
  */
 function isTransient(status, error) {
   if (status) return status === 429 || (status >= 500 && status <= 504);
   if (error?.name === "TimeoutError" || error?.name === "AbortError") return true;
-  const code = error?.cause?.code ?? "";
-  return (
-    code === "UND_ERR_CONNECT_TIMEOUT" ||
-    code === "UND_ERR_SOCKET" ||
-    code === "ECONNRESET" ||
-    code === "ECONNREFUSED" ||
-    code === "ETIMEDOUT" ||
-    code === "EAI_AGAIN" || // DNS 临时故障（ENOTFOUND 是真打错了，不重试）
-    /Connect Timeout/i.test(error?.cause?.message ?? "")
-  );
+  // netCodes 排过序，但这里是「有没有一条值得重试」，所以全看一遍
+  const codes = netCodes(error);
+  if (
+    codes.some(
+      (c) =>
+        c === "UND_ERR_CONNECT_TIMEOUT" ||
+        c === "UND_ERR_SOCKET" ||
+        c === "ECONNRESET" ||
+        c === "ECONNREFUSED" ||
+        c === "ETIMEDOUT" ||
+        c === "EPIPE" ||
+        c === "EAI_AGAIN" // DNS 临时故障（ENOTFOUND 是真打错了，不重试）
+    )
+  ) {
+    return true;
+  }
+  return /Connect Timeout/i.test(error?.cause?.message ?? "");
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -514,37 +526,32 @@ function logUpstreamFailure(label, status, text, body) {
  * e.cause 里（连不上、DNS 解析不了、证书不对…）。控制台就是给用户排查
  * 问题用的，所以这里要把 cause 挖出来。
  *
- * 每种情况后面都带上原始错误码：这句话会原样发到用户的 iMessage 里
+ * ── 为什么改成转给 proxy.js:whyNetwork ──
+ *
+ * 这里原来自己挖 `e.cause.code`，**只挖一层**，而真正的原因经常比一层深：
+ *
+ *  - Node 20 起默认开 Happy Eyeballs，IPv6 和 IPv4 都连不上时抛的是
+ *    `AggregateError`，外层只有一个笼统的 code，**每条具体原因在
+ *    `e.errors[]` 里**。只看 `cause.code` 的话一条都读不到，于是掉到最后那个
+ *    兜底，把 undici 的 `fetch failed` 原样吐出去 —— 用户报上来的就是这句。
+ *  - 走代理时 TLS / HTTP 隧道里的错还会再包一层。
+ *
+ * `netCodes` 会把 `errors[]` 和 `cause` 一起往下走四层，而 `whyNetwork` 还多
+ * 做一件这里做不到的事：**区分「走着代理出的错」和「直连出的错」**。同一个
+ * ECONNREFUSED，走代理时该去看代理开没开，直连时该去看地址填对没有 ——
+ * 两种要改的地方完全不同，而这里压根不知道这一类有没有挂代理。
+ *
+ * 传的 scope 是 `"llm"`，和这条路 `proxyFor("llm")` 用的是同一个 key ——
+ * 「挂代理看哪个开关，报错就照哪个开关说话」，两边不会各说一套。
+ *
+ * 每种情况都带上原始错误码：这句话会原样发到用户的 iMessage 里
  * （见 imessage.js:notifyFailure），有个能搜的关键词比一句中文描述管用。
  */
-function describeNetworkError(e) {
-  if (e?.name === "TimeoutError" || e?.name === "AbortError") {
-    return `上游超时，没在限定时间内响应（代码 ${e.name}）`;
-  }
-
-  const cause = e?.cause;
-  if (cause) {
-    const code = cause.code ?? "";
-    const tail = code ? `（代码 ${code}）` : "";
-    // 常见几种给一句中文解释，其余原样带出来
-    if (code === "UND_ERR_CONNECT_TIMEOUT" || /Connect Timeout/i.test(cause.message ?? "")) {
-      return `连不上接口地址，TCP 连接超时，可能是网络不通、被墙或需要代理${
-        tail || "（代码 UND_ERR_CONNECT_TIMEOUT）"
-      }`;
-    }
-    if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
-      return `域名解析失败，接口地址是不是打错了？${tail}`;
-    }
-    if (code === "ECONNREFUSED") return `对方拒绝连接，端口不对或服务没起来${tail}`;
-    if (code === "ECONNRESET") return `连接被对方掐断了${tail}`;
-    if (code?.startsWith?.("ERR_TLS") || code === "CERT_HAS_EXPIRED") {
-      return `HTTPS 证书有问题${tail}`;
-    }
-    const detail = cause.message ?? String(cause);
-    return `${e.message}：${detail}${tail}`;
-  }
-
-  return String(e?.message ?? e);
+function describeNetworkError(e, timeout = REQUEST_TIMEOUT) {
+  // AbortError 是「用户按停」和「我们自己的超时」共用的名字，whyNetwork
+  // 认不出后者的语义（它只看错误码），所以这一种留在这儿自己说
+  if (e?.name === "AbortError") return `上游超时，没在限定时间内响应（代码 AbortError）`;
+  return whyNetwork(e, "llm", timeout);
 }
 
 /**
@@ -936,7 +943,7 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
        * 800ms 后重试」三轮，然后还要再去打一遍副 API。
        */
       if (opts.signal?.aborted) throw abortedError();
-      const why = describeNetworkError(e);
+      const why = describeNetworkError(e, opts.timeout ?? REQUEST_TIMEOUT);
       if (retryIn !== undefined && isTransient(null, e)) {
         logWarn(label, `第 ${attempt + 1} 次请求失败，${retryIn}ms 后重试`, why);
         attempt += 1;
@@ -1237,7 +1244,7 @@ export async function listModels(endpoint, label = "API") {
       timeout: TEST_TIMEOUT,
     });
   } catch (e) {
-    const error = `${label} 拉模型失败：${describeNetworkError(e)}`;
+    const error = `${label} 拉模型失败：${describeNetworkError(e, TEST_TIMEOUT)}`;
     logWarn(label, "获取模型列表失败", error);
     return { ok: false, error };
   }
@@ -1454,7 +1461,7 @@ async function inlineMedia(endpoint, prompt, media, kind) {
       // 视频更慢 —— 实测 19MB 在某家中转站要 69 秒，所以这个超时不能缩
       result = await requestJson(url, { body, headers, timeout: VISION_TIMEOUT });
     } catch (e) {
-      const why = describeNetworkError(e);
+      const why = describeNetworkError(e, VISION_TIMEOUT);
       if (retryIn !== undefined && isTransient(null, e)) {
         logWarn(label, `第 ${attempt + 1} 次请求失败，${retryIn}ms 后重试`, why);
         await wait(retryIn);
@@ -1620,7 +1627,7 @@ export async function embedText(endpoint, text, opts = {}) {
         timeout: opts.timeout ?? REQUEST_TIMEOUT,
       });
     } catch (e) {
-      const why = describeNetworkError(e);
+      const why = describeNetworkError(e, opts.timeout ?? REQUEST_TIMEOUT);
       if (retryIn !== undefined && isTransient(null, e)) {
         logWarn(label, `第 ${attempt + 1} 次请求失败，${retryIn}ms 后重试`, why);
         await wait(retryIn);

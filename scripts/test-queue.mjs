@@ -519,6 +519,141 @@ console.log("\n[7. 压图]");
   });
 }
 
+/* ================= 8. 打字指示器不许拖累正事 ================= */
+console.log("\n[8. 打字指示器不许拖累正事]");
+{
+  /*
+   * 用户报的那句 `fetch failed`，栈底是 `ChatsResource.setTyping` —— 也就是
+   * 「让对方看到省略号」这个**装饰**动作挂了，然后整轮消息没回。
+   *
+   * 根因在 SDK：`space.responding(fn)` 里开指示器那一下没有 catch
+   *
+   *     responding: async (fn) => {
+   *       await space.send(typing("start"));        // ← 这行挂了，fn 压根没跑
+   *       try { return await fn(); }
+   *       finally { await space.send(typing("stop")).catch(() => {}); }
+   *     }
+   *
+   * 灭指示器那一下人家保护了，开的那一下没有。共享线路抖一下，用户看到的就是
+   * 「角色这一轮整个不说话」，日志里只有一句没有信息量的 fetch failed。
+   *
+   * 所以我们自己那个 respondingWhile 必须守住一条：**指示器是装饰，fn 是正事**。
+   * 下面每条都在钉这句话的一个侧面。
+   */
+  const buildResponding = () => {
+    const logs = [];
+    const factory = new Function(
+      "logDebug",
+      `return ${extractFn("respondingWhile", "async function")};`
+    );
+    return { respondingWhile: factory((scope, msg) => logs.push({ scope, msg })), logs };
+  };
+
+  /** 一个假的 space，两个 typing 动作各自能单独设成「会挂」。 */
+  const fakeSpace = ({ startFails = false, stopFails = false } = {}) => {
+    const calls = [];
+    return {
+      calls,
+      async startTyping() {
+        calls.push("start");
+        if (startFails) throw new Error("fetch failed");
+      },
+      async stopTyping() {
+        calls.push("stop");
+        if (stopFails) throw new Error("fetch failed");
+      },
+    };
+  };
+
+  await okAsync("开指示器挂了，内容照样发出去", async () => {
+    const R = buildResponding();
+    const space = fakeSpace({ startFails: true });
+    let ran = false;
+    const got = await R.respondingWhile(space, async () => {
+      ran = true;
+      return "发出去了";
+    });
+    assert.equal(ran, true, "这就是用户报的那个 bug：fn 压根没跑");
+    assert.equal(got, "发出去了", "返回值要原样传出来");
+  });
+
+  await okAsync("灭指示器挂了，也不吃掉已经拿到的结果", async () => {
+    const R = buildResponding();
+    const got = await R.respondingWhile(fakeSpace({ stopFails: true }), async () => "正文");
+    assert.equal(got, "正文");
+  });
+
+  await okAsync("两个都挂了还是要把内容发出去", async () => {
+    const R = buildResponding();
+    const got = await R.respondingWhile(
+      fakeSpace({ startFails: true, stopFails: true }),
+      async () => "正文"
+    );
+    assert.equal(got, "正文");
+  });
+
+  await okAsync("fn 自己的错照样往外抛（那才是真问题）", async () => {
+    const R = buildResponding();
+    const space = fakeSpace();
+    await assert.rejects(
+      () => R.respondingWhile(space, async () => { throw new Error("模型没回"); }),
+      /模型没回/
+    );
+    assert.deepEqual(space.calls, ["start", "stop"], "抛错也要把指示器灭掉");
+  });
+
+  await okAsync("正常走完也灭指示器", async () => {
+    const R = buildResponding();
+    const space = fakeSpace();
+    await R.respondingWhile(space, async () => "x");
+    assert.deepEqual(space.calls, ["start", "stop"]);
+  });
+
+  await okAsync("开不起来只记明细档，不喊 warn", async () => {
+    const R = buildResponding();
+    await R.respondingWhile(fakeSpace({ startFails: true }), async () => "x");
+    assert.equal(R.logs.length, 1, "要留一行，排查「省略号怎么不出来」时得看得见");
+    assert.match(R.logs[0].msg, /打字指示器/);
+    assert.match(R.logs[0].msg, /fetch failed/, "原始错误要带上");
+  });
+
+  await okAsync("不传 runner 也不炸（scopeOf 读 runner.label 会 throw）", async () => {
+    const R = buildResponding();
+    await R.respondingWhile(fakeSpace({ startFails: true }), async () => "x");
+    assert.equal(R.logs[0].scope, "桥接");
+  });
+
+  await okAsync("传了 runner 时日志带角色名", async () => {
+    const R = buildResponding();
+    await R.respondingWhile(fakeSpace({ startFails: true }), async () => "x", { label: "Dante" });
+    assert.equal(R.logs[0].scope, "桥接·Dante");
+  });
+
+  okWith("源码里不许再有 space.responding( 的调用点", () => {
+    /*
+     * 漏一处就等于那一路还留着原来的坏法，而这种坏法是间歇性的 ——
+     * 只在线路抖的那一秒复现，自测和手点都撞不上。
+     */
+    const hits = IM_SRC.split("\n")
+      .map((line, i) => ({ line, no: i + 1 }))
+      // 注释里那句「SDK 的 space.responding(fn)」是有意留的，得放过
+      .filter(({ line }) => /\.responding\(/.test(line) && !/^\s*\*/.test(line));
+    assert.deepEqual(hits, [], `还有 ${hits.length} 处没换：${hits.map((h) => h.no).join("、")}`);
+  });
+
+  okWith("两个 typing 动作各自单独 catch", () => {
+    const fn = extractFn("respondingWhile", "async function");
+    // 不能是一个 try 罩住两个：那样开的挂了就跳过 fn 了
+    assert.match(fn, /try \{\s*await space\.startTyping\(\);\s*\} catch/);
+    assert.match(fn, /finally \{\s*try \{\s*await space\.stopTyping\(\);\s*\} catch/);
+  });
+
+  okWith("fn 在 try 里、返回值原样 return", () => {
+    const fn = extractFn("respondingWhile", "async function");
+    assert.match(fn, /return await fn\(\);/);
+  });
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(

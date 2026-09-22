@@ -9,7 +9,7 @@
  */
 
 import { logDebug, logWarn } from "./logs.js";
-import { proxyFor } from "./proxy.js";
+import { proxyFor, whyNetwork } from "./proxy.js";
 
 const PHOTON_BASE = "https://spectrum.photon.codes";
 
@@ -79,7 +79,7 @@ export async function findSharedUser({ projectId, projectSecret, phoneNumber }) 
       ? { assignedPhoneNumber: hit.assignedPhoneNumber, userId: hit.id ?? "" }
       : null;
   } catch (e) {
-    logWarn("Photon", `查已登记的用户时连不上，当作没查过继续：${String(e?.message ?? e)}`, e);
+    logWarn("Photon", `查已登记的用户时连不上，当作没查过继续：${whyNetwork(e, "photon")}`, e);
     return null; // 查不到就当没查过，交给创建流程
   }
 }
@@ -114,7 +114,13 @@ export async function enrollSharedUser({ projectId, projectSecret, phoneNumber }
     });
     logDebug("Photon", `登记共享用户：HTTP ${res.status}`);
   } catch (e) {
-    throw fail(`连不上 Photon：${e?.message ?? e}`, 0);
+    /*
+     * 这句话会出现在「开通线路」那个按钮下面，是用户唯一能看到的原因。
+     * 原来是 `e.message`，也就是一句 `fetch failed` —— 而这一类出厂**不勾**
+     * 代理（Photon 实测直连就通），所以真正的原因多半是「这台机器出不了网」
+     * 或者「勾错了代理」，whyNetwork 正好会把这两种分开说。
+     */
+    throw fail(`连不上 Photon：${whyNetwork(e, "photon")}`, 0);
   }
 
   const text = await res.text();

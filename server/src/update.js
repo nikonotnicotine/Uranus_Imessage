@@ -36,7 +36,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { proxyFor } from "./proxy.js";
+import { netCode, proxyFor, usesProxy } from "./proxy.js";
 
 /**
  * 项目根目录（放着那份 package.json）。
@@ -156,9 +156,17 @@ function clipNotes(text) {
  * 「云备份」这个 scope 和重试策略的一整套；这边只有一次 GET，而且一次失败
  * 就该告诉用户「网络不通，回头再点」—— 检查更新不是非成功不可的动作，
  * 静默重试三次只会让按钮转得更久。
+ *
+ * 也没直接用 proxy.js:whyNetwork：那个说的是通用的「连不上目标」，而这里每一句
+ * 都要落到「过一会儿再点一次，或者直接打开仓库页面看」这个具体动作上 ——
+ * 检查更新失败了用户该干什么，比错误码本身有用。
+ *
+ * **但错误码是借它挖的**（`netCodes`，不是 `e.cause.code`）。原来只挖一层，
+ * 于是 `AggregateError`（国内连 GitHub 最常见的那种：IPv6 和 IPv4 都不通）
+ * 一个码都读不到，最后那句兜底连括号里的码都是空的，剩下一句「连不上 GitHub」。
  */
 function explain(e) {
-  const code = String(e?.cause?.code ?? e?.code ?? e?.name ?? "").trim();
+  const code = netCode(e) || String(e?.name ?? "").trim();
   if (code === "TimeoutError" || code.includes("TIMEOUT") || code === "ETIMEDOUT") {
     return "连 GitHub 超时了。国内直连 GitHub 经常这样，过一会儿再点一次，或者直接打开仓库页面看。";
   }
@@ -168,7 +176,9 @@ function explain(e) {
   if (code === "ECONNRESET" || code === "UND_ERR_SOCKET" || code === "EPIPE") {
     return "连接被中途掐断了。过一会儿再点一次，或者直接打开仓库页面看。";
   }
-  return `连不上 GitHub${code ? `（${code}）` : ""}。过一会儿再点一次，或者直接打开仓库页面看。`;
+  // 这一类出厂不勾代理，而国内直连 GitHub 时好时坏 —— 所以兜底那句要提一下代理
+  const via = usesProxy("update") ? "" : "（这一类没走代理，去控制台的「代理」那节可以勾上）";
+  return `连不上 GitHub${code ? `（${code}）` : ""}${via}。过一会儿再点一次，或者直接打开仓库页面看。`;
 }
 
 /**

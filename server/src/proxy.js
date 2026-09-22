@@ -437,6 +437,19 @@ export function whyNetwork(e, scope, timeoutMs) {
   const codes = netCodes(e);
   const code = codes[0] ?? "";
 
+  /*
+   * 错误码**每一句都要带上**。
+   *
+   * 这句话会进日志、会进界面、有几处还会原样发到用户的 iMessage 里
+   * （imessage.js:notifyFailure）。中文解释是给看的人省事的，而那个码是
+   * 唯一能拿去搜、能贴到群里对上号的东西 —— 用户报上来一句「连接被拒绝」，
+   * 我们还得再问一轮「日志里那个码是什么」。
+   *
+   * 原来只有 UND_ERR_ 那一档带码，别的档没带。llm.js 以前自己那套是每句都带
+   * 的（`（代码 ECONNREFUSED）`），改成转发到这里时不能把这个丢掉。
+   */
+  const tag = code ? `（${code}）` : "";
+
   if (name === "TimeoutError" || code === "UND_ERR_HEADERS_TIMEOUT" || /timeout/i.test(msg)) {
     const secs = timeoutMs ? `（${Math.round(timeoutMs / 1000)} 秒）` : "";
     return viaProxy
@@ -444,30 +457,44 @@ export function whyNetwork(e, scope, timeoutMs) {
       : `请求超时${secs} —— 这一类没走代理，被墙的话去控制台的「代理」那节勾上`;
   }
   if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
-    return viaProxy ? `域名解析不了 —— 检查 ${via}` : "域名解析不了 —— 检查网络，或者去控制台勾上代理";
+    return viaProxy
+      ? `域名解析不了${tag} —— 检查 ${via}`
+      : `域名解析不了${tag} —— 地址是不是打错了？也可能是这台机器的 DNS 不通，或者要走代理`;
   }
   if (code === "ECONNREFUSED") {
-    return viaProxy ? `${via} 拒绝连接（没开？端口错？）` : "连接被拒绝";
+    /*
+     * 直连时的 ECONNREFUSED 和走代理时是**两件事**，提示不能共用一句：
+     * 走代理是「代理没开 / 端口填错」，直连是「对方那个端口上没有服务」——
+     * 后者多半是接口地址写错了（少了端口、多了路径、http 写成了 https）。
+     * 让它去勾代理是误导，被墙的表现是超时或者被重置，不是被拒绝。
+     */
+    return viaProxy
+      ? `${via} 拒绝连接${tag}（代理没开？端口错？）`
+      : `对方拒绝连接${tag} —— 那个端口上没有服务，接口地址和端口填对了吗？`;
   }
   if (code === "ECONNRESET") {
-    return viaProxy ? `连接被重置 —— ${via} 不稳定？` : "连接被重置 —— 这一类没走代理，可能被墙了";
+    return viaProxy
+      ? `连接被重置${tag} —— ${via} 不稳定？`
+      : `连接被重置${tag} —— 这一类没走代理，可能被墙了`;
   }
-  if (code === "CERT_HAS_EXPIRED" || /certificate/i.test(msg)) {
-    return viaProxy ? `证书校验失败 —— ${via} 在中间做了 TLS 拦截？` : "证书校验失败";
+  if (code === "CERT_HAS_EXPIRED" || code.startsWith("ERR_TLS") || /certificate/i.test(msg)) {
+    return viaProxy
+      ? `证书校验失败${tag} —— ${via} 在中间做了 TLS 拦截？`
+      : `证书校验失败${tag} —— 中间有东西在拦（企业网关、杀毒软件的 HTTPS 扫描）`;
   }
   if (/^UND_ERR_|^ECONN|^EPIPE$|^ETIMEDOUT$/.test(code)) {
     const hint = viaProxy
       ? `${via} 那边连不上`
-      : "这一类没走代理 —— 在国内连不上，去控制台的「代理」那节勾上并填地址";
-    return `连不上目标（${code}）—— ${hint}`;
+      : "这一类没走代理，目标在国内连不上的话去控制台的「代理」那节勾上并填地址";
+    return `连不上目标${tag} —— ${hint}`;
   }
 
   // 兜底也得带点信息：`fetch failed` 这一句等于什么都没说，而这几种错误
   // 恰恰是最常见的几种，多带一两个词能省掉一轮排查
   if (/fetch failed|socket|other side closed/i.test(msg)) {
     return viaProxy
-      ? `连接失败 —— 检查 ${via} 是不是还开着`
-      : "连接失败 —— 目标在国内连不上，去控制台「代理」那节勾上并填地址";
+      ? `连接失败${tag} —— 检查 ${via} 是不是还开着`
+      : `连接失败${tag} —— 目标在国内连不上，去控制台「代理」那节勾上并填地址`;
   }
   return codes.length ? `${msg}（${codes.join("、")}）` : msg;
 }

@@ -29,7 +29,7 @@
  */
 
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { proxyFor } from "./proxy.js";
+import { proxyFor, whyNetwork } from "./proxy.js";
 
 /** 搜一次最多等多久。用户在 iMessage 那头干等着，不能太长。 */
 const SEARCH_TIMEOUT = 12000;
@@ -438,8 +438,15 @@ export async function runSearch(queries, api, scope = "搜索", limits = {}) {
       results = got?.items ?? [];
       dropped = got?.dropped ?? 0;
     } catch (e) {
-      // 搜不到不是致命错误：模型照常回答，只是没有实时信息
-      logWarn(scope, `搜「${query}」失败（${source.name}），这条跳过`, e);
+      /*
+       * 搜不到不是致命错误：模型照常回答，只是没有实时信息。
+       *
+       * 但**原因要说清**。原来这行只把 e 交给 logWarn，标题里一个字的原因都
+       * 没有 —— 明细档里是一句 `fetch failed` 加一坨栈，而这一类默认不走代理
+       * （DuckDuckGo 直连不通），所以最常见的失败恰恰就是「该勾代理没勾」。
+       * whyNetwork 会把这句话说出来，scope 用 "search"，和 proxyFor 同一个开关。
+       */
+      logWarn(scope, `搜「${query}」失败（${source.name}）：${whyNetwork(e, "search", SEARCH_TIMEOUT)}，这条跳过`, e);
       continue;
     }
     const ms = Date.now() - startedAt;

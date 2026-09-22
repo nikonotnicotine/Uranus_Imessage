@@ -422,6 +422,144 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
   checkThat("外壳挂上了 ProxyPanel", /<ProxyPanel \/>/.test(src("client/src/shell.jsx")));
 }
 
+/* ================= 9. 出错时说得出原因 ================= */
+{
+  console.log("\n9. 出错时说得出原因");
+
+  /*
+   * 用户的原话：「反馈给我一直 fetch failed，这个是什么问题，就是 fetch failed
+   * 也不是什么错误，反馈给我我还要去搜」。
+   *
+   * `fetch failed` 是 undici 对**一切**网络问题的统称，真正的原因埋在
+   * `e.cause` 里，而 IPv6 / IPv4 都不通时（Happy Eyeballs，Node 20 起默认开）
+   * 更是埋在 `e.errors[]` 的每一条里面。只挖一层的模块统统会掉到「原样吐
+   * e.message」那个兜底上，于是日志里只剩这一句。
+   *
+   * 这一节盯两件事：
+   *
+   *  1. **深挖**。netCodes 要能从 AggregateError 里把码捞出来。
+   *  2. **口子统一**。每个出网模块的报错都要走 whyNetwork（或者自己的中文
+   *     翻译 + netCode 挖码），而且 scope 要和它 proxyFor 用的 key 一致 ——
+   *     传错 key 的话它会理直气壮地指错方向（「这一类没走代理」其实走了）。
+   */
+
+  /** 造一个 undici 在双栈域名连不上时真会抛的那种错。 */
+  const aggregateFetchError = () => {
+    const v6 = new Error("connect ECONNREFUSED ::1:443");
+    v6.code = "ECONNREFUSED";
+    const v4 = new Error("connect ECONNREFUSED 127.0.0.1:443");
+    v4.code = "ECONNREFUSED";
+    const agg = new AggregateError([v6, v4], "");
+    const outer = new TypeError("fetch failed");
+    outer.cause = agg;
+    return outer;
+  };
+
+  check("AggregateError 里的码捞得出来", P.netCode(aggregateFetchError()), "ECONNREFUSED");
+  checkThat(
+    "只挖一层的写法确实读不到（这就是原来的坏法）",
+    aggregateFetchError().cause?.code === undefined,
+  );
+
+  // 外层带个笼统的 UND_ERR_CONNECT_TIMEOUT、里层才是真原因时，要报里层那个
+  {
+    const inner = new Error("connect ECONNREFUSED 127.0.0.1:7890");
+    inner.code = "ECONNREFUSED";
+    const outer = new TypeError("fetch failed");
+    outer.code = "UND_ERR_CONNECT_TIMEOUT";
+    outer.cause = inner;
+    check("笼统的码要让位给具体的", P.netCode(outer), "ECONNREFUSED");
+  }
+
+  checkThat(
+    "whyNetwork 不会把 fetch failed 原样吐出来",
+    !/fetch failed/.test(P.whyNetwork(aggregateFetchError(), "llm", 60000)),
+    P.whyNetwork(aggregateFetchError(), "llm", 60000),
+  );
+
+  /*
+   * 每一句都要带上错误码。中文解释给人看，码是唯一能拿去搜、能贴到群里对上号
+   * 的东西 —— 用户报「连接被拒绝」我们还得再问一轮「码是什么」。
+   */
+  for (const [what, err] of [
+    ["ECONNREFUSED", aggregateFetchError()],
+    ["ENOTFOUND", Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("x"), { code: "ENOTFOUND" }) })],
+    ["UND_ERR_SOCKET", Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("x"), { code: "UND_ERR_SOCKET" }) })],
+  ]) {
+    const said = P.whyNetwork(err, "llm", 60000);
+    checkThat(`${what} 那句里带着码`, said.includes(what), said);
+  }
+
+  /*
+   * 直连时的 ECONNREFUSED **不该**让人去勾代理：被拒绝的意思是「那个端口上
+   * 没有服务」，多半是接口地址写错了。被墙的表现是超时或者被重置。
+   */
+  {
+    const said = P.whyNetwork(aggregateFetchError(), "llm", 60000);
+    checkThat("直连被拒绝时不瞎指代理", !/勾上/.test(said), said);
+    checkThat("直连被拒绝时指向地址和端口", /端口/.test(said), said);
+  }
+
+  // 超时和连不上那两档才该提代理 —— 那两种确实是被墙的典型表现
+  {
+    const timeout = Object.assign(new Error("Connect Timeout Error"), { name: "TimeoutError" });
+    checkThat("超时那句提了代理", /代理/.test(P.whyNetwork(timeout, "llm", 60000)));
+    const socket = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("x"), { code: "UND_ERR_SOCKET" }),
+    });
+    checkThat("连不上那句提了代理", /代理/.test(P.whyNetwork(socket, "llm", 60000)));
+  }
+
+  /*
+   * 每个出网模块：报错走的 scope 必须是它 proxyFor 用的那个 key。
+   *
+   * 写成一张表而不是逐个 checkThat，是因为漏的那一处正是没人想到的那一处 ——
+   * 加新功能时照着这张表走一遍比凭记忆可靠。
+   */
+  const REPORTERS = [
+    ["server/src/llm.js", ["llm"]],
+    // media.js 走的是自己那层 whyFetch(e, scope, timeout)，scope 在调用点传
+    ["server/src/media.js", ["tts", "llm"], /whyFetch\([^)]*"SCOPE"/],
+    ["server/src/music.js", ["music"]],
+    ["server/src/websearch.js", ["search"]],
+    ["server/src/photon.js", ["photon"]],
+    ["server/src/igimage.js", ["ig"]],
+    ["server/src/ignet.js", ["ig"]],
+    ["server/src/linkmeta.js", ["link"]],
+    ["server/src/env.js", ["weather"]],
+  ];
+  for (const [file, scopes, via] of REPORTERS) {
+    const text = src(file);
+    // 报错的入口：多数文件直接调 whyNetwork，media.js 隔了自己那层 whyFetch
+    const fn = via ? "whyFetch" : "whyNetwork";
+    checkThat(`${file} 的报错走 whyNetwork`, /whyNetwork\(/.test(text));
+    for (const scope of scopes) {
+      checkThat(
+        `${file} 报错用的是 "${scope}"（和它挂代理的 key 一致）`,
+        new RegExp(`${fn}\\([^)]*"${scope}"`).test(text),
+      );
+    }
+    // 传了清单外的 key 等于指错方向，而且不会报错，只会安静地说反话
+    const used = [...text.matchAll(new RegExp(`${fn}\\([^)]*?"([a-z]+)"`, "g"))].map((m) => m[1]);
+    const bogus = used.filter((s) => !P.SCOPE_KEYS.includes(s));
+    checkThat(`${file} 没用清单外的类别名`, bogus.length === 0, bogus.join("、"));
+  }
+
+  // 这两个自己有更贴合场景的中文（「过一会儿再点一次，或者直接打开仓库页面看」），
+  // 但**挖码**必须借 netCode —— 原来只挖一层，连不上 GitHub 时括号里是空的
+  checkThat("update.js 借 netCode 挖码", /netCode\(/.test(src("server/src/update.js")));
+  checkThat("cloud/net.js 借 netCode 挖码", /netCode\(/.test(src("server/src/cloud/net.js")));
+  checkThat(
+    "cloud/net.js 不再自己走 errors[]（挑错分支会读不到码）",
+    !/function causeOf\(/.test(src("server/src/cloud/net.js")),
+  );
+
+  // 重试判据也得深挖：读不到码就当「不值得重试」，一次抖动会变成整轮失败
+  for (const file of ["server/src/llm.js", "server/src/media.js"]) {
+    checkThat(`${file} 的重试判据用 netCodes`, /netCodes\(/.test(src(file)));
+  }
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(`\n${fail === 0 ? "全部通过" : "有失败"}：${pass} 通过 / ${fail} 失败\n`);

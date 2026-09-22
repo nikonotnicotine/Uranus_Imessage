@@ -30,7 +30,7 @@ import path from "node:path";
 import { IMAGES_DIR, REF_IMAGES_DIR, ensureLayout } from "./datadir.js";
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { proxyFor } from "./proxy.js";
+import { netCodes, proxyFor, whyNetwork } from "./proxy.js";
 import { xmlBlockRanges } from "./websearch.js";
 
 /** 合成一条语音最多等多久。对方在 iMessage 那头看着打字指示器干等。 */
@@ -828,15 +828,19 @@ function trimBase(url) {
 /**
  * 网络层错误挖出人能看的一句话。
  *
- * 和 llm.js:describeNetworkError 同一个用意（undici 只抛一句没信息量的
- * "fetch failed"，真原因在 e.cause 里）。没直接复用是因为那个没 export，
- * 而且这里要的短得多 —— 这句话会进控制台，不会发给对方。
+ * 转给 proxy.js:whyNetwork。这里原来自己挖一层 `e.cause.code`，挖不着就把
+ * `e.message` 原样吐出去 —— 而 undici 的 message 就是那句没信息量的
+ * `fetch failed`。`AggregateError`（IPv6 / IPv4 都连不上时 Node 抛的，具体
+ * 原因在 `errors[]` 里）正好落在这个口子上，用户报上来的就是那一句。
+ *
+ * `scope` 要和这条路 `proxyFor(...)` 用的 key **一致**：合成语音走 `"tts"`、
+ * 生图走 `"llm"`。whyNetwork 会照这个 key 去看「这一类到底有没有挂代理」，
+ * 然后分开说 —— 同一个 ECONNREFUSED，走代理时该去看代理开没开，直连时该去看
+ * 地址填对没有。传错 key 的话它会理直气壮地指错方向。
  */
-function whyFetch(e) {
-  if (e?.name === "TimeoutError" || e?.name === "AbortError") return "请求超时";
-  const code = e?.cause?.code;
-  if (code) return `${e.message}（${code}）`;
-  return String(e?.message ?? e);
+function whyFetch(e, scope, timeout) {
+  if (e?.name === "AbortError") return "请求超时";
+  return whyNetwork(e, scope, timeout);
 }
 
 /**
@@ -848,17 +852,21 @@ function whyFetch(e) {
  * 反过来，鉴权失败、余额不足、参数不对、上游明确报错，重试只是多花一次钱、
  * 多等一个超时，所以一律不重试。HTTP 状态码类的错误在各家适配器里就抛成
  * 普通 Error 了，走不到这里。
+ *
+ * 错误码走 `netCodes` 挖（不是 `e.cause.code`）：只挖一层的话
+ * `AggregateError` 一个码都读不到，于是被当成「不值得重试」—— 一次本该重试
+ * 就过去的连接抖动，变成了这条语音直接退化成文字。
  */
 function worthRetry(e) {
-  const code = e?.cause?.code ?? e?.code;
-  return (
-    code === "UND_ERR_CONNECT_TIMEOUT" ||
-    code === "ECONNRESET" ||
-    code === "ECONNREFUSED" ||
-    code === "ETIMEDOUT" ||
-    code === "EPIPE" ||
-    code === "UND_ERR_SOCKET" ||
-    e?.name === "TimeoutError"
+  if (e?.name === "TimeoutError") return true;
+  return netCodes(e).some(
+    (c) =>
+      c === "UND_ERR_CONNECT_TIMEOUT" ||
+      c === "ECONNRESET" ||
+      c === "ECONNREFUSED" ||
+      c === "ETIMEDOUT" ||
+      c === "EPIPE" ||
+      c === "UND_ERR_SOCKET"
   );
 }
 
@@ -1449,10 +1457,10 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音") {
       break;
     } catch (e) {
       if (attempt <= TTS_RETRIES && worthRetry(e)) {
-        logWarn(scope, `${source.name} 没连上（${whyFetch(e)}），重试一次`);
+        logWarn(scope, `${source.name} 没连上（${whyFetch(e, "tts", TTS_TIMEOUT)}），重试一次`);
         continue;
       }
-      throw new Error(`${source.name} 合成失败：${whyFetch(e)}`);
+      throw new Error(`${source.name} 合成失败：${whyFetch(e, "tts", TTS_TIMEOUT)}`);
     }
   }
   const ms = Date.now() - startedAt;
@@ -1629,7 +1637,8 @@ export async function generateImage(endpoint, req, scope = "生图") {
       });
     }
   } catch (e) {
-    throw new Error(`生图请求失败：${whyFetch(e)}`);
+    // 生图打的是模型 API（proxyFor("llm")），所以这里的 scope 也是 llm
+    throw new Error(`生图请求失败：${whyFetch(e, "llm", IMAGE_TIMEOUT)}`);
   }
 
   const raw = await res.text();

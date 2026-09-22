@@ -54,7 +54,7 @@
  */
 
 import { logDebug, logWarn } from "./logs.js";
-import { proxyFor } from "./proxy.js";
+import { netCodes, proxyFor, whyNetwork } from "./proxy.js";
 
 /** 一次搜索最多等多久。发消息那条路在等它，不能久。 */
 const SEARCH_TIMEOUT_MS = 6000;
@@ -214,9 +214,24 @@ function evaluate(terms, item, rank, trustRank0) {
   return { score, aff };
 }
 
-/** fetch 挂了的时候说人话，别把一整坨 stack 甩进日志。 */
+/**
+ * fetch 挂了的时候说人话，别把一整坨 stack 甩进日志。
+ *
+ * 网络层的失败转给 proxy.js:whyNetwork —— 原来这里直接 `e.message`，而 undici
+ * 的 message 就是那句没信息量的 `fetch failed`，日志里只剩「网易云搜「x」没成功
+ * （fetch failed）」，用户拿着这句话只能去搜引擎。whyNetwork 会把真正的错误码
+ * 挖出来（`AggregateError` 的 `errors[]` 也一起挖），还会说清这一类有没有挂代理。
+ *
+ * scope 传 `"music"`，和上面两个 `proxyFor("music")` 是同一个开关。
+ *
+ * 非网络的错还是原样带出来：网易云的限流码（405「操作频繁」）和 `HTTP 4xx`
+ * 是我们自己抛的普通 Error，那些话本身就是原因，套一层反而糊。
+ */
 function why(e) {
   if (e?.name === "TimeoutError" || e?.name === "AbortError") return `超过 ${SEARCH_TIMEOUT_MS} 毫秒没回应`;
+  if (netCodes(e).length || /fetch failed/i.test(String(e?.message ?? ""))) {
+    return whyNetwork(e, "music", SEARCH_TIMEOUT_MS);
+  }
   return e?.message ? String(e.message) : String(e);
 }
 

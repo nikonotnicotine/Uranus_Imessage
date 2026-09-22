@@ -1458,6 +1458,74 @@ async function describeVideos(endpoint, prompt, max, runner, videos) {
 }
 
 /**
+ * 「正在输入…」套着干一件事 —— 替代 `space.responding(fn)`。
+ *
+ * ── 为什么不用 SDK 那个 ──
+ *
+ * spectrum 的 responding 是这样写的（@spectrum-ts/core）：
+ *
+ *     responding: async (fn) => {
+ *       await space.send(typing("start"));        ← 没保护
+ *       try { return await fn(); }
+ *       finally { await space.send(typing("stop")).catch(() => {}); }  ← 这个包了
+ *     }
+ *
+ * 收尾那句包了 `.catch`，**开头那句没有**。于是打字指示器没开成功的时候，
+ * `fn` 压根不会被执行 —— 而 fn 才是真正要干的事（发那条消息）。
+ *
+ * 实机上撞到的就是这个，用户反馈里那条栈：
+ *
+ *     IMessageError: fetch failed
+ *       at fromGrpcError  (@photon-ai/advanced-imessage)
+ *       at ChatsResource.setTyping          ← 失败的是打字气泡
+ *       at async startTyping / handleTyping
+ *       at async Object.send                ← 把整个 responding 带崩了
+ *     [桥接·某某] 处理这一轮消息出错
+ *
+ * `fetch failed` 是 undici 对一切网络失败的统称，这里是我们和 Photon 之间那条
+ * gRPC 连接抖了一下（共享线路上躲不掉，attachread.js 的文件头记过同一件事：
+ * 底下连接一抖，挂在上面的流会一起断）。
+ *
+ * 症状是**角色偶尔整轮不回**，而日志里只有一句没信息量的 fetch failed ——
+ * 一个纯装饰性的省略号气泡，代价是一整轮回复。
+ *
+ * ── 这里的规矩 ──
+ *
+ * 打字指示器是**装饰**，`fn` 是**正事**。所以两头的 typing 都各自 catch 掉，
+ * 不让它们有任何机会挡住 fn。我们自己那三处裸的 `space.startTyping()` 早就
+ * 是这么包的（见 sendBubbles），这个函数只是把同样的规矩补到 responding 上。
+ *
+ * fn 自己抛的错**照旧往外抛** —— 那才是真的失败，调用方要知道。
+ */
+async function respondingWhile(space, fn, runner = null) {
+  try {
+    await space.startTyping();
+  } catch (e) {
+    /*
+     * 只在明细档记一行：这事不影响结果，但排查「省略号怎么不出来」时要看得见。
+     * 而且它**不能**升到 warn —— 共享线路上这种抖动是常态，每次都喊一声等于
+     * 把真正的问题埋掉。
+     *
+     * runner 可以不传（几处静态调用点手上没有），所以这里自己兜一下标签，
+     * 不走 scopeOf（那个直接读 runner.label，传 null 会炸）。
+     */
+    logDebug(
+      runner?.label ? `桥接·${runner.label}` : "桥接",
+      `打字指示器没开起来，照常发内容：${String(e?.message ?? e)}`
+    );
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      await space.stopTyping();
+    } catch {
+      /* 灭不掉就算了：对方那头几秒后自己会灭 */
+    }
+  }
+}
+
+/**
  * 发一条**系统发言**。
  *
  * 系统发言 = 这个程序自己说的话：指令的确认、出错提示、`/memory` 和 `/diary`
@@ -1483,7 +1551,7 @@ async function sendSystem(runner, space, text, opts = {}) {
     logInfo(scopeOf(runner, "桥接"), `防相亲开着，${what}没发进聊天：${peek}`);
     return false;
   }
-  if (responding) await space.responding(() => space.send(text));
+  if (responding) await respondingWhile(space, () => space.send(text), runner);
   else await space.send(text);
   return true;
 }
@@ -1717,7 +1785,7 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
    */
   if (result.image) {
     try {
-      await space.responding(async () => {
+      await respondingWhile(space, async () => {
         const ok = await sendImagePart(
           runner,
           space,
@@ -1729,7 +1797,7 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
             what: "出图失败的提示",
           });
         }
-      });
+      }, runner);
     } catch (e) {
       logError(scope, "快捷指令出图失败", e);
     }
@@ -1747,7 +1815,7 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
    */
   if (result.memory) {
     try {
-      await space.responding(async () => {
+      await respondingWhile(space, async () => {
         const config = getConfig();
         const out =
           result.memory.kind === "diary"
@@ -1757,7 +1825,7 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
         await sendSystem(runner, space, out.text, {
           what: result.memory.kind === "diary" ? "日记" : "记忆总结",
         });
-      });
+      }, runner);
     } catch (e) {
       // manualMemory / manualDiary 自己吞了业务错误，走到这儿是发送本身出了事
       logError(scope, `快捷指令「${result.memory.kind}」失败`, e);
@@ -1809,7 +1877,7 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
    */
   if (result.igtick) {
     try {
-      await space.responding(async () => {
+      await respondingWhile(space, async () => {
         const done = await tickIgQueue(getConfig(), {
           session: igSessionFor(getConfig),
           all: true,
@@ -1822,7 +1890,7 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
             : "队列里现在没有排着的互动。",
           { what: "IG 队列的执行结果" }
         );
-      });
+      }, runner);
     } catch (e) {
       // tickIgQueue 自己吞了单条任务的异常，走到这儿是发送本身出了事
       logError(scope, "快捷指令「立即触发评论」失败", e);
@@ -2238,7 +2306,7 @@ async function runOfflineCommand(getConfig, runner, space, spaceId, { action, ro
       await say("现在不在线下模式里，不用关。");
       return;
     }
-    await space.responding(async () => {
+    await respondingWhile(space, async () => {
       let out;
       try {
         out = await endOffline(config, role, { inject: true });
@@ -2255,7 +2323,7 @@ async function runOfflineCommand(getConfig, runner, space, spaceId, { action, ro
       else lines.push("这次没有可写进记忆库的总结（剧情还没演出内容）。");
       if (out.error) lines.push(`⚠️ 结束时那份大总结没生成出来：${out.error}`);
       await say(lines.join("\n"));
-    });
+    }, runner);
     return;
   }
 
@@ -2267,7 +2335,7 @@ async function runOfflineCommand(getConfig, runner, space, spaceId, { action, ro
     await say(`现在没有在演的剧情，出不了${what}。发 /开启线下 起一段。`);
     return;
   }
-  await space.responding(async () => {
+  await respondingWhile(space, async () => {
     let made;
     try {
       made = await summarizeNow(config, role, storyId, kind);
@@ -2281,7 +2349,7 @@ async function runOfflineCommand(getConfig, runner, space, spaceId, { action, ro
       return;
     }
     await say(`✅ 出了一份${what}（第 ${made.from + 1}-${made.to} 轮）：\n\n${made.text}`);
-  });
+  }, runner);
 }
 
 /**
@@ -2318,8 +2386,10 @@ async function runOfflineTurnHere(getConfig, runner, space, spaceId, userText, p
 
   let out;
   try {
-    out = await space.responding(() =>
-      runOfflineTurn(config, role, resolveUser(config, role), { text: said })
+    out = await respondingWhile(
+      space,
+      () => runOfflineTurn(config, role, resolveUser(config, role), { text: said }),
+      runner
     );
   } catch (e) {
     logError(scope, "线下这轮没回上来", e);
@@ -2972,7 +3042,7 @@ async function handleTurn(
     // 带上等了多久 —— 「等 3 秒就报错」和「等满 300 秒超时」是两种毛病
     logError(llmScope, `这一轮没能拿到回复（等了 ${secsSince(askedAt)}s）`, e);
     // 让对方知道这轮为什么没回，不用去翻控制台
-    await space.responding(() => notifyFailure(runner, space, "这条消息没回上来", e));
+    await respondingWhile(space, () => notifyFailure(runner, space, "这条消息没回上来", e), runner);
     throw e;
   }
 
@@ -3007,7 +3077,7 @@ async function handleTurn(
     if (searched !== null) reply = searched;
   } catch (e) {
     logError(llmScope, "联网搜索之后那次生成失败，这一轮没能拿到回复", e);
-    await space.responding(() => notifyFailure(runner, space, "这条消息没回上来", e));
+    await respondingWhile(space, () => notifyFailure(runner, space, "这条消息没回上来", e), runner);
     throw e;
   }
 
@@ -3037,7 +3107,7 @@ async function handleTurn(
     if (spied !== null) reply = spied;
   } catch (e) {
     logError(llmScope, "查岗之后那次生成失败，这一轮没能拿到回复", e);
-    await space.responding(() => notifyFailure(runner, space, "这条消息没回上来", e));
+    await respondingWhile(space, () => notifyFailure(runner, space, "这条消息没回上来", e), runner);
     throw e;
   }
 
@@ -3063,7 +3133,7 @@ async function handleTurn(
     if (phoned !== null) reply = phoned;
   } catch (e) {
     logError(llmScope, "动手机之后那次生成失败，这一轮没能拿到回复", e);
-    await space.responding(() => notifyFailure(runner, space, "这条消息没回上来", e));
+    await respondingWhile(space, () => notifyFailure(runner, space, "这条消息没回上来", e), runner);
     throw e;
   }
 
@@ -3267,7 +3337,7 @@ async function handleTurn(
      * 同一个量级，理应和它们排在一起。
      */
     logError(scope, "这一轮没有可发送的正文（token 已消耗）", `原文 ${reply.length} 字：${reply}`);
-    await space.responding(() => notifyFailure(runner, space, "这条没能生成正文", why));
+    await respondingWhile(space, () => notifyFailure(runner, space, "这条没能生成正文", why), runner);
     return;
   }
 
@@ -3328,7 +3398,7 @@ async function handleTurn(
   }
 
   // 用 responding 串行化本条 space 的回包
-  await space.responding(async () => {
+  await respondingWhile(space, async () => {
     const freshest = getConfig();
     const chat = freshest.chat ?? {};
     /*
@@ -3372,7 +3442,7 @@ async function handleTurn(
     }
     // 计数只数真发出去的消息 —— 只贴了个爱心那轮不该让「已回复」多一条
     if (sent) runner.messageCount += 1;
-  });
+  }, runner);
 }
 
 /* ------------------------------------------------------------------ *
@@ -3524,7 +3594,7 @@ async function commitIgTurn(getConfig, runner, role, outcome) {
       afterTurn(runner, last?.space, config, fresh, { user: outcome.mark, assistant });
 
       if (!canSend) return;
-      await last.space.responding(async () => {
+      await respondingWhile(last.space, async () => {
         const { sent, acted, failed } = await sendBubbles(
           runner,
           last.space,
@@ -3545,7 +3615,7 @@ async function commitIgTurn(getConfig, runner, role, outcome) {
           return;
         }
         if (sent) runner.messageCount += 1;
-      });
+      }, runner);
     },
     "Instagram 这一轮没能落到会话里"
   );
@@ -4219,7 +4289,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
     return;
   }
 
-  await space.responding(async () => {
+  await respondingWhile(space, async () => {
     const freshest = getConfig();
     const { sent, acted, failed } = await sendBubbles(runner, space, freshest.chat ?? {}, forUser, {
       role: currentRole(freshest, runner) ?? role,
@@ -4251,7 +4321,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
     slot.read = false;
     // 这两笔要跟着表一起落盘，不然重启后「已读但没回」就丢了
     saveSlot(runner.projectRefId, spaceId, slot);
-  });
+  }, runner);
 }
 
 /**

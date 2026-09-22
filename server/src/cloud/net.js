@@ -20,34 +20,24 @@
  */
 
 import { logDebug } from "../logs.js";
-import { proxyFor } from "../proxy.js";
+import { netCode, proxyFor } from "../proxy.js";
 
 /**
- * 一路 unwrap 到最里面那个真正的错误。
+ * 最里面那个真正的错误码。
  *
  * 两种套法都得认：
  *  - `e.cause`：undici 的常规套娃（`TypeError: fetch failed` → 真正的 Error）
  *  - `e.errors[]`：域名同时有 A 和 AAAA 记录时 undici 会挨个试，全失败就包成
  *    一个 `AggregateError`，**它自己没有 `code`**，得钻进去拿。api.github.com
  *    就是双栈的，所以这条真的会踩到
+ *
+ * 这两件事 proxy.js:netCodes 已经在做了（而且是**每一条**分支都收，不像这里
+ * 原来那样一进 `errors[]` 就只顺着第一条往下走 —— IPv6 那条常是没有 code 的
+ * 包装错，真正的 ECONNREFUSED 挂在 IPv4 那条上，挑错分支就什么都读不到）。
+ * 所以这里转给它，`name` 兜底留着：TimeoutError 是靠名字认的，它没有 code。
  */
-function causeOf(e) {
-  let c = e;
-  for (let i = 0; i < 6; i++) {
-    if (Array.isArray(c?.errors) && c.errors.length) {
-      // 挑第一个带 code 的；都没有就拿第一个
-      c = c.errors.find((x) => x?.code) ?? c.errors[0];
-      continue;
-    }
-    if (!c?.cause) break;
-    c = c.cause;
-  }
-  return c ?? e;
-}
-
 function codeOf(e) {
-  const c = causeOf(e);
-  return String(c?.code ?? c?.name ?? "").trim();
+  return netCode(e) || String(e?.name ?? "").trim();
 }
 
 /** 这些是「网络抽了一下」，再来一次多半就好了。 */
