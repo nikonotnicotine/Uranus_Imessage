@@ -328,7 +328,12 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
     ["server/src/igreal.js", 1], // 把远端图片拉回本地
     ["server/src/cloud/net.js", 1], // 两家云的所有请求都从这一个 call() 出去
     ["server/src/media.js", 5], // TTS ×2（SoVITS 是本机，不挂）+ 生图 ×3
-    ["server/src/linkmeta.js", 3], // 跟重定向的 HEAD + 抓网页的 GET + B 站 API
+    /*
+     * linkmeta.js 的九处：抓网页的 GET + 跟重定向的 HEAD ×2 + B 站 API +
+     * 抖音（收 cookie 那趟 + 带 ttwid 重抓那趟）+ 小红书 + 把图拉回本地 +
+     * 把视频拉回本地。都是 link 类。
+     */
+    ["server/src/linkmeta.js", 9],
   ];
 
   for (const [file, n] of expect) {

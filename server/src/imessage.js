@@ -3206,7 +3206,7 @@ async function handleTurn(
      * 注意传的是**这一刻**重新读的 config 和角色 —— 出图要几十秒，这段时间
      * 用户可能在界面上改了配置。eps 顺手带上，省得 sendImagePart 再解析一次。
      */
-    const sent = await sendBubbles(runner, space, chat, forUser, {
+    const { sent, acted, failed } = await sendBubbles(runner, space, chat, forUser, {
       role: currentRole(freshest, runner) ?? freshRole,
       config: freshest,
       eps,
@@ -3217,22 +3217,30 @@ async function handleTurn(
     });
 
     /*
-     * 一条都没发出去 —— 只可能是「整条回复就一个 [image:…]，而出图失败了」。
-     * 图片失败是刻意不发占位文字的（见 sendImagePart），但整轮静默就成了
-     * 「消息发出去了却什么都没回」，那正是之前修过的坑。所以这里兜一句，
-     * 原因去控制台看。
+     * 一件事都没做成 —— 整条回复就一个媒体标记，而那个标记失败了。图片、
+     * 表情包这些失败时刻意不发占位文字（见 sendImagePart），但整轮静默就成了
+     * 「消息发出去了却什么都没回」，那正是之前修过的坑。所以这里兜一句。
+     *
+     * 判的是 `acted` 不是 `sent`：只贴了个 `[react:❤️]` 的那种回复 `sent` 是 0
+     * 但确实做了事（对方说「你别回我了」，角色贴一颗心就收尾），报错就错了。
+     *
+     * 那句话里说的是**真的**什么没成（sendBubbles 记着这一轮出现过哪几种
+     * 标记）—— 原先那句话把原因写死成图片，遇上表情包或者贴爱心失败就是一句
+     * 和事实无关的话，对方照着去看「生图」日志什么也找不到。
      */
-    if (!sent) {
-      logWarn(scope, "这轮一条消息都没能发出去（多半是生成图片失败了）");
+    if (!acted) {
+      const what = failed || "这条回复";
+      logWarn(scope, `这轮一件事都没做成（${what}）`);
       await notifyFailure(
         runner,
         space,
         "这条没能发出来",
-        "这轮回复里只有图片，而图片没生成成功。具体原因看控制台的「生图」日志。"
+        `这轮回复里只有${what}，而它没成功。具体原因看控制台上面几行日志。`
       );
       return;
     }
-    runner.messageCount += 1;
+    // 计数只数真发出去的消息 —— 只贴了个爱心那轮不该让「已回复」多一条
+    if (sent) runner.messageCount += 1;
   });
 }
 
@@ -3386,19 +3394,26 @@ async function commitIgTurn(getConfig, runner, role, outcome) {
 
       if (!canSend) return;
       await last.space.responding(async () => {
-        const sent = await sendBubbles(runner, last.space, config.chat ?? {}, forUser, {
-          role: fresh,
-          config,
-          eps: resolveRoleEndpoints(config, fresh),
-          // 引用和撤回要按 spaceId 去查两个环形缓冲（见 sendBubbles 的注释）
-          spaceId,
-          peer,
-        });
-        if (!sent) {
-          logWarn(scope, "Instagram 顺带的那条短信一条都没能发出去（多半是生成图片失败了）");
+        const { sent, acted, failed } = await sendBubbles(
+          runner,
+          last.space,
+          config.chat ?? {},
+          forUser,
+          {
+            role: fresh,
+            config,
+            eps: resolveRoleEndpoints(config, fresh),
+            // 引用和撤回要按 spaceId 去查两个环形缓冲（见 sendBubbles 的注释）
+            spaceId,
+            peer,
+          }
+        );
+        // 判 acted 不判 sent：只贴了个 [react:] 的那轮也算做了事（见 sendBubbles）
+        if (!acted) {
+          logWarn(scope, `Instagram 顺带的那条短信一件事都没做成（${failed || "没有内容"}）`);
           return;
         }
-        runner.messageCount += 1;
+        if (sent) runner.messageCount += 1;
       });
     },
     "Instagram 这一轮没能落到会话里"
@@ -4075,7 +4090,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
 
   await space.responding(async () => {
     const freshest = getConfig();
-    const sent = await sendBubbles(runner, space, freshest.chat ?? {}, forUser, {
+    const { sent, acted, failed } = await sendBubbles(runner, space, freshest.chat ?? {}, forUser, {
       role: currentRole(freshest, runner) ?? role,
       config: freshest,
       eps,
@@ -4083,8 +4098,20 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
       spaceId,
       peer,
     });
+    if (!acted) {
+      logWarn(scope, `这条主动消息一件事都没做成（${failed || "没有内容"}）`);
+      return;
+    }
+    /*
+     * `slot.awaiting` 卡在 `sent` 上，不是 `acted`。
+     *
+     * 那个标志是「等对方回话」的意思，而主动消息里一条新消息都没发出去
+     * （比如整条就一个 `[react:]`）时对方屏幕上什么新东西都没有 —— 那一等
+     * 就是白等，还会把后面的主动消息全堵住（和上面「只发了 IG」那一条同一个
+     * 道理）。messageCount 同理：前端那是「已回复」的计数。
+     */
     if (!sent) {
-      logWarn(scope, "这条主动消息一条都没能发出去（多半是生成图片失败了）");
+      logInfo(scope, "这条主动消息没有新消息、只改了已有的气泡，不进入「等对方回话」");
       return;
     }
     runner.messageCount += 1;
@@ -4478,19 +4505,23 @@ async function sendLocationPart(runner, space, part, ctx) {
  * 本地 Mac 模式不支持撤回（@spectrum-ts/imessage-local 直接返回
  * unsupportedAction），SDK 会抛错 —— 这里吞掉记一条 warn，那句漏嘴的话就
  * 留在对话里，比整轮回复因此中断强。
+ *
+ * @returns {Promise<boolean>} 真撤掉了没有。**不计进「发了几条」**（它不产出
+ *   内容），但调用方要靠它判断「这一轮到底做了事没有」—— 见 sendBubbles 里
+ *   `acted` 和 `sent` 的分工。
  */
 async function runUndoPart(runner, space, part, ctx) {
   const scope = scopeOf(runner, "桥接");
   if (!ctx?.role?.undoSend?.enabled) {
     logInfo(scope, "这个角色没开「消息撤回」，[undosend] 忽略");
-    return;
+    return false;
   }
 
   const list = ringOf(runner.outbox, ctx?.spaceId);
   const n = Math.max(1, Number(part.n) || 1);
   if (n > list.length) {
     logWarn(scope, `[undosend:${n}] 撤不了：这条会话只发出去过 ${list.length} 条`);
-    return;
+    return false;
   }
   const idx = list.length - n;
   const slot = list[idx];
@@ -4501,15 +4532,17 @@ async function runUndoPart(runner, space, part, ctx) {
 
   if (Date.now() - slot.at > UNDO_WINDOW_MS) {
     logWarn(scope, `[undosend:${n}] 撤不了：那条已经发出去超过两分钟，过了苹果的撤回窗口`);
-    return;
+    return false;
   }
 
   try {
     await slot.message.unsend();
     list.splice(idx, 1);
     logInfo(scope, `已撤回自己倒数第 ${n} 条消息`);
+    return true;
   } catch (e) {
     logWarn(scope, `[undosend:${n}] 撤回没成功（本地 Mac 模式不支持撤回）`, e);
+    return false;
   }
 }
 
@@ -4531,19 +4564,24 @@ async function runUndoPart(runner, space, part, ctx) {
  *
  * 本地 Mac 模式整个不支持（imessage-local 的 react 直接返回 unsupportedAction），
  * 所以包在 try 里退化成一行 warn：贴不上一个 emoji，不该让这一轮回复崩掉。
+ *
+ * @returns {Promise<boolean>} 真贴上了没有。**不计进「发了几条」**（它不新起
+ *   消息），但调用方要靠它判断「这一轮到底做了事没有」—— 只贴了个爱心的那种
+ *   回复（对方说「你别回我了」，角色贴一颗心）是完全正常的一轮，不该被当成
+ *   「一条都没发出去」去报错。见 sendBubbles 里 `acted` 和 `sent` 的分工。
  */
 async function runReactPart(runner, space, part, ctx) {
   const scope = scopeOf(runner, "桥接");
   if (!ctx?.role?.reactSend?.enabled) {
     logInfo(scope, "这个角色没开「消息回应」，[react] 忽略");
-    return;
+    return false;
   }
 
   const emoji = String(part?.emoji ?? "").trim();
   const allow = Array.isArray(ctx.role.reactSend.emojis) ? ctx.role.reactSend.emojis : [];
   if (!allow.includes(emoji)) {
     logWarn(scope, `[react:${emoji}] 不在这个角色的 emoji 清单里，不贴`);
-    return;
+    return false;
   }
 
   // 没写「贴哪条」就贴对方最后一条
@@ -4558,15 +4596,17 @@ async function runReactPart(runner, space, part, ctx) {
         ? `[react:${emoji}:${part.spec}] 没在最近的消息里找到对应的那条，不贴`
         : `[react:${emoji}] 这条会话还没收到过消息，没东西可贴`
     );
-    return;
+    return false;
   }
 
   try {
     const { reaction } = await import("spectrum-ts");
     await space.send(reaction(emoji, target));
     logInfo(scope, `已给对方${part.spec ? `「${part.spec}」那条` : "最后一条"}贴上 ${emoji}`);
+    return true;
   } catch (e) {
     logWarn(scope, `[react:${emoji}] 贴不上去（本地 Mac 模式不支持消息回应）`, e);
+    return false;
   }
 }
 
@@ -4612,7 +4652,14 @@ function effectAllowed(ctx, key, scope) {
  * `spaceId` 是引用和撤回要的：两个环形缓冲都按它索引，没有就退化成
  * 「引用发不出去、撤回撤不了」，普通文字照发。
  *
- * @returns {Promise<number>} 真的发出去了几条消息。整轮 0 条时调用方要兜底
+ * @returns {Promise<{sent:number, acted:number, failed:string}>}
+ *   `sent` 是**新起的消息**条数（前端的「已回复」计数、主动消息的
+ *   `slot.awaiting` 都按它算）；`acted` 是**做成的事**条数，多算上
+ *   `[react:]` 和 `[undosend:]` 那两个不新起消息的；`failed` 只在
+ *   `acted === 0` 时非空，说明是什么没做成（给对方那句报错用）。
+ *
+ *   调用方该看 `acted` 而不是 `sent` —— 整条回复只有一个 `[react:❤️]` 是
+ *   完全正常的一轮（`sent` 是 0，`acted` 是 1），不该报错。
  */
 async function sendBubbles(runner, space, chat, text, ctx = {}) {
   const scope = scopeOf(runner, "桥接");
@@ -4641,6 +4688,28 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
   }
 
   let sent = 0;
+  /*
+   * `acted` 和 `sent` 不是一回事。
+   *
+   * `sent` 数的是**新起的消息**（前端「已回复」的计数、`slot.awaiting` 都按它
+   * 算）。但 `[react:❤️]` 和 `[undosend:1]` 不新起消息 —— 它们改的是已有气泡，
+   * 所以刻意不进 `sent`。
+   *
+   * 于是「整条回复只有一个 [react:❤️]」这种完全正常的一轮（对方说「晚安 你别
+   * 回我了」，角色贴一颗心就收尾）会走出 `sent === 0`，然后被调用方当成
+   * 「一条都没发出去」，凭空给对方发一句「图片没生成成功」—— 那一轮压根没有
+   * 图片。`acted` 就是为了分开这两件事：**做成了事**，和**发出了消息**。
+   *
+   * 失败的那几种（图没出来、表情包文件夹是空的、爱心贴不上去）一律不算
+   * `acted`，该报错的照样报。
+   */
+  let acted = 0;
+  /*
+   * 这一轮到底出现过哪几种标记。整轮什么都没做成时，报错那句话要靠它说清
+   * 「是什么没成」—— 原先那句话是猜的（一律归给出图失败），猜错了就变成一句
+   * 和事实无关的话发给对方，而真正的原因在控制台里也对不上号。
+   */
+  const tried = new Set();
   for (const [i, bubble] of bubbles.entries()) {
     await sleep(bubble.delay);
 
@@ -4703,6 +4772,7 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
       if (body) {
         await emit(body);
         sent += 1;
+        acted += 1;
       }
       logDebug(
         scope,
@@ -4715,17 +4785,20 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
       if (part.kind === "text") {
         await emit(part.text);
         sent += 1;
+        acted += 1;
         continue;
       }
       // 撤回不产出内容，也不需要打字指示器 —— 它撤的是刚发出去那条
       if (part.kind === "undo") {
-        await runUndoPart(runner, space, part, ctx);
+        tried.add("undo");
+        if (await runUndoPart(runner, space, part, ctx)) acted += 1;
         continue;
       }
       // 回应同理：贴的是对方那条已有的气泡，不是新起一条消息，
-      // 所以既不打 typing 也不计进 sent
+      // 所以既不打 typing 也不计进 sent（但算 acted，见上面那段）
       if (part.kind === "react") {
-        await runReactPart(runner, space, part, ctx);
+        tried.add("react");
+        if (await runReactPart(runner, space, part, ctx)) acted += 1;
         continue;
       }
       /*
@@ -4739,6 +4812,7 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
         /* ignore */
       }
       let ok;
+      tried.add(part.kind);
       if (part.kind === "audio") ok = await sendVoicePart(runner, space, part, ctx);
       else if (part.kind === "sticker") ok = await sendStickerPart(runner, space, part, ctx);
       else if (part.kind === "card") ok = await sendCardPart(runner, space, part, ctx);
@@ -4746,7 +4820,10 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
       else if (part.kind === "location") ok = await sendLocationPart(runner, space, part, ctx);
       else ok = await sendImagePart(runner, space, part, ctx);
       // 语音退化成文字时也算发出去了一条（sendVoicePart 里已经发过）
-      if (ok || part.kind === "audio") sent += 1;
+      if (ok || part.kind === "audio") {
+        sent += 1;
+        acted += 1;
+      }
     }
     logDebug(
       scope,
@@ -4763,7 +4840,33 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
     scope,
     `回复发完，共 ${bubbles.length} 条气泡、${sent} 条消息，花了 ${secsSince(startedAt)}s`
   );
-  return sent;
+  return { sent, acted, failed: failedKinds(tried, acted) };
+}
+
+/** 标记种类 → 报错那句话里怎么称呼它。只有会「整轮只剩这一个」的那几种。 */
+const KIND_NAMES = {
+  image: "图片",
+  sticker: "表情包",
+  audio: "语音",
+  card: "链接卡片",
+  music: "音乐卡片",
+  location: "位置",
+  react: "emoji 回应",
+  undo: "撤回",
+};
+
+/**
+ * 整轮一件事都没做成时，是**什么**没成。
+ *
+ * 只在 `acted === 0` 时有意义 —— 做成了一件事就不该报错，哪怕别的几件失败了
+ * （对方收到了东西，那一轮不是白的）。
+ *
+ * 返回空串表示「没有任何标记，纯文字却一条都没发出去」—— 那不该发生（文字
+ * 那条路只要 body 非空就 `sent += 1`），真出现了就是别的 bug，措辞上留个口子。
+ */
+function failedKinds(tried, acted) {
+  if (acted > 0 || !tried.size) return "";
+  return [...tried].map((k) => KIND_NAMES[k] ?? k).join("、");
 }
 
 /**

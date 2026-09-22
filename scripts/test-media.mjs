@@ -1805,6 +1805,72 @@ console.log("\n[壁纸：删除]");
   ok("内置壁纸删不掉，并且报的是「内置」而不是「找不到」");
 }
 
+console.log("\n[只改已有气泡的那一轮：不许当成失败]");
+{
+  /*
+   * 起因是一条真实的错报。对方说「晚安 你别回我了」，角色回了个
+   * `[react:❤️]` —— 爱心贴上去了，日志里却紧跟着一句「这轮一条消息都没能
+   * 发出去（多半是生成图片失败了）」，然后真给对方发了一条「这轮回复里只有
+   * 图片，而图片没生成成功」。那一轮压根没有图片。
+   *
+   * 根因是 `sendBubbles` 只往外报 `sent`（新起的消息条数），而 `[react:]` 和
+   * `[undosend:]` 刻意不计进 `sent`（它们改的是已有气泡，不新起消息）。于是
+   * 「只贴了个爱心」和「只有一张图且出图失败了」在调用方眼里一模一样，报错
+   * 那句话只能猜 —— 猜错了就是一句和事实无关的话发给对方。
+   *
+   * sendBubbles 不导出（它要 runner 和 space 两个活对象），所以这里按 test-proxy
+   * 那个路子验源码结构：三个调用点都得判 `acted`，报错那句话不许写死「图片」。
+   */
+  const src = fs.readFileSync(new URL("../server/src/imessage.js", import.meta.url), "utf8");
+
+  // 三个调用点：正常轮、IG 顺带那条、主动消息
+  const calls = src.match(/=\s*await sendBubbles\(/g) ?? [];
+  assert.equal(calls.length, 3, `sendBubbles 应该有 3 个调用点，实际 ${calls.length}`);
+  const destructured = src.match(/\{\s*sent,\s*acted,\s*failed\s*\}\s*=\s*await sendBubbles\(/g) ?? [];
+  assert.equal(destructured.length, 3, "三个调用点都该解出 { sent, acted, failed }");
+  ok("三个调用点都拿到了 acted，不是只看 sent");
+
+  // 报错的闸判 acted。`if (!sent)` 一个都不许剩下 —— 那就是这个 bug 本身
+  assert.equal((src.match(/if \(!acted\)/g) ?? []).length, 3, "三处兜底都该判 !acted");
+  ok("三处兜底判的是 acted（做成了事没有），不是 sent（发出了消息没有）");
+
+  /*
+   * 这句话曾经写死在代码里。留一条断言钉住它 —— 表情包失败、爱心贴不上去都会
+   * 走同一条兜底，说成「图片」就是在骗人。
+   */
+  assert.ok(!src.includes("多半是生成图片失败了"), "报错那句话不该写死「图片」");
+  assert.ok(src.includes("KIND_NAMES"), "该有一张「标记种类 → 中文名」的表");
+  ok("报错那句话说的是真的什么没成，不是写死「图片」");
+
+  /*
+   * `slot.awaiting` 和 messageCount 必须继续卡在 `sent` 上。
+   *
+   * 这是修这个 bug 时最容易顺手改错的地方：把它们一起改成 `acted` 的话，
+   * 「主动消息只贴了个爱心」会让 slot 进入「等对方回话」—— 可对方屏幕上什么
+   * 新东西都没有，那一等就是白等，后面的主动消息全堵住。
+   */
+  // 找**赋值**那一处，不是注释里提到它的那几处（所以带上行首缩进和分号）
+  const awaiting = src.indexOf("\n    slot.awaiting = true;");
+  assert.ok(awaiting > 0, "找不到 slot.awaiting = true; 那一行赋值");
+  const guard = src.lastIndexOf("if (!sent) {", awaiting);
+  assert.ok(guard > 0 && awaiting - guard < 700, "slot.awaiting 前面该有一道 if (!sent) 的闸");
+  assert.ok(
+    (src.match(/if \(sent\) runner\.messageCount \+= 1;/g) ?? []).length === 2,
+    "两处 messageCount 该卡在 sent 上（前端那是「已回复」的计数）"
+  );
+  ok("slot.awaiting 和 messageCount 继续卡在 sent 上（没有新消息就不该等对方回话）");
+
+  // 那两个函数得真的返回布尔，不然 acted 永远加不上
+  for (const fn of ["runReactPart", "runUndoPart"]) {
+    const at = src.indexOf(`async function ${fn}(`);
+    assert.ok(at > 0, `找不到 ${fn}`);
+    const body = src.slice(at, at + 2600);
+    assert.ok(body.includes("return true"), `${fn} 该在做成时 return true`);
+    assert.ok(body.includes("return false"), `${fn} 该在没做成时 return false`);
+  }
+  ok("runReactPart / runUndoPart 都会报「做成了没有」");
+}
+
 /* ================= 收尾 ================= */
 
 fs.rmSync(TMP, { recursive: true, force: true });
