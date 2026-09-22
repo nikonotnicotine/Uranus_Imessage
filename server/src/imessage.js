@@ -5586,9 +5586,12 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                * emoji 告诉模型」，收款是另一件事。用户没开「消息回应」不代表
                * 他不想收款，卡在闸后面会让这个功能在大多数角色上悄悄失效。
                *
-               * 收款成功了就攒一句提示（走和背景变更、tapback 同一条路：
+               * 收款成功了默认只攒一句提示（走和背景变更、tapback 同一条路：
                * 不当场回一轮，等这个人下条真消息进来时一起送）—— 贴个 emoji
                * 收钱太轻了，当场回等于角色被一次点击勾着说话。
+               *
+               * 角色开了「收款后立刻通知」（transfer.notifyOnClaim，默认关）
+               * 就当场起一轮，见下面那个分叉。
                */
               const claimed = await claimTransferOnReact(
                 runner,
@@ -5600,13 +5603,25 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                 // 用**那笔存下来的**符号，不读当前配置：告诉模型的金额和卡片上一致
                 const money = formatAmount(claimed.amount, claimed.currency);
                 const memo = claimed.note ? `（${claimed.note}）` : "";
-                noteReaction(
-                  runner,
-                  peerKeyOf(peer),
-                  "",
-                  "",
-                  `[系统提示:{{user}}收下了你转的 ${money}${memo}]`
-                );
+                const hint = `[系统提示:{{user}}收下了你转的 ${money}${memo}]`;
+                /*
+                 * 开了「收款后立刻通知」就当场起一轮，否则照旧攒着。
+                 *
+                 * 立刻那一路走 enqueue 而不是直接 handleTurn：合并窗口正是这儿要的
+                 * —— 对方常常贴完表情紧接着就打字过来（「收到啦」），走队列的话这
+                 * 两件事并成同一轮，角色只回一次。直接开一轮会先回一句「钱收到了
+                 * 吧」，紧接着又为那句「收到啦」回第二轮。
+                 *
+                 * `message` 不往 item 里放：那是给已读回执用的，而这条 reaction
+                 * 不是一条能标已读的消息（它没有正文，对方屏幕上也没有未读）。
+                 * 真正的未读在下条消息进来时自然会带上它自己的 message。
+                 */
+                if (who?.transfer?.notifyOnClaim) {
+                  logInfo(scope, "开了「收款后立刻通知」，这就让角色回一句");
+                  enqueue(getConfig, runner, space, spaceId, { text: hint }, peer);
+                } else {
+                  noteReaction(runner, peerKeyOf(peer), "", "", hint);
+                }
                 continue;
               }
 

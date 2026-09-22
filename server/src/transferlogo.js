@@ -70,15 +70,19 @@ export const LOGO_EXTS = [".svg", ".png", ".jpg", ".jpeg", ".webp"];
  * 宽度一律 600：那张图在气泡里就两三百像素宽，600 够 Retina 了，再大只是白白
  * 多走几十 KB 的 gRPC。
  *
- * ── 为什么 icon 那档的留白是偏的 ──
+ * ── 两档留白都是对称的（icon 那档原来不是）──
  *
  * `imageTitle` 协议上必须和 `image` 一起给（见文件头），而它是**压在图下边缘的
- * 一行浮字**。banner 那档图高 300，那行字落在图外的下缘上，碍不着谁；压到 156
- * 之后就会直接盖在 logo 上。所以 icon 那档把留白挪到下面（上 18、下 66），
- * logo 坐在偏上的位置，底下那条空带子留给那行字。
+ * 一行浮字**。1.2.4 的 icon 那档因此把留白挪到了下面（上 18、下 66），想给那行
+ * 字腾一条空带子出来。
  *
- * 66 是按「气泡里显示成 ~30pt」估的，没在真机上量过 —— 真机上那行字压得更高
- * 或更低都有可能，到时候调这一个数就行。
+ * 真机上看下来这么做是错的：logo 明显偏上（中心落在 34.6% 而不是 50%），而那行
+ * 字并没有真把 logo 盖掉 —— banner 那档从一开始就是 48/48/48 对称的、那行字同样
+ * 压在图上，用户看着没问题。也就是说那行字比我当初估的矮得多，「66」那个数是凭
+ * 空估出来的（当时就在注释里标着没量过），不是量出来的。
+ *
+ * 所以 icon 改成 42/42 对称：**留白框的高度和原来一样是 72**，logo 尺寸一点不变，
+ * 只是回到正中间。底下仍然有 42px 给那行字，比 banner 那档的相对余量还宽松。
  *
  * `logo` 高度一律由 `boxH` 卡住，所以 icon 那档不管原图什么比例，出来都是同样
  * 高的一条 —— 方图变成个小方块，长条 logo 变成一条窄横幅（Chase 那种 5.4:1
@@ -86,7 +90,7 @@ export const LOGO_EXTS = [".svg", ".png", ".jpg", ".jpeg", ".webp"];
  */
 const CANVAS = {
   banner: { w: 600, h: 300, padX: 48, padTop: 48, padBottom: 48 },
-  icon: { w: 600, h: 156, padX: 24, padTop: 18, padBottom: 66 },
+  icon: { w: 600, h: 156, padX: 24, padTop: 42, padBottom: 42 },
 };
 
 /** 默认哪一档。保持 1.2.3 出厂时的样子 —— 换默认值等于悄悄改了所有人的卡片。 */
@@ -115,6 +119,107 @@ const MAX_BYTES = 256 * 1024;
 
 /** 渲染结果缓存：`路径|mtime|背景色|档位` → JPEG Buffer。 */
 const cache = new Map();
+
+/**
+ * SVG 自己声明的尺寸最大认到这儿。
+ *
+ * 不是「太大画不下」的意思 —— 是**大到分配不出那块位图时 skia 会把进程打死**
+ * （见 safeSvgBytes）。10000 远超任何 logo 的合理值。
+ */
+const SVG_MAX_DECLARED_PX = 10000;
+
+/** 自己接管光栅化尺寸时，按 viewBox 的比例把长边拉到这么大。两档画布都是 600 宽，1200 够 2× 了。 */
+const SVG_RASTER_PX = 1200;
+
+/** 根标签上取一个属性值（单双引号都认）。取不到返回 null。 */
+function svgAttr(tag, name) {
+  const m = new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i").exec(tag);
+  return m ? (m[2] ?? m[3]) : null;
+}
+
+/**
+ * 属性值 → 像素数，**只认能当像素用的那种**。
+ *
+ * 纯数字和 `px` 认；`%` / `em` / `pt` 一律当「认不出来」（它们要看上下文才能算成
+ * 像素，而 skia 对这些的处理各不相同 —— 实测 `50em` 会得到一张 0 高的图）。
+ * 认不出来、非正数、大得离谱的，全都返回 null，由调用方自己算一对出来。
+ */
+function svgPx(raw) {
+  const m = /^\s*([+-]?[\d.]+)\s*(px)?\s*$/i.exec(String(raw ?? ""));
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0 || n > SVG_MAX_DECLARED_PX) return null;
+  return n;
+}
+
+/** `viewBox="minX minY w h"` → `{w, h}`。宽高不是正数就当没有。 */
+function svgViewBox(tag) {
+  const parts = String(svgAttr(tag, "viewBox") ?? "")
+    .trim()
+    .split(/[\s,]+/)
+    .map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) return null;
+  const [, , w, h] = parts;
+  return w > 0 && h > 0 ? { w, h } : null;
+}
+
+/**
+ * 根标签上那对 width/height 不可信，先弄干净再交给 skia。
+ *
+ * ── 为什么非得管这件事 ──
+ *
+ * 那两个属性是**光栅化的目标尺寸**，skia 拿它直接去分配位图。而导出工具写出来的
+ * 数值什么都有 —— 自带素材里那张 Venmo 的官方 svg 就写着 `height="-1503"`。
+ *
+ * 负数、以及大到分配不出来的数，都会让 skia 在**原生层** abort：
+ *
+ *   ../../src/core/SkBitmap.cpp(262): fatal error:
+ *   "assertf(this->tryAllocPixels(info, rowBytes)): … [w:2500 h:-1503] rb:0"
+ *
+ * 这不是一个能 catch 的异常，是**整个 node 进程当场没了**。也就是说选了这么一张图
+ * 当 logo，一发转账服务就挂 —— renderLogo 那圈「失败只记一条 warn、绝不抛错」
+ * 压根轮不到执行。而「传一张自己的 logo」这个入口就摆在界面上。
+ *
+ * ── 怎么弄干净 ──
+ *
+ * 两个数都正常就**原样放过**，一个字节不动（已经好好工作的那些图不受影响）。
+ *
+ * 否则按 viewBox 的比例自己算一对。顺手也治了另一类常见 svg：图标库那种
+ * `viewBox="0 0 24 24"` 压根不写 width/height 的，原来会按 24×24 光栅化，而这儿的
+ * 缩放**只缩不放**（见 renderLogo），出来就是画布正中间一个小点。
+ *
+ * 连 viewBox 都算不出来就把那两个属性**删掉**：没有替代值可用，至少不让那串数字
+ * 落到 skia 手上。结果是 0×0，renderLogo 那道判断接得住，卡片退化成不带图。
+ *
+ * @param {Buffer} buf 文件字节
+ * @param {boolean} isSvg 位图不用管（它们的尺寸在像素数据里，不是一行文本属性）
+ * @returns {Buffer} 能安全交给 loadImage 的字节
+ */
+function safeSvgBytes(buf, isSvg) {
+  if (!isSvg) return buf;
+  const text = buf.toString("utf-8");
+  const m = /<svg\b[^>]*>/i.exec(text);
+  if (!m) return buf; // 后缀是 svg 但内容不是，让 loadImage 自己去抛
+  const tag = m[0];
+
+  if (svgPx(svgAttr(tag, "width")) !== null && svgPx(svgAttr(tag, "height")) !== null) return buf;
+
+  const box = svgViewBox(tag);
+  let attrs = "";
+  if (box) {
+    const k = SVG_RASTER_PX / Math.max(box.w, box.h);
+    const w = Math.max(1, Math.round(box.w * k));
+    const h = Math.max(1, Math.round(box.h * k));
+    attrs = ` width="${w}" height="${h}"`;
+  }
+
+  // 先把原来那两个摘掉（写两遍才能连单引号的一起摘），再把算出来的插在收尾符号前面
+  const clean = tag
+    .replace(/\s(width|height)\s*=\s*"[^"]*"/gi, "")
+    .replace(/\s(width|height)\s*=\s*'[^']*'/gi, "")
+    .replace(/\/?>$/, (end) => `${attrs}${end}`);
+  return Buffer.from(text.slice(0, m.index) + clean + text.slice(m.index + tag.length), "utf-8");
+}
 
 /** 一个文件夹里合法的 logo 文件。读不了就当空的。 */
 function scanDir(dir) {
@@ -229,7 +334,13 @@ export async function renderLogo(file, opts = {}) {
      * `await import("spectrum-ts")` 那儿。
      */
     const { createCanvas, loadImage } = await import("@napi-rs/canvas");
-    const img = await loadImage(await fs.promises.readFile(full));
+    /*
+     * 过一道 safeSvgBytes 再交给 skia：svg 根标签上那对 width/height 是光栅化的
+     * 目标尺寸，负数或者大得离谱会让 skia 在原生层 abort —— **整个进程没了**，
+     * 下面那个 catch 压根轮不到。自带的 Venmo.svg 就写着 height="-1503"。
+     */
+    const isSvg = path.extname(full).toLowerCase() === ".svg";
+    const img = await loadImage(safeSvgBytes(await fs.promises.readFile(full), isSvg));
     if (!(img.width > 0) || !(img.height > 0)) {
       logWarn(scope, `这个 logo 读出来是 0×0：${file}（这张卡片不带图）`);
       return null;
@@ -252,8 +363,11 @@ export async function renderLogo(file, opts = {}) {
     const w = Math.max(1, Math.round(img.width * k));
     const h = Math.max(1, Math.round(img.height * k));
     /*
-     * 横向居中，纵向在留白框里居中 —— icon 那档上下留白不一样（下面那条空带子
-     * 留给 imageTitle），所以这儿不能拿 box.h 算，得按 padTop 起算。
+     * 横向居中，纵向在留白框里居中。
+     *
+     * 按 `padTop` 起算而不是拿 `box.h` 算：两档现在留白都是对称的，这么写结果
+     * 一样，但 padTop / padBottom 是两个独立的数 —— 哪天又要给某档留条偏的带子
+     * （1.2.4 的 icon 就是那样，见 CANVAS），这儿不用跟着改。
      */
     ctx.drawImage(
       img,

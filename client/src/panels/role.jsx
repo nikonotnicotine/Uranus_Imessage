@@ -2137,8 +2137,10 @@ const logoFileUrl = (file) => `/api/transfer-logo/file/${encodeURIComponent(file
 /**
  * 预览格子的几何，和服务端那两档画布一一对应（`transferlogo.js` 里的 `CANVAS`）。
  *
- * 数字是那边的 padding 折成百分比。**icon 那档下面留得比上面宽得多** —— 那条空带子
- * 是给卡片上那行浮字让位的，预览里照样留出来，不然用户以为 logo 是居中的。
+ * 数字是那边的 padding 折成百分比（`48/300` = 16%、`42/156` = 26.9%……）。两档
+ * 现在都是上下对称的 —— icon 那档 1.2.4 时是偏的（上 11.5% 下 42.3%），因为想给
+ * 卡片上那行浮字腾一条空带子，真机上看下来 logo 只是偏上、那行字并没盖住它，
+ * 1.2.6 改回居中了。
  *
  * 用 `inset` 而不是 `padding`：CSS 里百分比的 padding **上下也按宽度算**，
  * 600 宽的格子上写 `paddingTop: 16%` 得到 96px 而不是 48px。`top`/`bottom`
@@ -2146,7 +2148,7 @@ const logoFileUrl = (file) => `/api/transfer-logo/file/${encodeURIComponent(file
  */
 const LOGO_TILE = {
   banner: { ratio: "600 / 300", inset: { left: "8%", right: "8%", top: "16%", bottom: "16%" } },
-  icon: { ratio: "600 / 156", inset: { left: "4%", right: "4%", top: "11.5%", bottom: "42.3%" } },
+  icon: { ratio: "600 / 156", inset: { left: "4%", right: "4%", top: "26.9%", bottom: "26.9%" } },
 };
 
 /**
@@ -2539,6 +2541,30 @@ function RoleTransferFields({ role }) {
           label="贴表情算收款"
         />
       </label>
+
+      {/*
+        收款通知的时机。只在「贴表情算收款」开着时才出现 —— 没有收款这件事就没有
+        「什么时候通知」可言（和这个面板里别处依赖字段一个写法，比如已读不回那段）。
+      */}
+      {tr.confirmOnReact !== false && (
+        <label className="flex items-start justify-between gap-4">
+          <span className="min-w-0">
+            <span className="block text-ui text-ink">收款后立刻通知角色</span>
+            <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+              开着的话你一收款，角色<b>当场</b>就回一句（「钱收到了吧」那种）。
+              <br />
+              关着（默认）只记一句「{"{{user}}"}已收款」，等你<b>下次发消息</b>时一起送进去
+              —— 贴个表情就把人勾出来说话有点太轻了，而且收完款你多半自己就接着打字了，
+              那时候这句提示正好跟着你的话一起进去。
+            </span>
+          </span>
+          <Switch
+            checked={Boolean(tr.notifyOnClaim)}
+            onChange={(v) => updateRole(role.id, { transfer: { ...tr, notifyOnClaim: v } })}
+            label="收款后立刻通知"
+          />
+        </label>
+      )}
     </div>
   );
 }

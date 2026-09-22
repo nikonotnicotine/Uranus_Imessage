@@ -1590,6 +1590,21 @@ function normalizeTransfer(input) {
     // 对方贴 emoji 时要不要把卡片改成「已收款」。默认开 —— 这是这个功能
     // 最像真转账的一步，而且它只是改一张自己发出去的卡片，不外溢
     confirmOnReact: input?.confirmOnReact === undefined ? true : Boolean(input.confirmOnReact),
+    /*
+     * 收款之后要不要**立刻**让角色说句话。
+     *
+     * 关（默认）：只攒一句 `[系统提示:{{user}}收下了你转的 ￥x]`，等这个人下次
+     * 真的发消息进来时一起送 —— 和背景变更、贴 tapback 同一个待遇
+     * （imessage.js:noteReaction）。
+     *
+     * 开：当场起一轮，角色立刻回一句。
+     *
+     * **默认关**，理由和 tapback 不当场回是同一条：贴个 emoji 就把角色勾出来说话
+     * 太轻了。何况收款这个动作常常是对方顺手一贴，紧接着自己就会打字过来 ——
+     * 那时候攒着的那句提示正好跟着他的话一起进去，时间上就是同一次「轮到你说话」。
+     * 想要「转完钱立刻收到一句谢谢」的人自己点开。
+     */
+    notifyOnClaim: Boolean(input?.notifyOnClaim),
   };
 }
 

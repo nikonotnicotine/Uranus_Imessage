@@ -358,7 +358,7 @@ okWith("货币符号一直传到卡片的槽里（金额和兜底文案两处都
 
 section("缩略图（transferlogo.js）");
 
-okWith("自带那两个素材在清单里，而且标着 builtin", () => {
+okWith("自带素材在清单里，而且标着 builtin", () => {
   const files = TL.listLogos();
   assert.ok(files.length >= 2, "assets/transfer-logos/ 里应该有自带素材");
   assert.ok(files.every((l) => l.builtin === true), "这会儿用户目录还是空的");
@@ -502,6 +502,153 @@ okWith("normalizeLogoStyle 只认那两档", () => {
   assert.equal(TL.DEFAULT_LOGO_STYLE, "banner", "换默认值等于悄悄改了所有人的卡片");
   assert.deepEqual(TL.LOGO_STYLES, ["banner", "icon"]);
 });
+
+/*
+ * **自带的每一张都得能渲出来。**
+ *
+ * 这条不是「多测一遍」—— 它防的是一类会**把整个进程打死**的输入。svg 根标签上
+ * 那对 width/height 是光栅化的目标尺寸，skia 拿它直接去分配位图，负数或者大到
+ * 分配不出来的数会让它在**原生层** abort：
+ *
+ *   ../../src/core/SkBitmap.cpp(262): fatal error: "assertf(…) [w:2500 h:-1503]"
+ *
+ * 不是异常，catch 不到，node 当场没了。自带的 Venmo.svg 官方导出就写着
+ * `height="-1503"`，所以 transferlogo.js:safeSvgBytes 在交给 skia 之前先弄干净。
+ *
+ * 真要是回归了，这个测试进程也会被一起打死 —— 那样收尾那句「N 项全部通过」
+ * 压根不会打出来，照样是响亮的失败。
+ */
+{
+  const all = TL.listBuiltinLogos().map((l) => l.file);
+  const bufs = [];
+  for (const f of all) bufs.push([f, await TL.renderLogo(f, { style: "icon" })]);
+  if (bufs.every(([, b]) => b)) {
+    okWith(`自带那 ${all.length} 张全都渲得出来（负数/离谱尺寸不许打死进程）`, () => {
+      for (const [f, b] of bufs) {
+        assert.equal(b.subarray(0, 2).toString("hex"), "ffd8", `${f} 不是 JPEG`);
+        assert.ok(b.length > 500, `${f} 只有 ${b.length} 字节，像是渲空了`);
+      }
+      assert.ok(
+        all.some((f) => f.toLowerCase().startsWith("venmo")),
+        "Venmo.svg 得留在自带素材里 —— 它就是那张负高度的样本"
+      );
+    });
+  }
+}
+
+/**
+ * 把渲出来的 JPEG 读回去，量**墨迹**落在哪几行（占画布高度的百分比）。
+ *
+ * 验「图摆在哪儿」只能这么验：字节数看不出偏心，而画布尺寸是固定的，
+ * 两档都一样高的那条带子里 logo 偏上偏下全看这个。
+ *
+ * 底色是纯白，离白够远就算墨迹（JPEG 有压缩噪点，留 24 的余量）。
+ * 装不上 @napi-rs/canvas 的机器上调不到这儿 —— 调用方先判了 buf 是不是 null。
+ */
+async function inkBand(buf) {
+  const { createCanvas, loadImage } = await import("@napi-rs/canvas");
+  const img = await loadImage(buf);
+  const c = createCanvas(img.width, img.height);
+  const x = c.getContext("2d");
+  x.drawImage(img, 0, 0);
+  const d = x.getImageData(0, 0, img.width, img.height).data;
+  let top = -1;
+  let bot = -1;
+  for (let y = 0; y < img.height; y += 1) {
+    for (let px = 0; px < img.width; px += 1) {
+      const i = (y * img.width + px) * 4;
+      if (255 - d[i] > 24 || 255 - d[i + 1] > 24 || 255 - d[i + 2] > 24) {
+        if (top < 0) top = y;
+        bot = y;
+        break;
+      }
+    }
+  }
+  const pct = (v) => Number(((v / img.height) * 100).toFixed(1));
+  return { h: img.height, top: pct(top), bottom: pct(bot), center: pct((top + bot) / 2) };
+}
+
+/*
+ * safeSvgBytes 的分档，拿现造的 svg 走一遍真渲染（`renderLogo` 只收文件名，
+ * 所以先落到用户目录里再删）。
+ *
+ * 四种输入的期望不一样：
+ *  - 正常的 → 原样放过；
+ *  - 负数 / 离谱大 → 按 viewBox 自己算一对（要点是**别崩**）；
+ *  - 只有 viewBox → 也按 viewBox 算（顺手治了图标库那种 24×24 的，
+ *    原来会被「只缩不放」留成画布中间一个小点）；
+ *  - 什么都没有 → 摘掉那两个属性，0×0，退化成不带图。
+ */
+{
+  const svgOf = (attrs) =>
+    `<svg xmlns="http://www.w3.org/2000/svg" ${attrs}><rect x="10" y="10" width="80" height="30" fill="#07c160"/></svg>`;
+  const render = async (attrs) => {
+    const name = TL.saveLogo(`探${Math.random().toString(36).slice(2, 7)}.svg`, Buffer.from(svgOf(attrs)).toString("base64"), "image/svg+xml");
+    const buf = await TL.renderLogo(name, { style: "icon" });
+    TL.removeLogo(name);
+    return buf;
+  };
+
+  const good = await render('viewBox="0 0 100 50" width="400" height="200"');
+  const neg = await render('viewBox="0 0 100 50" width="2500" height="-1503"');
+  const huge = await render('viewBox="0 0 100 50" width="200" height="1e9"');
+  const boxOnly = await render('viewBox="0 0 24 24"');
+  const nothing = await render('fill="#07c160"');
+
+  if (good && neg && huge) {
+    /*
+     * 比的是**墨迹落在哪儿**，不是字节数：正常那张按 400×200 光栅化、重算的按
+     * 1200×600，缩到同一块画布上抗锯齿的细节不同，JPEG 大小差个几百字节是正常的。
+     * 真正该一致的是「这个 rect 占了画布的哪一段」。
+     */
+    const bands = [await inkBand(good), await inkBand(neg), await inkBand(huge)];
+    okWith("svg 声明的尺寸是负数 / 大得离谱时按 viewBox 重算，不崩", () => {
+      for (const b of [good, neg, huge]) assert.equal(b.subarray(0, 2).toString("hex"), "ffd8");
+      const [g, n, h] = bands;
+      assert.deepEqual(n, g, "负数那张该和正常声明的落在同一段");
+      assert.deepEqual(h, g, "离谱大那张也一样");
+    });
+  }
+
+  okWith("只写 viewBox（图标库那种）也认，不会留成画布中间一个小点", () => {
+    assert.ok(boxOnly);
+    assert.equal(boxOnly.subarray(0, 2).toString("hex"), "ffd8");
+  });
+
+  okWith("尺寸和 viewBox 都没有 → 退化成不带图（0×0，不是崩）", () => {
+    assert.equal(nothing, null);
+  });
+}
+
+/*
+ * 两档留白**都是对称的**，logo 得落在画布正中间。
+ *
+ * 1.2.4 的 icon 那档是偏的（上 18、下 66），想给 imageTitle 那行浮字腾条空带子；
+ * 真机上看下来 logo 只是偏上、那行字并没盖住它，1.2.6 改回 42/42 对称。
+ * 这里把渲出来的 JPEG 读回去量墨迹的上下边界 —— 这是唯一能验「真的居中」的办法，
+ * 光看字节数看不出偏心。
+ */
+{
+  const probe = async (file, style) => {
+    const buf = await TL.renderLogo(file, { style });
+    return buf ? inkBand(buf) : null;
+  };
+  const all = TL.listBuiltinLogos().map((l) => l.file);
+  const bands = [];
+  for (const f of all) {
+    bands.push([f, await probe(f, "icon"), await probe(f, "banner")]);
+  }
+
+  if (bands.every(([, i, b]) => i && b)) {
+    okWith("两档都把 logo 摆在画布正中间（icon 那档 1.2.4 时偏上到 34.6%）", () => {
+      for (const [f, icon, banner] of bands) {
+        // 留 1.5% 的余量：缩放取整 + JPEG 噪点，量出来不会正好是 50.0
+        assert.ok(Math.abs(icon.center - 50) < 1.5, `${f} 的 icon 墨迹中心在 ${icon.center}%`);
+        assert.ok(Math.abs(banner.center - 50) < 1.5, `${f} 的 banner 墨迹中心在 ${banner.center}%`);
+      }
+    });
+  }
+}
 
 /*
  * 真渲一张自带的 SVG 出来。
@@ -932,6 +1079,24 @@ okWith("角色默认不开转账（不该由一次误触发生）", () => {
   assert.equal(role.transfer.enabled, false);
   assert.equal(role.transfer.appName, "");
   assert.equal(role.transfer.confirmOnReact, true); // 这一个默认开
+  // 收款后**不**当场回一轮：贴个 emoji 就把角色勾出来说话太轻了
+  assert.equal(role.transfer.notifyOnClaim, false);
+});
+
+/*
+ * 「收款后立刻通知」默认关，而且缺字段不能变成开。
+ *
+ * `confirmOnReact` 那个是 `=== undefined ? true :`，这个是直接 `Boolean()` ——
+ * 两条路反着写，老配置里都没这两个字段，所以各自都得盯一眼。
+ */
+okWith("notifyOnClaim 默认关，认布尔（老配置里没这个字段）", () => {
+  const on = (v) =>
+    C.normalizeConfig({ roles: [{ id: "r0", name: "x", transfer: { notifyOnClaim: v } }] }).roles[0]
+      .transfer.notifyOnClaim;
+  assert.equal(on(true), true);
+  for (const junk of [undefined, null, false, "", 0]) {
+    assert.equal(on(junk), false, `${junk} 不该把它打开`);
+  }
 });
 
 okWith("appName 截到 40 字", () => {
@@ -1156,6 +1321,33 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
     assert.ok(claim.includes("style: hit.logoStyle"), "改的时候没按存下来那档渲");
     assert.ok(!claim.includes("renderLogo(role"), "改的时候不许读当前配置");
     assert.ok(!claim.includes("role.transfer.logoStyle"), "改的时候不许读当前配置的档位");
+  });
+
+  /*
+   * 收款之后那句提示，**默认攒着、开了才当场回**。
+   *
+   * 两条路各自都有能悄悄坏掉的方式：
+   *  - 默认那路要走 noteReaction 的 hint 口子（攒进 reactPending，等这个人
+   *    下条真消息一起送）；
+   *  - 开了的那路要走 **enqueue** 而不是直接 handleTurn —— 合并窗口正是这儿
+   *    要的：对方常常贴完表情紧接着来一句「收到啦」，走队列两件事并成一轮。
+   *    绕过队列的话角色会先回一句「钱收到了吧」，再为那句「收到啦」回第二轮。
+   *
+   * 而且那个 item 里**不许放 message**：那是给已读回执用的，这条 reaction
+   * 没有正文、对方屏幕上也没有未读可标。
+   */
+  okWith("收款提示默认攒着，开了 notifyOnClaim 才走 enqueue 当场回一轮", () => {
+    const at = src.indexOf("const claimed = await claimTransferOnReact(");
+    assert.ok(at > 0, "找不到收款那段");
+    const body = src.slice(at, at + 1800);
+    assert.ok(body.includes("who?.transfer?.notifyOnClaim"), "找不到那道分叉");
+    assert.ok(
+      body.includes("enqueue(getConfig, runner, space, spaceId, { text: hint }, peer)"),
+      "立刻通知那路该走 enqueue（要合并窗口），而且 item 里不带 message"
+    );
+    assert.ok(body.includes("noteReaction(runner, peerKeyOf(peer)"), "默认那路该攒进 reactPending");
+    // 两句提示得是同一份 —— 分叉只决定什么时候送，不该送出两种说法
+    assert.equal(body.match(/收下了你转的/g)?.length, 1, "提示文案该只拼一次");
   });
 
   okWith("已经收过的不重复处理（重复贴表情不该让卡片闪一下）", () => {

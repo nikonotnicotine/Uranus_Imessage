@@ -267,6 +267,23 @@ function blankRole(projectRef = "") {
     dropCount: 1,
     presetRef: "",
     worldBookRefs: [],
+    /*
+     * 转账卡片：功能本身默认关（`enabled` 不写 = falsy），但**新角色**出厂
+     * 先挑好一张图 —— 内置的 Apple Pay，压成小图标那一档。
+     *
+     * 这儿**故意和后端的 normalizeTransfer 不一致**（那边是「不带图 + 横幅」），
+     * 两者管的不是同一批角色：
+     *
+     *   blankRole          只影响**这一刻新建**的角色 —— 还没人配过，给个好看的起点
+     *   normalizeTransfer  兜所有**已经存在**的角色 —— 换它的默认值等于悄悄改了
+     *                      别人早就配好的卡片（transferlogo.js:DEFAULT_LOGO_STYLE
+     *                      那句注释说的就是这件事）
+     *
+     * 只列和后端默认值不同的那两个字段，剩下六个（enabled / appName / currency /
+     * logoBg / confirmOnReact / notifyOnClaim）让后端填 —— 全抄一遍的话哪天后端
+     * 改了某个默认值，新角色会被这儿钉在旧值上。
+     */
+    transfer: { logo: "Apple Pay.svg", logoStyle: "icon" },
   };
 }
 
