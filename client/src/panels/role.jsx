@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   CATEGORY_LABELS,
+  SPY_SWITCHES,
   describeRef,
   modelLabel,
   modelOptions,
@@ -15,6 +16,7 @@ import {
   resolveUser,
   roleBlockReason,
   roleLabel,
+  spySwitchesOn,
   userLabel,
   worldBookLabel,
 } from "../labels.js";
@@ -382,12 +384,14 @@ function RoleSearchFields({ role, onGoto }) {
  * 光说「开」看不出开的是哪一头。
  */
 function spyBadge(spy) {
-  const pc = Boolean(spy?.pcEnabled);
-  const phone = Boolean(spy?.phoneEnabled);
-  if (pc && phone) return "电脑+手机";
-  if (pc) return "电脑";
-  if (phone) return "手机";
-  return "关";
+  const { on } = spySwitchesOn(spy);
+  if (!on.length) return "关";
+  /*
+   * 五个全开时不逐个列 —— 折叠标题那一行放不下「电脑查岗+手机查岗+查看手机里的
+   * 东西+操控手机+让角色放歌」，而且那串字读起来还不如「全开」直观。
+   */
+  if (on.length === SPY_SWITCHES.length) return "全开";
+  return on.join("+");
 }
 
 /**
@@ -416,7 +420,12 @@ function RoleSpyFields({ role, onGoto }) {
 
   const pcOn = Boolean(spy.pcEnabled);
   const phoneOn = Boolean(spy.phoneEnabled);
-  const anyOn = pcOn || phoneOn;
+  const viewOn = Boolean(spy.phoneViewEnabled);
+  const controlOn = Boolean(spy.phoneControlEnabled);
+  const musicOn = Boolean(spy.phoneMusicEnabled);
+  // 手机里那三组任一开着，都要那套 SMTP 凭据 —— 和手机屏幕查岗走的是同一条腿
+  const needsPhone = phoneOn || viewOn || controlOn || musicOn;
+  const anyOn = pcOn || needsPhone;
   // 任一条腿打开时都要把预设里那条子条目一并打开，不然开关开了也不注入
   const turnOn = (patch) => {
     set(patch);
@@ -490,6 +499,50 @@ function RoleSpyFields({ role, onGoto }) {
         />
       </label>
 
+      {/*
+        手机**里面**那三组。和上面两个屏幕开关分开摆（中间一条横线），因为
+        它们是另一回事：上面是「看一眼他屏幕现在长什么样」，这三个是「替他
+        打开某个 App」和「动他的手机」。
+
+        文案从 labels.js:SPY_SWITCHES 读 —— 五个开关的 label 和说明只该有一份，
+        badge（spyBadge）和这儿各写一遍迟早会走岔。
+      */}
+      <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
+        <div>
+          <p className="text-ui text-ink">手机里面</p>
+          <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
+            上面两个只看一眼屏幕。这三个是让角色
+            <strong className="text-ink-soft">替你打开某个 App</strong>
+            、或者<strong className="text-ink-soft">直接动你的手机</strong>
+            ，走的是和手机查岗同一条邮件链路（所以也要下面那套凭据和快捷指令，
+            <strong className="text-ink-soft">而且每一项各要一条自己的快捷指令</strong>
+            ）。
+          </p>
+        </div>
+
+        {SPY_SWITCHES.slice(2).map((s) => (
+          <label key={s.field} className="flex items-start justify-between gap-4">
+            <span className="min-w-0">
+              <span className="block text-ui text-ink">{s.label}</span>
+              <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                允许这个角色写
+                <code className="mx-1 bg-sunken px-1">{s.tag}</code>
+                这样的标签。{s.hint}
+              </span>
+            </span>
+            <Switch
+              checked={Boolean(spy[s.field])}
+              onChange={(v) => turnOn({ [s.field]: v })}
+              label={`启用${s.label}`}
+            />
+          </label>
+        ))}
+
+        {musicOn && (
+          <PlaylistFields playlists={smtp.playlists} updateSpyApi={updateSpyApi} />
+        )}
+      </div>
+
       {anyOn && (
         <div className="grid grid-cols-1 gap-6">
           <p className="text-meta leading-relaxed text-ink-faint">
@@ -562,7 +615,7 @@ function RoleSpyFields({ role, onGoto }) {
           </div>
           )}
 
-          {phoneOn && (
+          {needsPhone && (
           <div className="grid grid-cols-1 gap-5 border-t border-line pt-5">
             <div>
               <p className="text-ui text-ink">手机那头</p>
@@ -695,6 +748,14 @@ function RoleSpyFields({ role, onGoto }) {
           </div>
           )}
 
+          {/*
+            自动回退和那两份模板**只管屏幕查岗**，所以整块只在屏幕那两个开关
+            任一开着时才出现：手机里那三组没有「另一头」可倒（`[查岗手机:支付宝
+            账单]` 没看到不能改成「那看看微信吧」，见 imessage.js:phoneRound），
+            模板也是另外一套写死的（spy.js:PHONE_* 那几份）。只开「放歌」的人
+            看到一栏「两头都没看到时」只会莫名其妙。
+          */}
+          {(pcOn || phoneOn) && (
           <div className="grid grid-cols-1 gap-5 border-t border-line pt-5">
             {/*
               自动回退**只在两条腿都开着时才有意义** —— 只开一条腿的话它无处可倒
@@ -786,8 +847,85 @@ function RoleSpyFields({ role, onGoto }) {
               />
             </Field>
           </div>
+          )}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * 预设歌单那一栏（`[操控手机:预设歌单 睡前]` 用的）。
+ *
+ * **为什么要用户自己填**：歌单 ID 是一串数字，没有公开接口能按名字查到用户
+ * 自己收藏的歌单（点歌能搜是因为单曲有公开搜索接口）。所以名字给模型认、
+ * ID 给快捷指令用，两样都得他填一次。详见 config.js:normalizeSpyPlaylists。
+ *
+ * 存在全局 spyApi 上而不是角色上：和 SMTP 凭据一样，它描述的是「用户那部手机
+ * 里的网易云」，所有角色共用一份。
+ *
+ * ID 那一栏**接受整条分享链接**（服务端会抠出数字），所以 placeholder 摆的是
+ * 链接而不是裸数字 —— 用户手上现成有的就是链接。
+ */
+function PlaylistFields({ playlists, updateSpyApi }) {
+  const list = Array.isArray(playlists) ? playlists : [];
+  // 末尾永远留一行空的，不用先点「加一个」再填（和别处那些清单一个路子）
+  const rows = [...list, { name: "", id: "" }];
+  const write = (rows2) =>
+    updateSpyApi({ playlists: rows2.filter((r) => r.name.trim() || String(r.id).trim()) });
+
+  return (
+    <div className="grid grid-cols-1 gap-3 rounded border border-line p-4">
+      <div>
+        <p className="text-ui text-ink">预设歌单</p>
+        <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
+          角色只能放<strong className="text-ink-soft">你在这儿填过的歌单</strong>
+          （网易云没有公开接口能按名字查到你收藏的歌单，所以得填一次）。
+          <strong className="text-ink-soft">名字给角色认</strong>
+          ，随便起，说「放睡前那个」也认得出来；
+          <strong className="text-ink-soft">链接直接粘</strong>
+          进右边那栏就行，会自己抠出 ID。
+          <br />
+          一个都不填的话「预设歌单」那一项用不了，其余五项（每日推荐、私人漫游、
+          红心歌单、播放/暂停、指定歌曲）不受影响。
+        </p>
+      </div>
+
+      {rows.map((row, i) => (
+        <div key={i} className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_2fr_auto]">
+          <input
+            className={inputCls}
+            value={row.name ?? ""}
+            onChange={(e) => {
+              const next = rows.map((r, j) => (j === i ? { ...r, name: e.target.value } : r));
+              write(next);
+            }}
+            placeholder="睡前"
+            aria-label="歌单名字"
+          />
+          <input
+            className={inputCls}
+            value={row.id ?? ""}
+            onChange={(e) => {
+              const next = rows.map((r, j) => (j === i ? { ...r, id: e.target.value } : r));
+              write(next);
+            }}
+            placeholder="https://music.163.com/playlist?id=123456789"
+            aria-label="歌单链接或 ID"
+          />
+          {i < list.length ? (
+            <Button
+              variant="ghost"
+              onClick={() => write(rows.filter((_, j) => j !== i))}
+              aria-label={`删掉「${row.name || "这个歌单"}」`}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          ) : (
+            <span />
+          )}
+        </div>
+      ))}
     </div>
   );
 }

@@ -406,10 +406,11 @@ export const FORMAT_CHILD_UNWIRED = [];
  *
  * **quote 故意不在这里**：引用回复是自带的，没有角色开关。
  *
- * **spy 在这里、但服务端那张表里没有**：查岗在角色上是两个开关
- * （`spy.pcEnabled` / `spy.phoneEnabled`），没有单个 `.enabled` 可查，所以
- * 服务端由 prompt.js 单独判「任一条腿开着」。前端这张表只用来判「这一条要不要
- * 显示『还得去角色那儿开』的提示」（preset.jsx），查岗当然要显示，所以留着。
+ * **spy 在这里、但服务端那张表里没有**：查岗在角色上是**五个**开关
+ * （`spy.pcEnabled` / `spy.phoneEnabled` 看屏幕，另外三个管手机里那些事，
+ * 见 SPY_SWITCHES），没有单个 `.enabled` 可查，所以服务端由 prompt.js 单独判
+ * 「任一个开着」。前端这张表只用来判「这一条要不要显示『还得去角色那儿开』的
+ * 提示」（preset.jsx），查岗当然要显示，所以留着。
  * 值写成 `spy` 只是指向角色上那个字段块，别拿它当布尔字段名用。
  */
 export const ROLE_GATED_CHILDREN = {
@@ -426,6 +427,74 @@ export const ROLE_GATED_CHILDREN = {
   instagram: "instagram",
   spy: "spy",
 };
+
+/**
+ * 查岗那一栏的五个开关：面板上叫什么、下面那行说明写什么。
+ *
+ * 五个而不是一个，是因为**代价和形态各不一样**，一个总开关说不清用户在同意
+ * 什么（服务端字段见 server/src/config.js:normalizeSpy）：
+ *
+ *   pcEnabled            拉一张电脑截图。用户那头没有任何动静
+ *   phoneEnabled         发邮件把 iPhone 唤起来截屏，一趟十几秒
+ *   phoneViewEnabled     替用户打开微信 / 支付宝 / 淘宝再截图 —— 比桌面截图私密得多
+ *   phoneControlEnabled  真的改变手机状态：设闹钟、把屏幕锁掉
+ *   phoneMusicEnabled    放歌。要先去 163 搜一次，而且锁屏状态下也生效
+ *
+ * `field` 是角色 `spy` 块里那个布尔字段名，面板直接拿它读写（role.jsx）。
+ * `tag` 是这个开关放开的标签，摆在说明里给用户看 —— 这几个功能全靠标签驱动，
+ * 用户看到标签长什么样才知道自己开的是什么。
+ *
+ * 顺序就是面板上的顺序：先屏幕、再手机里面，和服务端那张功能表
+ * （server/src/spyfeatures.js:FEATURES，查看在前）一个走向。
+ */
+export const SPY_SWITCHES = [
+  {
+    field: "pcEnabled",
+    label: "电脑查岗",
+    tag: "[查岗实时电脑屏幕]",
+    hint: "抓一张电脑桌面的截图。走本地截图程序的一个 GET 接口，几百毫秒就回来，你那头没有任何动静。",
+  },
+  {
+    field: "phoneEnabled",
+    label: "手机查岗",
+    tag: "[查岗实时手机屏幕]",
+    hint: "抓一张 iPhone 当前屏幕的截图。这一头是发一封邮件把你手机唤起来、等它把图传回来，一趟十几秒，而且要先在 iPhone 上配好快捷指令。",
+  },
+  {
+    field: "phoneViewEnabled",
+    label: "查看手机里的东西",
+    tag: "[查岗手机:支付宝账单]",
+    hint: "让角色替你打开某个 App 看一眼：微信、支付宝账单、B站历史、抖音私信和主页、淘宝订单和购物车，另外还能问电量和位置。看到的东西比一张桌面截图私密得多 —— 这是这几个开关里外溢最狠的一个。",
+  },
+  {
+    field: "phoneControlEnabled",
+    label: "操控手机",
+    tag: "[操控手机:锁屏]",
+    hint: "让角色真的动你的手机：设闹钟、开关已有的闹钟、锁屏。做完只回一句「已经照做了」，不截图。",
+  },
+  {
+    field: "phoneMusicEnabled",
+    label: "让角色放歌",
+    tag: "[操控手机:放歌 晴天]",
+    hint: "网易云那六件事：每日推荐、私人漫游、红心歌单、播放/暂停、指定歌曲、预设歌单。点歌要先去网易云搜一次；播放/暂停和锁屏一样，锁着屏也生效。",
+  },
+];
+
+/** 角色上那五个查岗开关的字段名。判「有没有开着的」用它。 */
+export const SPY_SWITCH_FIELDS = SPY_SWITCHES.map((s) => s.field);
+
+/**
+ * 这个角色的查岗开着几个、哪几个。
+ *
+ * 折叠标题那个徽标和「要不要显示下面那些设置」都问这个 —— 五个开关分散在
+ * 面板各处，每处自己数一遍迟早会走岔。
+ *
+ * @returns {{on:string[], any:boolean}} `on` 是开着的那几个的 label
+ */
+export function spySwitchesOn(spy) {
+  const on = SPY_SWITCHES.filter((s) => Boolean(spy?.[s.field])).map((s) => s.label);
+  return { on, any: on.length > 0 };
+}
 
 /** 可移动条目能选的身份。 */
 export const ENTRY_ROLES = ["system", "user", "assistant"];

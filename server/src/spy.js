@@ -49,10 +49,42 @@
  *
  * 回退**只走一次**，不来回弹：两头都不通时第二次注定也不通，多打一轮只是让
  * 用户在那头多等十几秒。
+ *
+ * ── 还有两个标签，管的是手机**里面** ──
+ *
+ * 上面那两个只看一眼屏幕。手机上另有十八件事（spyfeatures.js 那张表），
+ * 各带一个参数，所以标签也是带参数的：
+ *
+ *   [查岗手机:支付宝账单]   查看类。和屏幕查岗同一个形态 —— 抓回来 → 识图/读
+ *                           数据 → 接在回复后面再问一次模型（imessage.js:spyRound）
+ *   [操控手机:锁屏]         操控类。干完了给模型一句「已经照做了」就收尾，
+ *                           **不识图**（锁屏之后截图必然是锁屏画面，见 spyrun.js 头）
+ *
+ * 认标签、挑 pool、驱动那一趟、拼给模型的话都在这个文件（`phoneTargetIn` /
+ * `phonePool` / `runPhone`）；真去发邮件等回传在 spyrun.js。两类各查一份自己的
+ * pool：查看类是 `viewFeatures()`，操控类是 `controlFeatures()` —— 分开是必须的，
+ * 不然模型用查岗标签点歌会被匹配上，然后走一条不该走的路。
+ *
+ * ── 五个开关，不是一个 ──
+ *
+ * 角色上是五个独立开关（`spyLegs`）：电脑屏幕、手机屏幕、查看、操控、网易云。
+ * 分这么细是因为**代价和外溢程度差了好几个量级** —— 看一眼桌面截图和替用户
+ * 打开支付宝账单不是一回事，后者更不是「把他手机锁掉」那回事。
+ *
+ * 操控类**横跨两个开关**（闹钟锁屏归 control，网易云归 music），所以
+ * `phonePool` 要按开关再滤一道：只开放歌的用户写 `[操控手机:锁屏]` 必须匹配
+ * 不上，不然那部手机就真的被锁了，而用户从没同意过这件事。
  */
 
 import { logDebug, logInfo, logWarn } from "./logs.js";
 import { describeImage } from "./llm.js";
+import {
+  controlFeatures,
+  featuresInGroup,
+  matchFeature,
+  viewFeatures,
+} from "./spyfeatures.js";
+import { runByName } from "./spyrun.js";
 import {
   cancelShot,
   createShotRequest,
@@ -82,11 +114,45 @@ const PHONE_WAIT_DEFAULT = 90000;
  */
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
-/** 两个标签。中文写法、全角方括号和全角冒号一律认，理由见 igtags.js 文件头。 */
+/** 两个屏幕标签。中文写法、全角方括号和全角冒号一律认，理由见 igtags.js 文件头。 */
 const PC_TAG = /[[［]\s*查岗(?:实时)?电脑屏幕\s*[\]］]/g;
 const PHONE_TAG = /[[［]\s*查岗(?:实时)?手机屏幕\s*[\]］]/g;
-/** 两个一起认，用来剥标签和判「这轮要不要查岗」。 */
+/** 两个屏幕标签一起认，用来剥标签和判「这轮要不要看屏幕」。 */
 const ANY_TAG = new RegExp(`${PC_TAG.source}|${PHONE_TAG.source}`, "g");
+
+/**
+ * 手机里那两个带参数的标签。
+ *
+ * 冒号后面那串交给 spyrun.js:splitArg 去拆成「功能名 + 参数」—— 这儿不拆，
+ * 因为拆法要查功能表（`放歌 稻香 周杰伦` 得按已知功能名啃前缀，见那边）。
+ *
+ * 认的写法比屏幕那两个宽一档：
+ *
+ *  - `查岗手机` / `查看手机` / `看手机`：都是「看一眼手机里的某个 App」
+ *  - `操控手机` / `控制手机` / `操作手机`：都是「让手机做一件事」
+ *
+ * **屏幕那两个标签必须优先匹配**：`[查岗实时手机屏幕]` 里 `查岗手机` 不连续
+ * （中间夹着「实时」），所以这两套正则本来就不重叠；但 `[查岗手机:手机屏幕]`
+ * 这种写法模型是会写的，那一路走 matchFeature 找不到「手机屏幕」这个功能，
+ * 会回一句「能用的是：微信、支付宝账单…」—— 比静默失败清楚。
+ *
+ * 体内长度给到 120：功能名最长「抖音个人主页」六个字，参数那头「稻香 周杰伦」
+ * 这种也就十来个字，120 足够宽，又不会把一整段跑飞的正文吞进来当参数。
+ *
+ * 体内**允许是空的**（`{0,120}`），虽然空标签什么也做不了 —— 认它是为了能剥掉它。
+ * 不认的话 `[查岗手机:]` 会原样发到对方手机上，那比静默忽略难看得多。
+ * 「空的当没写」这条判断在 phoneTargetIn 里。
+ */
+const PHONE_VIEW_TAG =
+  /[[［]\s*(?:查岗|查看|看)手机\s*[:：]\s*([^\]］]{0,120}?)\s*[\]］]/g;
+const PHONE_CONTROL_TAG =
+  /[[［]\s*(?:操控|控制|操作)手机\s*[:：]\s*([^\]］]{0,120}?)\s*[\]］]/g;
+
+/** 手机里那两个标签一起认。剥标签用，也用来判「这轮有没有要做手机上的事」。 */
+const PHONE_ANY_TAG = new RegExp(
+  `${PHONE_VIEW_TAG.source}|${PHONE_CONTROL_TAG.source}`,
+  "g"
+);
 
 /** 两头各自的中文名。日志、提示模板、给模型的说明都用这两个词。 */
 export const DEVICE_NAMES = { pc: "电脑", phone: "手机" };
@@ -95,72 +161,214 @@ export const DEVICE_NAMES = { pc: "电脑", phone: "手机" };
 const OTHER = { pc: "phone", phone: "pc" };
 
 /**
- * 这个角色的两条腿各自开没开。
+ * 这个角色的五个查岗开关各自开没开。
  *
- * 角色上是两个独立开关（`spy.pcEnabled` / `spy.phoneEnabled`，老配置的单个
- * `enabled` 由 config.js:normalizeSpy 迁过来）。三个地方要问同一个问题 ——
- * 提示词注入哪几行（prompt.js）、这轮要不要真去抓（imessage.js:spyRound）、
+ * 前两个是屏幕（`spy.pcEnabled` / `spy.phoneEnabled`，老配置的单个 `enabled`
+ * 由 config.js:normalizeSpy 迁过来），后三个管手机**里面**那十九件事，按
+ * spyfeatures.js 的 group 一一对应：
+ *
+ *   view     `[查岗手机:…]` 那九件（截图七件 + 电量位置两件）
+ *   control  `[操控手机:…]` 里闹钟和锁屏那四件
+ *   music    `[操控手机:…]` 里网易云那六件
+ *
+ * 四个地方要问同一个问题 —— 提示词注入哪几行（prompt.js → trimSpyPrompt）、
+ * 这轮要不要真去抓（imessage.js 那两趟往返）、能在哪些功能里找（phonePool）、
  * 失败了能不能倒向另一头（runSpy）—— 所以答案只在这儿算一次。
  *
- * @returns {{pc:boolean, phone:boolean, any:boolean}}
+ * **`screens` 和 `any` 不是一回事**，分开是必须的：屏幕那两条腿的互相兜底
+ * （runSpy）只在 `screens` 里打转，而「这一整条子条目要不要注入」问的是 `any`。
+ * 混成一个的话，只开「放歌」的用户会拿到一整段讲屏幕查岗的提示词。
+ *
+ * @returns {{pc:boolean, phone:boolean, view:boolean, control:boolean,
+ *            music:boolean, screens:boolean, any:boolean}}
  */
 export function spyLegs(role) {
   const spy = role?.spy ?? {};
   const pc = Boolean(spy.pcEnabled);
   const phone = Boolean(spy.phoneEnabled);
-  return { pc, phone, any: pc || phone };
+  const view = Boolean(spy.phoneViewEnabled);
+  const control = Boolean(spy.phoneControlEnabled);
+  const music = Boolean(spy.phoneMusicEnabled);
+  const screens = pc || phone;
+  return { pc, phone, view, control, music, screens, any: screens || view || control || music };
 }
 
 /**
- * 只开一条腿时，把提示词正文改成「只有这一头」。
+ * 三个手机组各自那一行，靠**变量占位符**认。
  *
- * 三件事：
+ * 屏幕那两行能按标签字面量认（`[查岗实时电脑屏幕]` 是唯一的），手机里那三组
+ * 不行：`操控手机` 和 `放歌` 两组共用 `[操控手机:…]` 这一个标签前缀，按标签
+ * 认的话删一组会把另一组也删掉。所以每组各给一个占位符，既是「这一行要注入
+ * 哪份清单」的锚，也是「这一组关掉时删哪一行」的锚 —— 和 `{{表情包变量}}`
+ * 那几个一个路子（prompt.js:formatBlock）。
+ */
+const GROUP_VARS = {
+  view: /\{\{\s*查看项\s*\}\}/,
+  control: /\{\{\s*操控项\s*\}\}/,
+  music: /\{\{\s*网易云项\s*\}\}/,
+};
+
+/** 把一组功能拼成给模型看的清单。要参数的带上参数长什么样。 */
+function featureList(group, { playlists = [] } = {}) {
+  return featuresInGroup(group)
+    .map((f) => {
+      if (!f.needsArg) return f.name;
+      /*
+       * 预设歌单的 argHint 是「用户预设过的那几个」—— 那是句废话，模型看不到
+       * 「那几个」是什么。这儿换成真名字，它才点得出来。一个都没配时这条功能
+       * 压根用不了（spyrun.js:buildBody 会报「还没预设过任何歌单」），所以直接
+       * 说清楚，别让它白写一个标签。
+       */
+      if (f.key === "musicPlaylist") {
+        const names = playlists.map((p) => p.name).filter(Boolean);
+        return names.length
+          ? `${f.name}（${names.join("、")}）`
+          : `${f.name}（用户还没预设过歌单，这一项现在用不了）`;
+      }
+      return `${f.name}（${f.argHint}）`;
+    })
+    .join("、");
+}
+
+/**
+ * 这一行里那几个**写死了功能名**的标签，是不是全都属于已经关掉的组？
  *
- *  1. **删掉关着那条腿的行。** 按标签字面量认行 —— 默认正文里 `看电脑:` /
- *     `看手机:` 和「正确示例」下面那两行各自带着自己的标签，一删就干净。
- *     按标签认而不是按 `看电脑:` 这种小标题认，是因为这段正文用户能改：
- *     他把小标题改成别的词，标签本身还是得原样写（不然功能就废了）。
- *  2. **删掉讲自动回退的那行。** 单腿时压根不会倒向另一头（runSpy 拦着），
- *     留着就是一句和事实相反的话。这一条是**尽力而为**的：按默认正文里那句
- *     「自动改看另一头」的措辞认，用户把它改写成别的说法就认不出来了 ——
- *     所以还有下面第 3 条兜底。
- *  3. **在末尾补一句程序生成的话**，点明只有哪一头、不会自动改看另一头。
- *     前两步都是删，删不干净的靠这一句压住：正文里「按你想知道的挑一头……
- *     该在躺着刷手机就看手机」这类话还在，模型凭它硬编一个手机标签是有的
- *     （那种情况 imessage.js:spyRound 会拦下来，但白烧一轮）。补在最后是因为
+ * 「正确示例」下面那几行是写好参数的真标签（`[查岗手机:支付宝账单]`、
+ * `[操控手机:锁屏]`），占位符和它们无关，所以按占位符认行那套规则一个都抓不到 ——
+ * 结果就是：查看类关着，正文里却还挂着一条 `- [查岗手机:支付宝账单]`，模型照
+ * 着抄一遍，白烧一轮生成。
+ *
+ * 判法是查真表：把标签体拿去 `matchFeature` 认出它属于哪一组，那一组关着就算
+ * 这个标签死了。不按字面词判是因为示例里的词用户能改（他把「支付宝账单」换成
+ * 「微信」，还是得认出来这是 view 组）。认不出来的词（比如他瞎写一个不存在的
+ * 功能）不算死标签 —— 删掉看不懂的行比留着更糟。
+ *
+ * **一行里的标签要全死才删这一行。** 讲参数怎么写那条规则一行里挂着两个例子
+ * （`[操控手机:设置闹钟 07:30]` 和 `[操控手机:放歌 稻香 周杰伦]`），分属
+ * control 和 music 两组 —— 只关了一组时那行还得留着，不然另一组就没人教它参数
+ * 写在哪儿了。
+ */
+function deadExample(line, on) {
+  let seen = 0;
+  let dead = 0;
+  for (const [re, pool] of [
+    [PHONE_VIEW_TAG, viewFeatures()],
+    [PHONE_CONTROL_TAG, controlFeatures()],
+  ]) {
+    // 带 g 的正则的 lastIndex 会跨调用留着，每次现造一个
+    const scan = new RegExp(re.source, "g");
+    let m = scan.exec(line);
+    while (m) {
+      const body = (m[1] ?? "").trim();
+      // 参数（`放歌 稻香`）按已知功能名啃前缀是 spyrun.js 的事，这儿双向包含够用
+      const f = body ? matchFeature(body, pool) : null;
+      if (f) {
+        seen += 1;
+        if (!on[f.group]) dead += 1;
+      }
+      m = scan.exec(line);
+    }
+  }
+  return seen > 0 && dead === seen;
+}
+
+/**
+ * 按这个角色开着哪几组，把提示词正文裁成「只有这几样」。
+ *
+ * 五组开关（见 spyLegs）对着正文里五行，全开时一个字不动，关掉的那几组要把
+ * 对应的行删掉 —— 教模型写一个注定被拒的标签，代价是白烧一轮生成。
+ *
+ * 四件事：
+ *
+ *  1. **删掉关着那几组的行。** 屏幕两行按标签字面量认（默认正文里 `看电脑:` /
+ *     `看手机:` 和「正确示例」下面那两行各自带着自己的标签，一删就干净），
+ *     手机里那三行按变量占位符认（理由见 GROUP_VARS）。按标签/占位符认而不是
+ *     按 `看电脑:` 这种小标题认，是因为这段正文用户能改：他把小标题改成别的词，
+ *     标签和占位符还是得原样留着（不然功能就废了）。
+ *  2. **删掉讲自动回退的那行。** 屏幕没有两条腿都开着时压根不会倒
+ *     （runSpy 拦着），留着就是一句和事实相反的话。这一条是**尽力而为**的：
+ *     按默认正文里那句「自动改看另一头」的措辞认，用户改写成别的说法就认不
+ *     出来了 —— 所以还有第 4 条兜底。
+ *  3. **把留下来那几行的占位符换成真清单。** 清单从 spyfeatures.js 现算，
+ *     不写死在正文里 —— 那张表加一条，这儿跟着就有了。
+ *  4. **在末尾补一句程序生成的话**，逐字列清这一轮到底哪几个标签能用。
+ *     前三步都是删和填，删不干净的靠这一句压住：正文里「按你想知道的挑一头……
+ *     该在躺着刷手机就看手机」这类话还在，模型凭它硬编一个没开的标签是有的
+ *     （那种情况 imessage.js 那两趟往返会拦下来，但白烧一轮）。补在最后是因为
  *     靠后的指令压得住前面的泛泛之谈。
  *
- * 两条腿都开时原样返回，一个字不动。
+ * 五组全开时原样返回（只换占位符），一个字不多加。
  *
  * @param {string} text 子条目正文（已经填过 {{变量}}）
- * @param {{pc:boolean, phone:boolean}} legs spyLegs 的结果
- * @returns {string} 裁过的正文；两条腿都关时返回空串（调用方据此整条跳过）
+ * @param {object} legs spyLegs 的结果
+ * @param {object} [ctx]
+ * @param {{name:string,id:string}[]} [ctx.playlists] 用户预设的歌单，填进清单里
+ * @returns {string} 裁过的正文；五组全关时返回空串（调用方据此整条跳过）
  */
-export function trimSpyPrompt(text, legs) {
+export function trimSpyPrompt(text, legs, { playlists = [] } = {}) {
   const src = String(text ?? "");
-  if (!legs?.pc && !legs?.phone) return "";
-  if (legs.pc && legs.phone) return src;
+  const on = {
+    pc: Boolean(legs?.pc),
+    phone: Boolean(legs?.phone),
+    view: Boolean(legs?.view),
+    control: Boolean(legs?.control),
+    music: Boolean(legs?.music),
+  };
+  if (!on.pc && !on.phone && !on.view && !on.control && !on.music) return "";
 
-  const only = legs.pc ? "pc" : "phone";
-  const goneTag = new RegExp((only === "pc" ? PHONE_TAG : PC_TAG).source);
-  // 默认正文里讲自动回退的那句。改过措辞的认不出来，末尾那句补充兜底
-  const FALLBACK_LINE = /自动改看另一头|没看到时会自动/;
-  const kept = src
+  /*
+   * 关着那几组各自的「认行」正则。屏幕用标签，手机里那三组用占位符。
+   *
+   * 注意 PC_TAG / PHONE_TAG 是带 g 的全局正则，`test` 会带着 lastIndex 走 ——
+   * 在这儿按行反复 test 的话会漏判。所以照 source 现造一个不带 g 的。
+   */
+  const gone = [];
+  if (!on.pc) gone.push(new RegExp(PC_TAG.source));
+  if (!on.phone) gone.push(new RegExp(PHONE_TAG.source));
+  for (const key of ["view", "control", "music"]) {
+    if (!on[key]) gone.push(GROUP_VARS[key]);
+  }
+  // 讲自动回退的那句。只有屏幕两条腿都开着时它才是真话
+  if (!(on.pc && on.phone)) gone.push(/自动改看另一头|没看到时会自动/);
+
+  let kept = src
     .split("\n")
-    .filter((line) => !goneTag.test(line) && !FALLBACK_LINE.test(line))
+    .filter((line) => !gone.some((re) => re.test(line)) && !deadExample(line, on))
     .join("\n")
     .trim();
   if (!kept) return "";
 
-  const name = DEVICE_NAMES[only];
-  const other = DEVICE_NAMES[OTHER[only]];
-  const tag = only === "pc" ? "[查岗实时电脑屏幕]" : "[查岗实时手机屏幕]";
-  return (
-    `${kept}\n` +
-    `        补充: "你现在只能看${name}屏幕。查岗标签只有 ${tag} 这一个，` +
-    `别写${other}屏幕那种标签 —— 那一头没开，写了也看不到，` +
-    `${name}这头没看到时也不会自动改看${other}。"`
-  );
+  // 留下来那几组的占位符换成真清单
+  if (on.view) kept = kept.replace(GROUP_VARS.view, featureList("view", { playlists }));
+  if (on.control) kept = kept.replace(GROUP_VARS.control, featureList("control", { playlists }));
+  if (on.music) kept = kept.replace(GROUP_VARS.music, featureList("music", { playlists }));
+
+  // 全开：正文本身已经说全了，不用再补
+  if (on.pc && on.phone && on.view && on.control && on.music) return kept;
+
+  /*
+   * 补充那句。**逐字列出能用的标签**，别只说「其它的别写」—— 模型对
+   * 「可以写 A」的服从度远高于「不要写 B」，正面清单比禁令管得住。
+   */
+  const live = [];
+  if (on.pc) live.push("[查岗实时电脑屏幕]");
+  if (on.phone) live.push("[查岗实时手机屏幕]");
+  if (on.view) live.push("[查岗手机:…]");
+  if (on.control || on.music) live.push("[操控手机:…]");
+
+  const notes = [
+    `你这一轮能用的标签只有这些：${live.join("、")}。别的写法一律不生效，写了也白写。`,
+  ];
+  // 屏幕只开一条腿：额外点明不会自动改看另一头（正文里那句已经删了，这儿说清）
+  if (on.pc !== on.phone) {
+    const only = on.pc ? "pc" : "phone";
+    notes.push(
+      `屏幕你只能看${DEVICE_NAMES[only]}，` +
+        `${DEVICE_NAMES[only]}这头没看到时也不会自动改看${DEVICE_NAMES[OTHER[only]]}。`
+    );
+  }
+  if (!on.pc && !on.phone) notes.push("你看不到他的屏幕，只能看他手机里那几项具体的东西。");
+  return `${kept}\n        补充: "${notes.join("")}"`;
 }
 
 /**
@@ -224,6 +432,52 @@ export const DEFAULT_BOTH_FAILED_TEMPLATE =
   "也别提「截图」「失败」「系统」这些词 —— 就按你的人设正常说话，" +
   "可以顺口问一句在干什么。";
 
+/**
+ * 看手机里某个 App 时给视觉模型的提示词。
+ *
+ * 和屏幕那两份分开：屏幕问的是「这个人在干什么」（开着哪些软件、在和谁聊天），
+ * 这儿问的是「这一屏上写着什么」—— 用户点名要看支付宝账单，想知道的是金额和
+ * 商家，不是「他在用支付宝」。`{{what}}` 换成功能名。
+ *
+ * 「照实念出来」这句是这份的重点：账单、订单、聊天列表全是密密麻麻的文字，
+ * 视觉模型不催的话只会回一句「这是一个账单页面，显示了若干条交易记录」，
+ * 那句话进了第二轮提示词等于什么都没看到。
+ */
+const PHONE_VIEW_PROMPT =
+  "这是用户 iPhone 上刚打开的「{{what}}」那一屏的截图。" +
+  "请把你看到的内容照实说出来，**具体到文字和数字**：" +
+  "有几条、每条分别是什么、金额多少、时间是什么时候、对方是谁。" +
+  "看得见的文字尽量原样念出来，别概括成「若干条记录」。" +
+  "页面要是没加载出来、需要登录、或者是一片空白，就照实说明。" +
+  "不要寒暄，不要说「这是一张截图」。";
+
+/** 看手机里某样东西成功了。`{{what}}` 是看的哪一项，`{{seen}}` 是看到的内容。 */
+export const PHONE_VIEW_OK_TEMPLATE =
+  "<手机里的{{what}}>\n{{seen}}\n</手机里的{{what}}>\n\n" +
+  "上面是你刚在 {{user}} 手机上看到的{{what}}。现在正式回答对方，别再写手机标签。" +
+  "就当是你自己亲眼看到的，别提「截图」「系统」「工具」这些词，" +
+  "也别把上面这段原文抄给对方 —— 挑你在意的那部分说。";
+
+/**
+ * 没看成 / 没做成。
+ *
+ * `{{why}}` 是 spyrun.js 给的那句失败原因（那边刻意写得很细，见那个文件头）。
+ * **原因给模型看但不许它转述**：「手机 90 秒内没回传，可能锁着屏」对用户来说
+ * 是句天书，角色照着念一遍只会显得像个报错窗口。给它是为了让它知道该说
+ * 「你手机是不是没在身边」还是「你是不是没装那个 App」。
+ */
+export const PHONE_FAIL_TEMPLATE =
+  "你想{{what}}，但这次没成（{{why}}）。" +
+  "现在正式回答对方，别再写手机标签。**别告诉对方你在动他的手机**，" +
+  "上面那个原因也别原样告诉他 —— 就按你的人设正常说话，" +
+  "可以顺口问一句他手机在不在身边、或者干脆聊别的。";
+
+/** 操控做完了。不识图，就这一句（理由见 spyrun.js 文件头「为什么 control 不等回传」）。 */
+export const PHONE_DONE_TEMPLATE =
+  "{{done}}。现在正式回答对方，别再写操控标签。" +
+  "这件事已经在 {{user}} 手机上做好了，按你的人设说一句就行 —— " +
+  "别提「指令」「系统」「工具」这些词，也别说「我帮你操作了」这种话。";
+
 /** 把 `{{x}}` 换成值。留着没给值的变量不动，和 igrun.js:markFor 一个路子。 */
 function fill(template, vars) {
   let out = String(template ?? "");
@@ -273,25 +527,106 @@ export function spyTargetIn(text) {
   return best?.kind ?? null;
 }
 
-/** 有没有查岗标签。 */
+/** 有没有屏幕查岗标签。 */
 export function hasSpyTag(text) {
   return matchesOutsideXml(text, new RegExp(ANY_TAG.source, "g"));
 }
 
 /**
- * 去掉查岗标签，只留文字。
+ * 这轮模型要在手机里做哪件事？
+ *
+ * 和 spyTargetIn 同一套规矩，两条也都按**先出现**的算，一轮只做一件：
+ * 查看类要走一趟「抓回来 → 识图 → 再问一次模型」，两件事就是两趟等待和两次
+ * 识图钱；操控类本来可以并发，但「一轮只做一件」对模型来说是条好记的规则，
+ * 两类分着讲反而容易让它把两个标签写在一条回复里。
+ *
+ * 查看和操控**都写了的时候按先出现的算** —— 这两类的下游形态不一样
+ * （一个要识图往返、一个只回一句话），混着做没法收尾成一段话。
+ *
+ * @returns {{kind:"view"|"control", keyword:string, at:number}|null}
+ *          没写手机标签时返回 null。`keyword` 是冒号后面那串原文（含参数），
+ *          拆成功能名 + 参数是 spyrun.js:splitArg 的事
+ */
+export function phoneTargetIn(text) {
+  const src = String(text ?? "");
+  if (!src) return null;
+  const ranges = xmlBlockRanges(src);
+  const outside = (m) => !ranges.some(([a, b]) => m.index >= a && m.index < b);
+
+  let best = null;
+  for (const [kind, re] of [
+    ["view", new RegExp(PHONE_VIEW_TAG.source, "g")],
+    ["control", new RegExp(PHONE_CONTROL_TAG.source, "g")],
+  ]) {
+    for (const m of src.matchAll(re)) {
+      if (!outside(m)) continue;
+      const keyword = String(m[1] ?? "").trim();
+      // 体内是空的（`[查岗手机:]`）：当没写 —— 交给下游只会换回一句
+      // 「没有「」这个功能」，那句话对模型毫无信息
+      if (!keyword) continue;
+      if (best === null || m.index < best.at) best = { kind, keyword, at: m.index };
+      break;
+    }
+  }
+  return best ? { kind: best.kind, keyword: best.keyword, at: best.at } : null;
+}
+
+/**
+ * 有没有一个**做得成**的手机标签。
+ *
+ * 刻意走 phoneTargetIn 而不是自己 match 一遍正则：那样 `[查岗手机:]` 会让这个
+ * 函数回 true、而 phoneTargetIn 回 null，两个答案对不上，调用方按哪个写都有
+ * 一条路是错的。空标签照样会被 stripSpyTags 剥掉（那边用的是自己的正则），
+ * 所以这儿从严没有代价。
+ */
+export function hasPhoneTag(text) {
+  return phoneTargetIn(text) !== null;
+}
+
+/**
+ * 某一类该在哪些功能里找，**按这个角色开着哪几组过滤**。
+ *
+ * 两类首先必须各查自己那份：查看类的 pool 里没有「放歌」，所以模型用
+ * `[查岗手机:放歌]` 点歌会被回一句「能用的是：微信、支付宝账单…」，而不是
+ * 真去放歌然后没法收尾（放完歌没有图可识，查看类那条路在等一张图）。
+ * 反过来操控类里没有「支付宝账单」，`[操控手机:支付宝账单]` 同理被挡住。
+ *
+ * 再往下还要按开关滤一道，因为**操控类横跨两个开关**：闹钟锁屏那四件归
+ * `phoneControlEnabled`，网易云那六件归 `phoneMusicEnabled`。只开放歌的用户
+ * 写 `[操控手机:锁屏]` 必须匹配不上 —— 不滤的话 controlFeatures() 里有锁屏，
+ * 那部手机就真的被锁了，而用户从没同意过这件事。
+ *
+ * 滤成空数组是合法结局（那一类一个开关都没开）：调用方据此当这轮没写标签。
+ *
+ * @param {"view"|"control"} kind
+ * @param {object} legs spyLegs 的结果
+ */
+export function phonePool(kind, legs) {
+  if (kind === "view") return legs?.view ? viewFeatures() : [];
+  return controlFeatures().filter((f) =>
+    f.group === "music" ? Boolean(legs?.music) : Boolean(legs?.control)
+  );
+}
+
+/**
+ * 去掉查岗标签（四个都去），只留文字。
  *
  * 和 stripSearchTags 一样只在**发给对方**那一路上用 —— 内存历史、落盘存档、
  * 「上下文」面板里都该看得见模型的原文（用户明确要求过「使用功能的时候
  * 不要过滤任何标签」）。
+ *
+ * 四个标签一起剥而不是分成两个函数：调用点（imessage.js 那两处 `withoutSpy`）
+ * 要的是「把这条回复里所有查岗痕迹去掉之后还剩几个字」，分开剥的话每个调用点
+ * 都得记着连着调两次，漏一个就会有 `[操控手机:锁屏]` 原样发到对方手机上。
  */
 export function stripSpyTags(text) {
   const src = String(text ?? "");
   if (!src) return "";
   const ranges = xmlBlockRanges(src);
+  const all = new RegExp(`${ANY_TAG.source}|${PHONE_ANY_TAG.source}`, "g");
   let out = "";
   let cursor = 0;
-  for (const m of src.matchAll(new RegExp(ANY_TAG.source, "g"))) {
+  for (const m of src.matchAll(all)) {
     if (ranges.some(([a, b]) => m.index >= a && m.index < b)) continue;
     out += src.slice(cursor, m.index);
     cursor = m.index + m[0].length;
@@ -610,4 +945,98 @@ export async function runSpy(want, { role, eps, spyApi, userName, scope }) {
     error: `${DEVICE_NAMES[want]}${first.error}，${DEVICE_NAMES[other]}${second.error}`,
     user: userName || "对方",
   });
+}
+
+/**
+ * 手机里那一趟：做那件事，回一段要当 user 消息问回去的话。
+ *
+ * 三条收尾，和 spyrun.js 那三种 kind 对齐：
+ *
+ *   操控成功 → `PHONE_DONE_TEMPLATE`，一句「已经照做了」。**不识图**
+ *   查看成功 → 有图的先识图，识完套 `PHONE_VIEW_OK_TEMPLATE`；
+ *              电量位置那两件回的是现成的一句话，直接套同一份模板
+ *   没成     → `PHONE_FAIL_TEMPLATE`
+ *
+ * **识图在这儿做，不在 spyrun.js 里做。** 那个文件只认「手机」这一层、不认
+ * 角色，而视觉模型是角色的东西（`eps.vision`）—— 它把 Buffer 交出来，怎么变成
+ * 文字由这儿定（见那个文件头「为什么 screenshot 这一路不在这儿识图」）。
+ *
+ * **从不抛错**，和 runSpy 一样：调用方要靠返回值决定下一步，而「没做成」在这个
+ * 功能里是很正常的结局（手机锁着、App 没装、用户不在身边）。
+ *
+ * @param {{kind:"view"|"control", keyword:string}} want phoneTargetIn 的结果
+ * @param {object} ctx
+ * @param {object} ctx.role   当前角色（要 role.spy 那几个开关）
+ * @param {object} ctx.eps    这个角色解析好的几条线（查看类要 eps.vision）
+ * @param {object} ctx.spyApi 全局那份（SMTP 凭据 + 校验密钥 + 预设歌单）
+ * @param {string} ctx.userName 对方的名字，填模板里的 `{{user}}`
+ * @param {string} ctx.scope  日志作用域
+ * @returns {Promise<string>} 接在第一次回复后面、要当 user 消息问回去的那段话
+ */
+export async function runPhone(want, { role, eps, spyApi, userName, scope }) {
+  const legs = spyLegs(role);
+  const user = userName || "对方";
+  const pool = phonePool(want.kind, legs);
+
+  /*
+   * 查看类要视觉模型，**这道闸排在发邮件之前**。
+   *
+   * 和 lookAt 里同一个理由，在这条路上更要紧：查看类是「把用户手机唤起来、
+   * 替他打开支付宝、截一张图、传回来」，十几秒加一次打扰，全做完了才发现
+   * 没模型可看 —— 那是白折腾用户一趟，而且那张账单截图已经白传了一遍。
+   */
+  if (want.kind === "view" && !eps?.vision) {
+    logWarn(scope, `「${want.keyword}」没看：这个角色没开识图模型，抓回来也看不出内容`);
+    return fill(PHONE_FAIL_TEMPLATE, { what: `看他手机里的${want.keyword}`, why: "没开识图模型" });
+  }
+
+  const out = await runByName(want.keyword, pool, {
+    spyApi,
+    playlists: Array.isArray(spyApi?.playlists) ? spyApi.playlists : [],
+    scope,
+  });
+
+  // 名字对不上（pool 里没有这一条）。runByName 那句话里已经列了能用的是哪些，
+  // 直接把它交给模型 —— 比「没成」三个字有用，它下一轮就能改写对
+  if (!out.feature) return fill(PHONE_FAIL_TEMPLATE, { what: want.keyword, why: out.text });
+
+  const label = out.label || out.feature.name;
+  if (!out.ok) {
+    const what = want.kind === "view" ? `看他手机里的${label}` : `让他手机${label}`;
+    return fill(PHONE_FAIL_TEMPLATE, { what, why: out.text });
+  }
+
+  // 操控类：一句话收尾，不识图
+  if (want.kind === "control") {
+    return fill(PHONE_DONE_TEMPLATE, { done: out.text, user });
+  }
+
+  /*
+   * 查看类。两种货：
+   *
+   *  - 有 image（截图那七件）：识图成文字
+   *  - 有 text（电量、位置）：spyrun.js 已经拼成一句话了，直接用
+   *
+   * 后者刻意不走识图 —— 电量本来就是个数字，截图再让视觉模型去认屏幕上的
+   * 「85%」纯属绕路（见 spyfeatures.js:VIEW_JSON）。
+   */
+  if (!out.image) return fill(PHONE_VIEW_OK_TEMPLATE, { what: label, seen: out.text, user });
+
+  let seen;
+  try {
+    seen = await describeImage(eps.vision, fill(PHONE_VIEW_PROMPT, { what: label }), {
+      base64: out.image.toString("base64"),
+      mimeType: out.mimeType,
+      name: `手机里的${label}`,
+    });
+  } catch (e) {
+    logWarn(scope, `「${label}」的截图拿到了，但识图失败：${e.message}`);
+    return fill(PHONE_FAIL_TEMPLATE, {
+      what: `看他手机里的${label}`,
+      why: `识图失败（${e.message}）`,
+    });
+  }
+
+  logInfo(scope, `手机里的${label}看到了，识图 ${seen.length} 字`, seen);
+  return fill(PHONE_VIEW_OK_TEMPLATE, { what: label, seen, user });
 }

@@ -53,6 +53,24 @@ const TRIGGER_BODY = "Screenshot request triggered.";
 /** 收图路由的默认路径。改这个要和 iPhone 快捷指令里的 URL 一起改。 */
 export const DEFAULT_WEBHOOK_PATH = "/phone/screenshot";
 
+/**
+ * 电量和位置的回传路径。
+ *
+ * 这两件事**不截图** —— 快捷指令那边用「文本」动作拼一个 JSON 直接 POST 回来
+ * （`{"level": 85}` / `{"address": "…", "longitude": …, "latitude": …}`），
+ * 所以不能走收图那个口子（那边会验图片魔数，一段 JSON 过不了）。
+ *
+ * 两个各自一条路径而不是共用一条带参数的，是因为**快捷指令里填的是死 URL**：
+ * 用户在那个小小的输入框里手打一遍地址已经够烦了，再让他拼查询串只会多一处
+ * 填错的地方。路径写死也就少一处要对照的东西。
+ *
+ * 这两条**不跟着配置里那个 webhookPath 走**（那个只管收图）。理由是它们的
+ * 前缀本来就该和收图口子一致，而用户改 webhookPath 的场景是「和别的服务撞了」，
+ * 撞的是那一条具体路径，不是整个 /phone 前缀。
+ */
+export const BATTERY_PATH = "/phone/battery";
+export const LOCATION_PATH = "/phone/location";
+
 /** 发信最多等多久。SMTP 握手 + 投递，正常两三秒。 */
 const SMTP_TIMEOUT = 15000;
 
@@ -75,6 +93,15 @@ const LATE_MIN_TRIP = 8;
 
 /** 一张图最大多少字节。和 spy.js 的上限一致，理由见那边。 */
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 一段回传 JSON 最多多少字符。
+ *
+ * 电量是 `{"level":85}`，位置是一个地址加两个浮点数 —— 几十到几百字符。
+ * 8000 给的是离谱的余量：真到这个量级，多半是快捷指令里 `data` 那一行选错了
+ * （把截图当文本传过来）。拦在进队列之前，免得一个填错的自动化把等待位占掉。
+ */
+const MAX_DATA_CHARS = 8000;
 
 /* ============================ 待领队列 ============================ */
 
@@ -231,9 +258,24 @@ export function phoneConfigProblem(api) {
  * 端口决定加密方式：465 直接 SSL，其余（通常 587）走 STARTTLS。
  * 这是 SMTP 的惯例，iCloud、QQ、163 都是这套。
  *
+ * ── 主题和正文为什么能覆盖 ──
+ *
+ * 一开始只有「看一眼当前屏幕」这一件事，主题是配置里那个固定的
+ * `PHONESPY_TRIGGER`。现在手机上有十八件事（见 spyfeatures.js），每件事在
+ * iPhone 上是**各自一条**邮件自动化，靠主题词区分（iOS 的邮件自动化只能按
+ * 「发件人 + 主题包含」触发）。所以主题得能按功能给。
+ *
+ * 正文是**传参数**用的：快捷指令那边「从输入中获取文本」拿到的就是邮件正文，
+ * 闹钟几点、放哪首歌都从这儿过去（见 spyrun.js:buildBody）。
+ *
+ * 两个都不给时回落到原来的行为（配置里的主题 + 那句占位正文），所以单个查岗
+ * 那条路一个字都不用改。
+ *
+ * @param {object} api 全局那份 spyApi
+ * @param {{subject?:string, body?:string}} [opts] 覆盖主题 / 正文
  * @throws {Error} 发不出去（认证失败、连不上、超时）
  */
-export async function sendTriggerMail(api) {
+export async function sendTriggerMail(api, opts = {}) {
   const port = Number(api?.smtpPort) || 587;
   const secure = port === 465;
 
@@ -247,14 +289,20 @@ export async function sendTriggerMail(api) {
     socketTimeout: SMTP_TIMEOUT,
   });
 
-  const subject = String(api?.subject ?? "").trim() || TRIGGER_SUBJECT;
+  const subject =
+    String(opts?.subject ?? "").trim() || String(api?.subject ?? "").trim() || TRIGGER_SUBJECT;
+  /*
+   * 正文空着时填那句占位的话 —— 有些 SMTP 把空正文当垃圾邮件。给了参数的
+   * 功能（闹钟、放歌）正文就是那个参数本身，快捷指令那边靠它干活。
+   */
+  const text = String(opts?.body ?? "").trim() || TRIGGER_BODY;
 
   try {
     await transporter.sendMail({
       from: String(api.smtpUser).trim(),
       to: String(api.mailTo).trim(),
       subject,
-      text: TRIGGER_BODY,
+      text,
     });
     logInfo("查岗", `触发邮件已发给 ${api.mailTo}（主题 ${subject}）`);
   } catch (e) {
@@ -314,7 +362,11 @@ export function parseShotUpload(body, contentType) {
   // ---- multipart/form-data（快捷指令的「表单」）----
   const boundary = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(ct);
   if (/multipart\/form-data/i.test(ct) && boundary) {
-    return parseMultipart(body, (boundary[1] || boundary[2]).trim());
+    const parts = parseMultipart(body, (boundary[1] || boundary[2]).trim(), ["secret", "image"]);
+    return {
+      secret: parts.secret ? parts.secret.toString("utf8").trim() : "",
+      image: parts.image ?? null,
+    };
   }
 
   // ---- application/json：{ secret, image: "<base64>" } ----
@@ -338,14 +390,20 @@ export function parseShotUpload(body, contentType) {
 }
 
 /**
- * 手写的 multipart 解析，只够用来取 `secret` 和 `image` 两个字段。
+ * 手写的 multipart 解析，取指定的那几个字段。
  *
  * 按 `--boundary` 切段，每段用 CRLF CRLF 分头和体，从 `Content-Disposition`
  * 里读 name。**体必须按字节切**（不能 toString 再 split）—— JPEG 里任何字节
  * 组合都可能出现，转成字符串再切会把二进制搞坏。
+ *
+ * @param {Buffer} body
+ * @param {string} boundary
+ * @param {string[]} fields 要取哪几个字段
+ * @returns {Record<string, Buffer>} 字段名 → 原始字节。没出现的字段不在里面
  */
-function parseMultipart(body, boundary) {
-  const out = { secret: "", image: null };
+function parseMultipart(body, boundary, fields) {
+  const want = new Set(fields);
+  const out = {};
   const sep = Buffer.from(`--${boundary}`);
   const headEnd = Buffer.from("\r\n\r\n");
 
@@ -372,8 +430,7 @@ function parseMultipart(body, boundary) {
     }
 
     const name = /name="([^"]*)"/i.exec(header)?.[1] ?? "";
-    if (name === "secret") out.secret = value.toString("utf8").trim();
-    else if (name === "image") out.image = value;
+    if (want.has(name)) out[name] = value;
   }
   return out;
 }
@@ -406,5 +463,98 @@ export function handleShotUpload({ secret, image, want }) {
    * 而这种情况（超时之后图才到）不是用户操作错了，弹通知只会让人以为配坏了。
    */
   deliverShot(image);
+  return { status: 200, text: "ok" };
+}
+
+/**
+ * 从 POST 里把那段 JSON 抠出来（电量 / 位置走这条）。
+ *
+ * 快捷指令那边是「请求体 → 表单」，两行都是**文本**：`secret` 和 `data`，
+ * `data` 的值是上一步「文本」动作拼出来的那个 JSON 串。所以和收图那个口子
+ * 复用同一个 multipart 解析，只是取的字段名不同。
+ *
+ * 顺带认 `application/json`（直接把 JSON 当请求体发）和
+ * `application/x-www-form-urlencoded` —— 有人会照自己的习惯改快捷指令。
+ *
+ * @param {Buffer} body
+ * @param {string} contentType
+ * @returns {{secret:string, data:string}}
+ */
+export function parseDataUpload(body, contentType) {
+  const ct = String(contentType ?? "");
+
+  // ---- multipart/form-data（快捷指令的「表单」）----
+  const boundary = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(ct);
+  if (/multipart\/form-data/i.test(ct) && boundary) {
+    const parts = parseMultipart(body, (boundary[1] || boundary[2]).trim(), ["secret", "data"]);
+    return {
+      secret: String(parts.secret ?? ""),
+      data: parts.data ? parts.data.toString("utf8").trim() : "",
+    };
+  }
+
+  // ---- urlencoded：secret=xxx&data=%7B...%7D ----
+  if (/application\/x-www-form-urlencoded/i.test(ct)) {
+    const q = new URLSearchParams(body.toString("utf8"));
+    return { secret: String(q.get("secret") ?? ""), data: String(q.get("data") ?? "").trim() };
+  }
+
+  /*
+   * ---- 直接把 JSON 当请求体 ----
+   *
+   * 两种形态都认：`{"secret":"x","data":"{...}"}`（包了一层）和
+   * `{"level":85}`（就是数据本身，secret 只能走查询串或请求头）。
+   * 靠有没有 data 字段区分。
+   */
+  const text = body.toString("utf8").trim();
+  if (/application\/json/i.test(ct) || text.startsWith("{")) {
+    try {
+      const obj = JSON.parse(text);
+      if (obj && typeof obj === "object" && obj.data !== undefined) {
+        const inner = obj.data;
+        return {
+          secret: String(obj.secret ?? ""),
+          // data 可能是串，也可能已经是对象（快捷指令有时会帮着解一层）
+          data: typeof inner === "string" ? inner.trim() : JSON.stringify(inner),
+        };
+      }
+      // 没有 data 字段：整个请求体就是数据
+      return { secret: String(obj?.secret ?? ""), data: text };
+    } catch {
+      return { secret: "", data: "" };
+    }
+  }
+
+  return { secret: "", data: "" };
+}
+
+/**
+ * 收 JSON 的路由逻辑。和 `handleShotUpload` 一模一样的校验顺序，只是把
+ * 「有没有图」换成「有没有数据」。
+ *
+ * @returns {{status:number, text:string}}
+ */
+export function handleDataUpload({ secret, data, want, label = "数据" }) {
+  if (!want) {
+    logWarn("查岗", `有人往收${label}的口子 POST，但配置里没设校验密钥，已拒绝`);
+    return { status: 403, text: "forbidden" };
+  }
+  if (secret !== want) {
+    logWarn("查岗", `收到密钥不对的${label}回传，已拒绝`);
+    return { status: 403, text: "forbidden" };
+  }
+  if (!data) {
+    logWarn("查岗", `收到的${label}回传里没有 data 字段`);
+    return { status: 400, text: "missing data" };
+  }
+  if (data.length > MAX_DATA_CHARS) {
+    // 一段电量或位置的 JSON 不可能上万字符。这么大多半是快捷指令里那个
+    // 字段选错了（比如把截图选成了 data），拦下来免得进队列占位
+    logWarn("查岗", `${label}回传的内容太长了（${data.length} 字符），已拒绝`);
+    return { status: 413, text: "data too large" };
+  }
+
+  // 没人在等也回 200，理由同 handleShotUpload
+  deliverShot(Buffer.from(data, "utf8"));
   return { status: 200, text: "ok" };
 }

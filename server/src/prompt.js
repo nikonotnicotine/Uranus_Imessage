@@ -263,12 +263,15 @@ function formatBlock(entry, fill, role, config) {
       text = text.replace(/\{\{\s*特效变量\s*\}\}/g, effectListText(list));
     }
     /*
-     * 查岗不在 ROLE_GATED_CHILDREN 里 —— 角色上是两个开关，没有单个 .enabled
-     * 可查。两条腿都关 → 整条跳过（trimSpyPrompt 返回空串）；只开一条腿 →
-     * 把另一条腿那几行删掉，别教模型写一个注定被拒的标签。
+     * 查岗不在 ROLE_GATED_CHILDREN 里 —— 角色上是**五个**开关，没有单个
+     * .enabled 可查。五个都关 → 整条跳过（trimSpyPrompt 返回空串）；开了几个 →
+     * 关掉那几组的行删掉，别教模型写一个注定被拒的标签。
+     *
+     * 预设歌单要一路传进去：`[操控手机:预设歌单 睡前]` 那一项的清单是用户在
+     * 全局配置里填的，写不死在正文里（见 spy.js:featureList）。
      */
     if (child.kind === "spy") {
-      text = trimSpyPrompt(text, spyLegs(role));
+      text = trimSpyPrompt(text, spyLegs(role), { playlists: config?.spyApi?.playlists });
       if (!text) continue;
     }
     if (!tag || !text) continue;

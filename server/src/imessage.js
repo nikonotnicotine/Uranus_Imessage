@@ -84,7 +84,16 @@ import {
 import { applyAndLog } from "./regex.js";
 import { requestRestart } from "./restart.js";
 import { appendTurn, recentMessages, sessionIdFor } from "./sessions.js";
-import { DEVICE_NAMES, runSpy, spyLegs, spyTargetIn, stripSpyTags } from "./spy.js";
+import {
+  DEVICE_NAMES,
+  phonePool,
+  phoneTargetIn,
+  runPhone,
+  runSpy,
+  spyLegs,
+  spyTargetIn,
+  stripSpyTags,
+} from "./spy.js";
 import { parseSearchQueries, runSearch, stripSearchTags } from "./websearch.js";
 
 /**
@@ -2436,6 +2445,90 @@ async function spyRound(
 }
 
 /**
+ * 手机里那一趟往返。
+ *
+ * 模型回复里写了 `[查岗手机:支付宝账单]` / `[操控手机:锁屏]` 时：真去做那件事，
+ * 把结果接在那条回复后面当一条 user 消息，再问一次模型。对方只收到第二次的回复。
+ *
+ * **和上面 spyRound 是同一个形态**，那几条选择在这儿同样成立（只一轮、中间这趟
+ * 不进 history 不进存档、没做成也照样问第二次、第二次生成失败不吞异常）。
+ *
+ * 但有一处刻意不一样：**没有互相兜底。** 屏幕那两条腿是「想知道他在干什么」的
+ * 两种办法，一头不通换另一头是同一个目的；这儿的十九件事各是各的，「支付宝账单
+ * 没看到」不能改成「那看看微信吧」—— 模型要的是账单，给它别的等于答错题。
+ *
+ * 操控类那一路更不能兜：「锁屏没成功那就放首歌」是荒谬的。
+ *
+ * @param {object} ctx 同 spyRound
+ * @returns {Promise<string|null>} 第二次的回复原文；这轮没写手机标签时返回 null
+ */
+async function phoneRound(
+  reply,
+  { role, eps, spyApi, params, messages, user, scope, llmScope, onPrompt }
+) {
+  /*
+   * 角色那三道闸。提示词那边也拦着（spy.js:trimSpyPrompt 会把关掉那几组的行
+   * 删掉），这里再拦一次 —— 模型凭记忆硬写一个标签出来，不该就真的去开用户的
+   * 支付宝、或者把他手机锁掉。这道闸比屏幕那道更要紧：那边泄的是一张桌面截图，
+   * 这边是账单流水，而操控那半边压根不是「泄」，是**改**用户手机的状态。
+   */
+  const legs = spyLegs(role);
+  if (!legs.view && !legs.control && !legs.music) return null;
+
+  const want = phoneTargetIn(reply);
+  if (!want) return null;
+
+  /*
+   * 这一类的开关关着。
+   *
+   * 不像屏幕那边能倒向另一条腿 —— 这儿没有「另一头」（见函数头），所以直接
+   * 当这轮没写标签。pool 空了也走这条：查看类没开、或者操控类那两个开关都没开。
+   */
+  const pool = phonePool(want.kind, legs);
+  if (!pool.length) {
+    const what = want.kind === "view" ? "看他手机里的东西" : "操控他手机";
+    logWarn(scope, `模型想${what}（${want.keyword}），但这一类的开关是关的，这轮不做`);
+    return null;
+  }
+
+  logInfo(
+    scope,
+    `模型要${want.kind === "view" ? "看手机里的" : "操控手机："}${want.keyword}`
+  );
+
+  const note = await runPhone(want, {
+    role,
+    eps,
+    spyApi,
+    userName: user?.name ?? "",
+    scope,
+  });
+
+  // 「照原来的格式」这句必须有，和 spyRound 同一个理由（不写的话第二次回复里
+  // 一个 <thinking> 都没有，而存档里存的正是第二次那条）
+  const followUp = [
+    ...messages,
+    { role: "assistant", content: reply },
+    {
+      role: "user",
+      content:
+        `${note}\n\n` +
+        "照你原来的格式回答（预设里要求的思考块、气泡分隔这些照旧写，" +
+        "别因为这段内容就省掉）。",
+    },
+  ];
+
+  logInfo(llmScope, `手机那件事的结果注入 ${note.length} 字，只注入这一次`, note);
+  logDebug(llmScope, "正在等手机那件事之后的第二次回复…");
+
+  onPrompt?.(followUp);
+
+  const { content } = await chatWithFallback(eps.chat, eps.fallback, followUp, params);
+  logInfo(llmScope, `手机那件事之后的回复 ${content.length} 字`, content);
+  return content;
+}
+
+/**
  * 发一个已读回执，让对方那头的气泡显示「已读」。
  *
  * **会话级、不可逆。** iMessage 远端模式走的是 `chats.markRead(chatGuid)`，
@@ -2813,6 +2906,32 @@ async function handleTurn(
     if (spied !== null) reply = spied;
   } catch (e) {
     logError(llmScope, "查岗之后那次生成失败，这一轮没能拿到回复", e);
+    await space.responding(() => notifyFailure(runner, space, "这条消息没回上来", e));
+    throw e;
+  }
+
+  /*
+   * 手机里那十九件事。和上面查岗同一个形态（见 phoneRound）。
+   *
+   * **排在屏幕查岗之后**，理由和「搜索排在查岗之前」一样：查岗那趟返回的是最终
+   * 回复，这儿在它的结果上再判一次 —— 也就是「先看一眼他手机屏幕，发现他在刷
+   * 淘宝，那再看看他购物车」这条路是通的。反过来排的话那条路是死的。
+   */
+  try {
+    const phoned = await phoneRound(reply, {
+      role: freshRole,
+      eps,
+      spyApi: freshConfig?.spyApi,
+      params,
+      messages,
+      user,
+      scope,
+      llmScope,
+      onPrompt: (followUp) => notePrompt(promptMeta, followUp),
+    });
+    if (phoned !== null) reply = phoned;
+  } catch (e) {
+    logError(llmScope, "动手机之后那次生成失败，这一轮没能拿到回复", e);
     await space.responding(() => notifyFailure(runner, space, "这条消息没回上来", e));
     throw e;
   }
@@ -3813,6 +3932,27 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
     if (spied !== null) reply = spied;
   } catch (e) {
     logError(llmScope, "主动消息查岗之后那次生成失败，这次跳过", e);
+    runner.history.set(sessionId, historyArr);
+    return;
+  }
+
+  // 手机里那十九件事。主动消息这一路也给 —— 「早上自己开口」正是最想先看一眼
+  // 他电量还剩多少、或者顺手放首歌的场景（见 phoneRound）
+  try {
+    const phoned = await phoneRound(reply, {
+      role,
+      eps,
+      spyApi: config?.spyApi,
+      params,
+      messages,
+      user,
+      scope,
+      llmScope,
+      onPrompt: (followUp) => notePrompt(promptMeta, followUp),
+    });
+    if (phoned !== null) reply = phoned;
+  } catch (e) {
+    logError(llmScope, "主动消息动手机之后那次生成失败，这次跳过", e);
     runner.history.set(sessionId, historyArr);
     return;
   }

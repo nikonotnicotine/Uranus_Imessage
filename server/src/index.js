@@ -49,9 +49,13 @@ import {
 } from "./imessage.js";
 import { getLastPrompt } from "./lastprompt.js";
 import {
+  BATTERY_PATH,
   DEFAULT_WEBHOOK_PATH,
+  handleDataUpload,
   handleShotUpload,
+  LOCATION_PATH,
   MAX_IMAGE_BYTES as SHOT_UPLOAD_LIMIT,
+  parseDataUpload,
   parseShotUpload,
 } from "./spyphone.js";
 import { enrollSharedUser, findSharedUser, normalizePhone } from "./photon.js";
@@ -348,6 +352,90 @@ app.use((req, res, next) => {
   req.on("error", (e) => {
     if (tooBig) return; // 上面主动掐断的，已经报过了
     logWarn("查岗", `收图的连接断在半路（收了 ${Math.round(size / 1024)}KB，${e?.code || e?.message || e}）`);
+    if (!res.headersSent) res.status(400).type("text/plain").send("bad request");
+  });
+});
+
+/*
+ * 电量和位置的回传口子。
+ *
+ * 和上面收图那条**同一个形态、同一个理由**（必须排在 express.json() 之前、
+ * 自己收原始字节、走预共享 secret 不走控制台鉴权），区别只有两处：
+ *
+ *  1. 路径是写死的两条（`/phone/battery` / `/phone/location`），不跟着配置里
+ *     那个 webhookPath 走 —— 理由见 spyphone.js 那两个常量的注释。
+ *  2. 收的是一段 JSON 而不是一张图，所以闸门按字符数算，小得多。
+ *
+ * 这两件事在 iPhone 上是两条独立的自动化，回传的 JSON 长得也不一样，但收下来
+ * 之后**进的是同一个等待队列**（`deliverShot`）—— 队列里那个条目是谁挂的，
+ * 回来的就归谁，不看内容。所以这儿一个中间件管两条路径就够了，只在日志里
+ * 分一下名字，好让用户看得出是哪条自动化在动。
+ */
+app.use((req, res, next) => {
+  const label = req.path === BATTERY_PATH ? "电量" : req.path === LOCATION_PATH ? "位置" : "";
+  if (!label) return next();
+  if (req.method !== "POST" && req.method !== "PUT") return next();
+
+  const api = loadConfig()?.spyApi ?? {};
+  const chunks = [];
+  let size = 0;
+  let tooBig = false;
+
+  logInfo(
+    "查岗",
+    `收${label}的口子来了个 ${req.method}（来源 ${req.ip || "未知"}，` +
+      `类型 ${req.headers["content-type"] || "未声明"}）`
+  );
+
+  req.on("data", (c) => {
+    /*
+     * 这道闸比收图那道紧得多（64KB vs 20MB）：这条路径上正常只会来几百字节的
+     * JSON。真来了一个大家伙，八成是快捷指令里 `data` 那一行选成了截图 ——
+     * 早掐早省事，而且错得明显比错得隐蔽好排查。
+     */
+    size += c.length;
+    if (size > 64 * 1024) {
+      tooBig = true;
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
+
+  req.on("end", () => {
+    if (tooBig) {
+      logWarn(
+        "查岗",
+        `${label}回传的内容超过 64KB，已掐断 —— ` +
+          `快捷指令里 data 那一行是不是选成了截图？那一行应该是【文本】`
+      );
+      return res.status(413).type("text/plain").send("too large");
+    }
+    const body = Buffer.concat(chunks);
+    const parsed = parseDataUpload(body, req.headers["content-type"]);
+    // secret 也认查询串和请求头，和收图那条一样（裸 JSON 时表单里没地方放）
+    const secret =
+      parsed.secret ||
+      String(req.query?.secret ?? "") ||
+      String(req.headers["x-spy-secret"] ?? "");
+
+    logDebug(
+      "查岗",
+      `收到${label} ${body.length} 字节，secret ${secret ? "有" : "没有"}，` +
+        `data ${parsed.data ? `${parsed.data.length} 字符` : "没认出来"}`
+    );
+    const out = handleDataUpload({
+      secret,
+      data: parsed.data,
+      want: String(api.webhookSecret ?? ""),
+      label,
+    });
+    res.status(out.status).type("text/plain").send(out.text);
+  });
+
+  req.on("error", (e) => {
+    if (tooBig) return;
+    logWarn("查岗", `收${label}的连接断在半路（${e?.code || e?.message || e}）`);
     if (!res.headersSent) res.status(400).type("text/plain").send("bad request");
   });
 });

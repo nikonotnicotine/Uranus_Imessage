@@ -178,54 +178,195 @@ console.log("\n[两个开关：normalizeSpy 的默认值和老配置迁移]");
   assert.equal(legacyUrl.phoneUrl, undefined);
   ok("老的 phoneUrl 字段被丢掉（手机腿走邮件，没有地址）");
 
+  const off = { pc: false, phone: false, view: false, control: false, music: false };
   assert.deepEqual(S.spyLegs({ spy: { pcEnabled: true, phoneEnabled: false } }), {
+    ...off,
     pc: true,
-    phone: false,
+    screens: true,
     any: true,
   });
-  assert.deepEqual(S.spyLegs({ spy: {} }), { pc: false, phone: false, any: false });
-  assert.deepEqual(S.spyLegs(undefined), { pc: false, phone: false, any: false });
-  ok("spyLegs 三态齐全，角色为空也不炸");
+  assert.deepEqual(S.spyLegs({ spy: {} }), { ...off, screens: false, any: false });
+  assert.deepEqual(S.spyLegs(undefined), { ...off, screens: false, any: false });
+  ok("spyLegs 五个开关齐全，角色为空也不炸");
+
+  /*
+   * `screens` 和 `any` 不是一回事：只开手机里那三组的时候屏幕那两条腿是关的
+   * （runSpy 那套互相兜底压根不该启动），但整条子条目要注入。
+   */
+  const musicOnly = S.spyLegs({ spy: { phoneMusicEnabled: true } });
+  assert.equal(musicOnly.screens, false);
+  assert.equal(musicOnly.any, true);
+  ok("只开放歌：screens 是 false（屏幕不兜底），any 是 true（子条目要注入）");
+
+  // 三个新开关都默认 false，而且不继承老的 enabled
+  const fromLegacy = C.normalizeConfig({
+    roles: [{ id: "r-1", spy: { enabled: true } }],
+  }).roles[0].spy;
+  assert.equal(fromLegacy.pcEnabled, true);
+  assert.equal(fromLegacy.phoneViewEnabled, false);
+  assert.equal(fromLegacy.phoneControlEnabled, false);
+  assert.equal(fromLegacy.phoneMusicEnabled, false);
+  ok("老的 enabled 只迁成屏幕两条腿，手机里那三组一律不继承");
 }
 
-console.log("\n[提示词：两条腿各自决定注入什么]");
+console.log("\n[pool：按开关滤，不许越权]");
+{
+  const legs = (patch) => S.spyLegs({ spy: patch });
+
+  assert.equal(S.phonePool("view", legs({ phoneViewEnabled: true })).length, 9);
+  assert.equal(S.phonePool("view", legs({})).length, 0);
+  ok("查看类：开着给九条，关着给空");
+
+  /*
+   * 操控类横跨两个开关。只开放歌时**锁屏必须匹配不上** —— 不滤的话
+   * controlFeatures() 里有锁屏，用户那部手机就真的被锁了。
+   */
+  const musicOnly = S.phonePool("control", legs({ phoneMusicEnabled: true }));
+  assert.equal(musicOnly.length, 6);
+  assert.ok(!musicOnly.some((f) => f.key === "lock"), "只开放歌时锁屏不许在 pool 里");
+  assert.ok(musicOnly.every((f) => f.group === "music"));
+  ok("只开放歌：pool 里只有网易云那六件，锁屏进不来");
+
+  const ctrlOnly = S.phonePool("control", legs({ phoneControlEnabled: true }));
+  assert.equal(ctrlOnly.length, 4);
+  assert.ok(!ctrlOnly.some((f) => f.group === "music"), "只开操控时网易云不许在 pool 里");
+  ok("只开操控：pool 里只有闹钟锁屏那四件，网易云进不来");
+
+  assert.equal(
+    S.phonePool("control", legs({ phoneControlEnabled: true, phoneMusicEnabled: true })).length,
+    10
+  );
+  assert.equal(S.phonePool("control", legs({})).length, 0);
+  ok("两个都开给十条，都关给空");
+}
+
+console.log("\n[标签：手机那两个]");
+{
+  assert.deepEqual(S.phoneTargetIn("[查岗手机:支付宝账单]"), {
+    kind: "view",
+    keyword: "支付宝账单",
+    at: 0,
+  });
+  assert.equal(S.phoneTargetIn("［操控手机：锁屏］")?.kind, "control");
+  ok("全角方括号和全角冒号都认");
+
+  // 屏幕那两个标签不许被这两条正则吃掉（查岗手机 中间夹着「实时」）
+  assert.equal(S.phoneTargetIn("[查岗实时手机屏幕]"), null);
+  assert.equal(S.spyTargetIn("[查岗手机:支付宝账单]"), null);
+  ok("屏幕标签和手机标签互不串台");
+
+  assert.equal(S.phoneTargetIn("<thinking>要不要[操控手机:锁屏]</thinking>"), null);
+  ok("thinking 块里复述格式不算");
+
+  // 空体：认得出来所以剥得掉，但不当成「写了」
+  assert.equal(S.phoneTargetIn("[查岗手机:]"), null);
+  assert.equal(S.hasPhoneTag("[查岗手机:]"), false);
+  assert.equal(S.stripSpyTags("在的[查岗手机:]"), "在的");
+  ok("空标签：不当成写了，但照样剥干净");
+
+  // 两个都写了按先出现的算
+  assert.equal(S.phoneTargetIn("[操控手机:锁屏]然后[查岗手机:微信]")?.kind, "control");
+  assert.equal(S.phoneTargetIn("[查岗手机:微信]然后[操控手机:锁屏]")?.kind, "view");
+  ok("查看和操控都写了：按先出现的算");
+
+  // 参数原样带出来，拆是 splitArg 的事
+  assert.equal(S.phoneTargetIn("[操控手机:放歌 稻香 周杰伦]")?.keyword, "放歌 稻香 周杰伦");
+  ok("参数里的空格不丢");
+
+  // 四个标签一起剥
+  const messy = "在的[查岗实时电脑屏幕][查岗手机:微信][操控手机:锁屏]好";
+  assert.equal(S.stripSpyTags(messy), "在的好");
+  ok("stripSpyTags 四个标签一起剥");
+}
+
+console.log("\n[提示词：五个开关各自决定注入什么]");
 {
   const bothOff = setup();
   const s0 = await formatSection(bothOff.config, bothOff.role);
   assert.ok(!s0.includes("<查岗>"), s0);
-  ok("两条腿都关：整条查岗不注入（模型压根不知道有这功能）");
+  ok("五个都关：整条查岗不注入（模型压根不知道有这功能）");
 
-  const both = setup({ spy: { pcEnabled: true, phoneEnabled: true } });
+  const all = {
+    pcEnabled: true,
+    phoneEnabled: true,
+    phoneViewEnabled: true,
+    phoneControlEnabled: true,
+    phoneMusicEnabled: true,
+  };
+  const both = setup({ spy: all });
   const s1 = await formatSection(both.config, both.role);
   assert.ok(s1.includes("<查岗>"), s1);
   assert.ok(s1.includes("[查岗实时电脑屏幕]"), s1);
   assert.ok(s1.includes("[查岗实时手机屏幕]"), s1);
   assert.ok(s1.includes("自动改看另一头"), s1);
-  ok("两条腿都开：两个标签都教，回退那句话留着");
+  // 三个占位符都该被换成真清单，一个都不许漏出去
+  for (const v of ["{{查看项}}", "{{操控项}}", "{{网易云项}}"]) {
+    assert.ok(!s1.includes(v), `占位符 ${v} 漏进提示词了：\n` + s1);
+  }
+  assert.ok(s1.includes("支付宝账单"), "查看清单该有支付宝账单：\n" + s1);
+  assert.ok(s1.includes("锁屏"), "操控清单该有锁屏：\n" + s1);
+  assert.ok(s1.includes("每日推荐"), "网易云清单该有每日推荐：\n" + s1);
+  // 全开时不补那句「你这一轮能用的标签只有」
+  assert.ok(!s1.includes("你这一轮能用的标签"), "全开时不该补那句：\n" + s1);
+  ok("五个全开：五行都教、三个清单都填上、不补多余的话");
 
-  const pcOnly = setup({ spy: { pcEnabled: true, phoneEnabled: false } });
+  const pcOnly = setup({ spy: { pcEnabled: true } });
   const s2 = await formatSection(pcOnly.config, pcOnly.role);
   assert.ok(s2.includes("<查岗>"), s2);
   assert.ok(s2.includes("[查岗实时电脑屏幕]"), s2);
   assert.ok(!s2.includes("[查岗实时手机屏幕]"), "手机标签必须一个字都不剩：\n" + s2);
   assert.ok(!s2.includes("自动改看另一头"), "单腿时不该说会自动改看另一头：\n" + s2);
-  assert.ok(s2.includes("你现在只能看电脑屏幕"), s2);
-  ok("只开电脑腿：手机标签全删、补一句「只能看电脑」");
+  assert.ok(!s2.includes("[查岗手机:"), "查看类关着，那一行必须删掉：\n" + s2);
+  assert.ok(!s2.includes("[操控手机:"), "操控和放歌都关着，那两行必须删掉：\n" + s2);
+  assert.ok(s2.includes("屏幕你只能看电脑"), s2);
+  ok("只开电脑腿：另外四行全删、补一句「只能看电脑」");
 
-  const phoneOnly = setup({ spy: { pcEnabled: false, phoneEnabled: true } });
+  const phoneOnly = setup({ spy: { phoneEnabled: true } });
   const s3 = await formatSection(phoneOnly.config, phoneOnly.role);
   assert.ok(s3.includes("[查岗实时手机屏幕]"), s3);
   assert.ok(!s3.includes("[查岗实时电脑屏幕]"), "电脑标签必须一个字都不剩：\n" + s3);
-  assert.ok(s3.includes("你现在只能看手机屏幕"), s3);
+  assert.ok(s3.includes("屏幕你只能看手机"), s3);
   ok("只开手机腿：电脑标签全删、补一句「只能看手机」");
 
+  /*
+   * 只开放歌 —— 最容易出错的一种：`操控手机` 和 `放歌` 两行共用
+   * `[操控手机:…]` 这一个标签前缀，按标签认行的话会把两行一起删掉。
+   */
+  const musicOnly = setup({ spy: { phoneMusicEnabled: true } });
+  const s5 = await formatSection(musicOnly.config, musicOnly.role);
+  assert.ok(s5.includes("<查岗>"), s5);
+  assert.ok(s5.includes("每日推荐"), "网易云那行必须留着：\n" + s5);
+  assert.ok(!s5.includes("锁屏"), "操控那行必须删掉（锁屏没开）：\n" + s5);
+  assert.ok(!s5.includes("[查岗实时"), "屏幕那两行必须删掉：\n" + s5);
+  assert.ok(s5.includes("你看不到他的屏幕"), s5);
+  ok("只开放歌：操控那行删掉、网易云那行留着（两行共用同一个标签前缀也分得开）");
+
+  // 反过来：只开操控，网易云那行要删掉
+  const ctrlOnly = setup({ spy: { phoneControlEnabled: true } });
+  const s6 = await formatSection(ctrlOnly.config, ctrlOnly.role);
+  assert.ok(s6.includes("锁屏"), "操控那行必须留着：\n" + s6);
+  assert.ok(!s6.includes("每日推荐"), "网易云那行必须删掉：\n" + s6);
+  ok("只开操控：网易云那行删掉、操控那行留着");
+
   // 预设里那条子条目关着时，开关开着也不注入（两道闸都在）
-  const childOff = setup({ spy: { pcEnabled: true, phoneEnabled: true } });
+  const childOff = setup({ spy: all });
   const fmt = childOff.preset.entries.find((e) => e.kind === "format");
   fmt.children.find((c) => c.kind === "spy").enabled = false;
   const s4 = await formatSection(childOff.config, childOff.role);
   assert.ok(!s4.includes("<查岗>"), s4);
   ok("预设里那条子条目关着：开关开着也不注入");
+
+  // 预设歌单：配了就把名字列给模型，没配就明说这一项用不了
+  const withList = setup({ spy: { phoneMusicEnabled: true } });
+  withList.config.spyApi = { playlists: [{ name: "睡前", id: "123" }] };
+  const s7 = await formatSection(withList.config, withList.role);
+  assert.ok(s7.includes("睡前"), "配了的歌单名字该列给模型：\n" + s7);
+  assert.ok(s7.includes("还没预设过歌单") === false, s7);
+  const noList = setup({ spy: { phoneMusicEnabled: true } });
+  noList.config.spyApi = { playlists: [] };
+  const s8 = await formatSection(noList.config, noList.role);
+  assert.ok(s8.includes("还没预设过歌单"), "一个都没配时该明说用不了：\n" + s8);
+  ok("预设歌单：配了列名字，没配就明说这一项用不了");
 
   // trimSpyPrompt 直接测：用户改过正文时按标签认行，不认小标题
   const custom = [
@@ -244,9 +385,17 @@ console.log("\n[提示词：两条腿各自决定注入什么]");
   assert.equal(S.trimSpyPrompt("随便什么", { pc: false, phone: false }), "");
   ok("trimSpyPrompt 两条腿都关时返回空串（调用方据此整条跳过）");
 
-  const untouched = "两头都开的时候一个字都不动";
-  assert.equal(S.trimSpyPrompt(untouched, { pc: true, phone: true }), untouched);
-  ok("trimSpyPrompt 两条腿都开时原样返回");
+  // 注意这是 legs 的形状（spyLegs 的返回值），不是上面那个角色开关的形状
+  const allLegs = { pc: true, phone: true, view: true, control: true, music: true };
+  const untouched = "五个全开的时候一个字都不动";
+  assert.equal(S.trimSpyPrompt(untouched, allLegs), untouched);
+  ok("trimSpyPrompt 五个全开时原样返回");
+
+  // 少一个就得补那句 —— 全开才是「一个字不动」的唯一条件
+  const screensOnly = S.trimSpyPrompt(untouched, { pc: true, phone: true });
+  assert.ok(screensOnly.includes("补充"), screensOnly);
+  assert.ok(screensOnly.includes("只能看他手机里") === false, screensOnly);
+  ok("只开屏幕两条腿：正文原样留着，末尾补一句能用的标签");
 }
 
 console.log("\n[回退：不许倒进关着的那条腿]");
@@ -315,6 +464,80 @@ console.log("\n[回退：不许倒进关着的那条腿]");
   } finally {
     globalThis.fetch = realFetch;
   }
+}
+
+console.log("\n[runPhone：四种结局，一律不抛错]");
+{
+  /*
+   * runPhone 里真去做事的那一步是 spyrun.js:runByName（发邮件 + 等回传），
+   * 这儿不碰它 —— 只测 runPhone 自己那几道判断：没开识图、名字对不上、
+   * 越权（开关关着 pool 是空的）。这三条都在发邮件**之前**就返回了，
+   * 所以不需要假 SMTP。
+   */
+  const allOn = {
+    pcEnabled: true,
+    phoneEnabled: true,
+    phoneViewEnabled: true,
+    phoneControlEnabled: true,
+    phoneMusicEnabled: true,
+  };
+  const vision = { vision: { provider: "p-1", modelId: "vm", baseUrl: "x", key: "k" } };
+
+  // 查看类没开识图模型：抓图之前就退出（别白唤醒用户手机一趟）
+  const noVision = setup({ spy: allOn });
+  const n1 = await S.runPhone(
+    { kind: "view", keyword: "支付宝账单" },
+    { role: noVision.role, eps: {}, spyApi: noVision.config.spyApi, userName: "小明", scope: "测试" }
+  );
+  assert.ok(n1.includes("没开识图模型"), n1);
+  assert.ok(n1.includes("别告诉对方你在动他的手机"), "该走失败模板：\n" + n1);
+  ok("查看类没开识图模型：不发邮件，直接给模型一句原因");
+
+  // 名字对不上：把「能用的是……」原样交给模型，它下一轮就能改对
+  const bad = setup({ spy: allOn });
+  const n2 = await S.runPhone(
+    { kind: "view", keyword: "手机屏幕" },
+    { role: bad.role, eps: vision, spyApi: bad.config.spyApi, userName: "小明", scope: "测试" }
+  );
+  assert.ok(n2.includes("没有「手机屏幕」这个功能"), n2);
+  assert.ok(n2.includes("支付宝账单"), "该把能用的那几项列给模型：\n" + n2);
+  ok("名字对不上：把「能用的是…」透给模型，不是干巴巴一句没成");
+
+  /*
+   * 越权那一条 —— 这套里最要紧的判断：只开了放歌的用户，写 [操控手机:锁屏]
+   * 必须匹配不上。匹配上了那部手机就真被锁了，而用户从没同意过这件事。
+   */
+  const musicOnly = setup({ spy: { phoneMusicEnabled: true } });
+  const n3 = await S.runPhone(
+    { kind: "control", keyword: "锁屏" },
+    {
+      role: musicOnly.role,
+      eps: vision,
+      spyApi: musicOnly.config.spyApi,
+      userName: "小明",
+      scope: "测试",
+    }
+  );
+  assert.ok(n3.includes("没有「锁屏」这个功能"), "只开放歌时锁屏必须匹配不上：\n" + n3);
+  assert.ok(!n3.includes("已经"), "不许走成功模板：\n" + n3);
+  ok("只开放歌：[操控手机:锁屏] 匹配不上（没同意过的事一件都做不了）");
+
+  // 三个手机开关全关：pool 空的，什么名字都匹配不上
+  const phoneOff = setup({ spy: { pcEnabled: true, phoneEnabled: true } });
+  const n4 = await S.runPhone(
+    { kind: "view", keyword: "支付宝账单" },
+    {
+      role: phoneOff.role,
+      eps: vision,
+      spyApi: phoneOff.config.spyApi,
+      userName: "小明",
+      scope: "测试",
+    }
+  );
+  assert.ok(n4.includes("没有「支付宝账单」这个功能"), n4);
+  ok("查看开关关着：pool 是空的，屏幕开关开着也碰不到手机里的东西");
+
+  ok("runPhone 从不抛错（上面四条都返回了给模型的话）");
 }
 
 console.log("\n[手机腿：multipart 解析]");

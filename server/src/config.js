@@ -534,9 +534,15 @@ export const DEFAULT_CONFIG = {
       // 见 normalizeSpy）。电脑那头默认指向本地截图程序的 127.0.0.1:6878；
       // 手机那头没有地址 —— 走触发邮件，凭据在全局的 spyApi 里。
       // 两份文案留空 = 用 spy.js 里的默认
+      // phoneView / phoneControl / phoneMusic 管的是手机**里面**那十八件事
+      // （spyfeatures.js），和「看一眼手机屏幕」是两码事，所以另有三个开关，
+      // 也全默认关 —— 理由见 normalizeSpy
       spy: {
         pcEnabled: false,
         phoneEnabled: false,
+        phoneViewEnabled: false,
+        phoneControlEnabled: false,
+        phoneMusicEnabled: false,
         pcUrl: "127.0.0.1:6878",
         autoFallback: true,
         fallbackTemplate: "",
@@ -601,6 +607,9 @@ export const DEFAULT_CONFIG = {
     webhookSecret: "",
     webhookPath: "/phone/screenshot",
     waitSeconds: 90,
+    // 预设歌单 [{name, id}]：`[操控手机:预设歌单 睡前]` 要的那份对照表。
+    // 空 = 那个功能用不了（歌单 ID 没有公开接口能按名字查，见 normalizeSpyPlaylists）
+    playlists: [],
   },
   // 语音合成（TTS）的凭据，同样全局一份（只写 data.config.json）。
   // 三家都没开 = 角色就算打开了「发语音」也发不出来，退化成文字，见 media.js
@@ -1720,12 +1729,38 @@ function normalizeWebSearch(input) {
  * 只在新字段**压根不存在**时才回落到 `enabled`，任一新字段存在就以新的为准
  * （不然用户刚关掉的那条腿会被老字段又打开）。返回值里**不再带 `enabled`** ——
  * 留着会让「哪个才是真开关」有两个答案。
+ *
+ * ── 手机里那十八件事：另外三个开关 ──
+ *
+ * `phoneEnabled` 管的是**看一眼手机屏幕**（`[查岗实时手机屏幕]`）。手机里那十八件
+ * 事（spyfeatures.js）是另一码事，再拆三个开关：
+ *
+ *   phoneViewEnabled     查看类，`[查岗手机:支付宝账单]`。会打开用户的 App 截一张图
+ *   phoneControlEnabled  操控类里的闹钟和锁屏，`[操控手机:锁屏]`
+ *   phoneMusicEnabled    网易云那六件事，`[操控手机:放歌 晴天]`
+ *
+ * 为什么不跟着 `phoneEnabled` 一起开：**看一眼和动手是两件事**。屏幕查岗只是
+ * 截一张图，而查看类会替用户打开微信、支付宝、淘宝订单（看到的比一张桌面截图
+ * 私密得多），操控类更是真的改变手机状态 —— 角色能给用户设闹钟、把他手机锁掉。
+ * 「可以看我屏幕，但别动我手机」是个合理要求，得能表达出来。
+ *
+ * 音乐单独一个开关是因为它和另外两类的性质也不一样：放歌要先去 163 搜一次歌
+ * （一次外部请求），而且这是这批里唯一**锁屏状态下也生效**的一类 —— 用户可能
+ * 很愿意让角色给他放歌，同时完全不想让角色看他的微信。
+ *
+ * 三个全默认 false，和 pc/phone 那两个一个道理：这一整套的代价都是外溢的，
+ * 必须是用户自己一个一个点开的。**不继承老的 `enabled`** —— 那个字段的年代
+ * 压根没有这十八件事，拿它当「用户同意过」的证据是假的。
  */
 function normalizeSpy(input) {
   const legacy = Boolean(input?.enabled);
   return {
     pcEnabled: input?.pcEnabled === undefined ? legacy : Boolean(input.pcEnabled),
     phoneEnabled: input?.phoneEnabled === undefined ? legacy : Boolean(input.phoneEnabled),
+    // 手机里那十八件事，三类各一个开关（见上面那段）。全默认关，不继承 legacy
+    phoneViewEnabled: Boolean(input?.phoneViewEnabled),
+    phoneControlEnabled: Boolean(input?.phoneControlEnabled),
+    phoneMusicEnabled: Boolean(input?.phoneMusicEnabled),
     /*
      * 电脑那头：本地 Windows 截图程序（astrbot_plugin_screen_monitor_exe），
      * 默认 127.0.0.1:6878。这是角色自己的字段，因为不同角色可以查不同机器。
@@ -1778,7 +1813,40 @@ function normalizeSpyApi(input) {
     webhookPath: normalizeWebhookPath(input?.webhookPath),
     // 等图最多等多久（秒）。钳的逻辑在 spy.js:clampWait，这里只存
     waitSeconds: clampInt(input?.waitSeconds, 90, 20, 180),
+    // 预设歌单（见 normalizeSpyPlaylists）。和上面几个字段一样是「用户那部手机」
+    // 的事，不属于哪个角色，所以也在这块、也跟着整块进密钥文件
+    playlists: normalizeSpyPlaylists(input?.playlists),
   };
+}
+
+/**
+ * 预设歌单：`[{ name, id }]`。
+ *
+ * 为什么要预设：`[操控手机:预设歌单 睡前]` 那一路要往邮件正文里塞
+ * `orpheus://playlist/<id>`，而歌单 ID 是一串数字，没有公开接口能按名字查到
+ * 用户自己收藏的歌单（放歌那一路能搜是因为单曲有公开搜索接口）。所以只能让
+ * 用户自己填一次：名字给模型认，ID 给快捷指令用。
+ *
+ * **两个字段都空的行整条丢掉**，只有一个空的也丢 —— 只有名字没有 ID 的歌单
+ * 放不了，只有 ID 没有名字的模型没法点。静默留着会让 spyrun.js:matchPlaylist
+ * 匹配上一条放不出来的歌单，然后模型收到的是一句莫名其妙的失败。
+ *
+ * ID 只留数字：用户大概率是从网易云分享链接里整条粘过来的
+ * （`https://music.163.com/playlist?id=123456` 或者 `#/playlist?id=123456`），
+ * 让他自己抠那串数字不如这儿抠。抠不出数字的行当没填。
+ *
+ * 不去重、不排序 —— 顺序是用户填的顺序，界面上和提示词里都按这个顺序走
+ * （和 parseFeatureList 一个道理）。同名两条的话 matchPlaylist 取先出现的那个。
+ */
+function normalizeSpyPlaylists(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((p) => ({
+      name: str(p?.name).trim(),
+      // 粘一整条分享链接进来也认：把里面的 id=数字 抠出来
+      id: (/(?:^|[?&#/])id=(\d+)/.exec(str(p?.id)) ?? [])[1] ?? str(p?.id).replace(/\D+/g, ""),
+    }))
+    .filter((p) => p.name && p.id);
 }
 
 /**
