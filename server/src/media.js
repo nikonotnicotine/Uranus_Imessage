@@ -1026,6 +1026,126 @@ export async function toMp3ForStt(buffer, { ext = "", mimeType = "", scope }) {
   }
 }
 
+/**
+ * 小于这个的图**压根不动**。
+ *
+ * 700KB 的图上传只要一两秒，跑一趟 ffmpeg（起进程 + 读写临时文件）省下来的
+ * 时间抵不上折腾。手机直出的照片、微信转发的截图基本都在这条线以上，
+ * 表情包和小图标在这条线以下 —— 正好是想要的分界。
+ */
+const VISION_SHRINK_MIN = 700 * 1024;
+
+/**
+ * 压完最长边不超过这个。
+ *
+ * 各家多模态模型内部都会把图切成固定大小的 tile（Gemini 是 768、GPT 是 512），
+ * 再高的分辨率进去也是先被它压掉。1600 已经比任何一家的内部尺寸都大，
+ * 留的余量是给「看图里的小字」这种用法的。
+ */
+const VISION_MAX_SIDE = 1600;
+
+/**
+ * 把**收到的**图片压小再送去识别。
+ *
+ * ── 为什么要压 ──
+ *
+ * 上限是 20MB，而 base64 还要再胀三分之一 —— 一张手机原图能让请求体到 27MB。
+ * 那 27MB 要先老老实实上传给中转站，用户在 iMessage 那头看着打字指示器等。
+ * 而模型自己会把图切成 768px 的 tile，多传的那几十兆**一点用都没有**，
+ * 纯粹是白等。压到 1600 边长、JPEG 质量 4，通常是几百 KB，识别结果没区别。
+ *
+ * ── 永不抛错 ──
+ *
+ * 和 toMp3ForStt 一个口径：ffmpeg 找不到、转失败、转出来反而更大，一律原样退回。
+ * 压缩是**纯粹的优化**，为它让整轮识图失败是本末倒置。
+ *
+ * 一个已知的取舍：带透明通道的图转成 JPEG 会把透明填成黑色。真透明的图
+ * （贴纸、图标）几乎都在 700KB 以下、压根走不到这儿；而 700KB 以上的 PNG
+ * 基本是截图，alpha 通道全是 255，转过去颜色一模一样。
+ *
+ * @param {Buffer} buffer 原始图片字节
+ * @param {{mimeType?: string, name?: string, scope: string}} opts
+ * @returns {Promise<{buffer: Buffer, mimeType: string}>} 压不动时原样退回
+ */
+export async function shrinkForVision(buffer, { mimeType = "", name = "", scope }) {
+  const fallback = () => ({ buffer, mimeType: mimeType || "image/jpeg" });
+  const kb = (n) => (n / 1024).toFixed(0);
+  if (!buffer?.length || buffer.length <= VISION_SHRINK_MIN) return fallback();
+
+  try {
+    const bin = await ffmpegPath();
+    if (!bin) {
+      logWarn(
+        scope,
+        `找不到 ffmpeg（静态包没装、PATH 上也没有），这张 ${kb(buffer.length)}KB 的图按原样送去识别，会慢一些`
+      );
+      return fallback();
+    }
+
+    const os = await import("node:os");
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "uranus-vis-"));
+    const ext = sniffImage(buffer).ext;
+    const inPath = path.join(dir, `in.${ext}`);
+    const outPath = path.join(dir, "out.jpg");
+    try {
+      await fs.promises.writeFile(inPath, buffer);
+      const { code, stderr } = await runFfmpeg(bin, [
+        "-y",
+        "-hide_banner",
+        "-i",
+        inPath,
+        /*
+         * 装成 `min(边长, 1600)` 的框再 decrease 收进去 —— 这样**不会放大**。
+         * 直接写 `scale=1600:1600:force_original_aspect_ratio=decrease` 的话，
+         * 一张 400×300 的图会被拉到 1600×1200，字节数反而涨。
+         * force_divisible_by=2 是给 JPEG 的色度采样对齐用的。
+         */
+        "-vf",
+        `scale='min(iw,${VISION_MAX_SIDE})':'min(ih,${VISION_MAX_SIDE})'` +
+          ":force_original_aspect_ratio=decrease:force_divisible_by=2",
+        // 动图只取第一帧：不加这个 ffmpeg 会按帧写出一串文件，而模型也只看一帧
+        "-frames:v",
+        "1",
+        "-q:v",
+        "4",
+        "-pix_fmt",
+        "yuvj420p",
+        outPath,
+      ]);
+
+      if (code !== 0) {
+        logWarn(scope, `ffmpeg 压图失败（退出码 ${code}），按原图送去识别`, clipBody(stderr));
+        return fallback();
+      }
+      const out = await fs.promises.readFile(outPath);
+      if (!out.length) {
+        logWarn(scope, "ffmpeg 压出来是空文件，按原图送去识别");
+        return fallback();
+      }
+      /*
+       * 压完反而更大就别用压完的。走到这儿的多半是本来就压得很狠的 JPEG ——
+       * 重新编码一次只会掉质量、还多花几百 KB。
+       */
+      if (out.length >= buffer.length) {
+        logDebug(scope, `这张图压完反而更大（${kb(buffer.length)}KB → ${kb(out.length)}KB），按原图送`);
+        return fallback();
+      }
+
+      logDebug(
+        scope,
+        `图片压小${name ? `「${name}」` : ""}：${kb(buffer.length)}KB ${ext} → ${kb(out.length)}KB jpg` +
+          `（省了 ${Math.round((1 - out.length / buffer.length) * 100)}%）`
+      );
+      return { buffer: out, mimeType: "image/jpeg" };
+    } finally {
+      await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  } catch (e) {
+    logWarn(scope, "压图出错，按原图送去识别", String(e?.message ?? e));
+    return fallback();
+  }
+}
+
 /** 上游错误体截一段出来，别把整页 HTML 灌进日志。 */
 function clipBody(text) {
   const s = String(text ?? "").replace(/\s+/g, " ").trim();

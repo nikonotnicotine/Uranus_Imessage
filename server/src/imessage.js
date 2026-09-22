@@ -36,6 +36,7 @@ import {
   generateImage,
   hasLeaveOnRead,
   resolveRefFile,
+  shrinkForVision,
   splitMedia,
   stripLeaveOnRead,
   synthesizeVoice,
@@ -304,6 +305,9 @@ function createRunner(projectRefId) {
     history: new Map(), // spaceId -> [{role, content}]
     seen: new Set(), // 消息 id 去重
     pending: new Map(), // spaceId -> { texts, images, timer, space }
+    // spaceId -> 还有几条消息正在拆附件。合并窗口到点时看它决定「发」还是
+    // 「再等等」—— 图和文字被拆成两轮的根因就在这儿，见 holdPending
+    holds: new Map(),
     chains: new Map(), // spaceId -> Promise（同一会话串行处理）
     proactive: new Map(), // spaceId -> 主动消息的调度槽，见 proactiveSlot
     // 最近一条入站消息所在的会话。Instagram 那条链路要用：角色在别人帖子底下
@@ -873,9 +877,20 @@ async function readImage(content, scope = "桥接") {
   if (buf.length > MAX_IMAGE_BYTES) {
     throw new Error(`图片 ${mb(buf.length)}MB，超过 ${cap}MB 上限`);
   }
-  return {
-    base64: buf.toString("base64"),
+
+  /*
+   * 压小再识别。上限判定用的是**原图**大小（上面那两处）—— 压缩是优化，
+   * 不该顺手把「超过 20MB 上限」这条规则放宽；压不动时（没 ffmpeg / 转失败）
+   * 原样退回，识别照跑，只是慢一些。详见 media.js:shrinkForVision。
+   */
+  const small = await shrinkForVision(buf, {
     mimeType: content.mimeType,
+    name: content.name,
+    scope,
+  });
+  return {
+    base64: small.buffer.toString("base64"),
+    mimeType: small.mimeType,
     name: content.name,
   };
 }
@@ -1080,9 +1095,44 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
    */
   if (item?.message) slot.message = item.message;
 
-  const fire = () => {
+  /**
+   * 引爆这一轮。
+   *
+   * @param {boolean} [force] 附件还在下载也照发。只有 flushPending 传 true ——
+   *   那三处（指令 / 协助模式 / 线下模式）要的正是「排在前面的那一轮先跑完」。
+   */
+  const fire = (force = false) => {
     if (slot.timer) clearTimeout(slot.timer);
     slot.timer = null;
+    /*
+     * 还有附件正在拆 → 这一轮先挂起。
+     *
+     * 这就是「图 + 字被拆成两轮」的修法（整个来龙去脉见 holdPending）。到点了
+     * 却有东西还在路上时，把窗口挂起：`slot.due` 记着「已经到点，只差附件」，
+     * slot 留在 runner.pending 里**不动**，最后一个附件落地时由 releasePending
+     * 补上这一次引爆。
+     *
+     * 不额外加兜底计时器：hold 的寿命就是 readBytes 的寿命（重试到头 17.8 秒，
+     * 见 attachread.js），而且释放写在调用方的 finally 里，读崩了照样放。
+     *
+     * `wait === 0`（用户把合并关了）那条路走不到这儿的挂起分支：那时候 slot
+     * 压根没进 runner.pending，挂起就等于把这一轮丢掉。判据写成「表里那个
+     * 就是我」而不是 `wait === 0`，因为被 flushPending 引爆过的 slot 也已经
+     * 不在表里了。
+     */
+    const holds =
+      force || runner.pending.get(spaceId) !== slot
+        ? 0
+        : runner.holds?.get(spaceId) ?? 0;
+    if (holds > 0) {
+      slot.due = true;
+      logDebug(
+        scopeOf(runner, "桥接"),
+        `这一轮到点了，但还有附件在下载，等它拆完一起发`
+      );
+      return;
+    }
+    slot.due = false;
     runner.pending.delete(spaceId);
     const videos = slot.videos ?? [];
     if (runner.stopped) {
@@ -1144,6 +1194,18 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
     return;
   }
 
+  /*
+   * 窗口已经到点、正等着附件拆完（slot.due）—— 那**不能重新装一个计时器**。
+   *
+   * 走到这儿的典型情形就是被修的那个 bug 的下半段：窗口到点挂起，紧接着那张图
+   * 读好了、进这个 slot。这时候重开一个 6 秒的窗口，等于附件每拆完一件就把这
+   * 一轮往后推一次 —— 那又是 debounce。该由 releasePending 立刻引爆。
+   */
+  if (slot.due) {
+    logDebug(scopeOf(runner, "桥接"), `又攒一条：${counts}，这一轮已经到点，拆完就发`);
+    return;
+  }
+
   logDebug(scopeOf(runner, "桥接"), `攒消息中：${counts}，${wait}s 后把这期间的一起发`);
   slot.firesAt = Date.now() + wait * 1000;
   slot.timer = setTimeout(fire, wait * 1000);
@@ -1180,30 +1242,44 @@ async function describeImages(endpoint, prompt, max, runner, images) {
     logWarn(scope, `这轮收到 ${images.length} 张图，按上限只识别前 ${use.length} 张`);
   }
 
-  const parts = [];
-  let failed = 0;
-  let firstError = null;
-  for (const [i, image] of use.entries()) {
-    const label = use.length > 1 ? `图片${i + 1}` : "图片";
-    // 开始那行也要有：识图要打一次模型（VISION_TIMEOUT 是 180 秒），只有
-    // 「完成」那行的话，这中间几十秒在控制台里看不出是在识别还是卡住了
-    logInfo(scope, `开始识别${label}${use.length > 1 ? `（共 ${use.length} 张）` : ""}…`);
-    const startedAt = Date.now();
-    try {
-      const desc = await describeImage(endpoint, prompt, image);
-      logInfo(
-        scope,
-        `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
-      );
-      runner.imageCount += 1;
-      parts.push(`${label}内容：${desc}`);
-    } catch (e) {
-      logError(scope, `${label}识别失败（等了 ${secsSince(startedAt)}s）`, e);
-      parts.push(`${label}：识别失败（${String(e?.message ?? e)}）`);
-      failed += 1;
-      firstError ??= e;
-    }
-  }
+  /*
+   * 几张图**同时**识别。
+   *
+   * 以前是 for 里逐张 await：三张图就是三个来回串起来，每个来回十几秒，用户
+   * 等的是它们的和。而这几张之间毫无依赖，各打一次接口而已。
+   *
+   * 用 Promise.all 收，顺序由数组下标定，不靠谁先回来 —— 所以「图片1 / 图片2」
+   * 的编号和拼出来的顺序还是用户发的那个顺序。失败也按下标顺序归并（firstError
+   * 要的是「排最前面那张的错」，上游拿它给用户报一句原因）。
+   *
+   * 并发数就是 max（默认 3），不另外限流：这是**一轮对话内**的几张图，量级摆在
+   * 那儿；真正要防的是几条会话同时来，那个由别处的会话级排队管。
+   */
+  const settled = await Promise.all(
+    use.map(async (image, i) => {
+      const label = use.length > 1 ? `图片${i + 1}` : "图片";
+      // 开始那行也要有：识图要打一次模型（VISION_TIMEOUT 是 180 秒），只有
+      // 「完成」那行的话，这中间几十秒在控制台里看不出是在识别还是卡住了
+      logInfo(scope, `开始识别${label}${use.length > 1 ? `（共 ${use.length} 张，并发）` : ""}…`);
+      const startedAt = Date.now();
+      try {
+        const desc = await describeImage(endpoint, prompt, image);
+        logInfo(
+          scope,
+          `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
+        );
+        runner.imageCount += 1;
+        return { part: `${label}内容：${desc}`, err: null };
+      } catch (e) {
+        logError(scope, `${label}识别失败（等了 ${secsSince(startedAt)}s）`, e);
+        return { part: `${label}：识别失败（${String(e?.message ?? e)}）`, err: e };
+      }
+    })
+  );
+
+  const parts = settled.map((r) => r.part);
+  const failed = settled.filter((r) => r.err).length;
+  const firstError = settled.find((r) => r.err)?.err ?? null;
 
   const skipped =
     images.length > use.length
@@ -1252,29 +1328,34 @@ async function describeVoices(endpoint, prompt, max, runner, voices) {
     logWarn(scope, `这轮收到 ${voices.length} 条语音，按上限只识别前 ${use.length} 条`);
   }
 
-  const parts = [];
-  let failed = 0;
-  let firstError = null;
-  for (const [i, voice] of use.entries()) {
-    const label = use.length > 1 ? `语音${i + 1}` : "语音";
-    const dur = voice.seconds ? `（${voice.seconds.toFixed(1)} 秒）` : "";
-    logInfo(scope, `开始识别${label}${dur}${use.length > 1 ? `（共 ${use.length} 条）` : ""}…`);
-    const startedAt = Date.now();
-    try {
-      const desc = await transcribeAudio(endpoint, prompt, voice);
+  // 同 describeImages：几条语音同时听，顺序按下标定（见那边的注释）
+  const settled = await Promise.all(
+    use.map(async (voice, i) => {
+      const label = use.length > 1 ? `语音${i + 1}` : "语音";
+      const dur = voice.seconds ? `（${voice.seconds.toFixed(1)} 秒）` : "";
       logInfo(
         scope,
-        `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
+        `开始识别${label}${dur}${use.length > 1 ? `（共 ${use.length} 条，并发）` : ""}…`
       );
-      runner.audioCount += 1;
-      parts.push(`${label}${dur}内容：${desc}`);
-    } catch (e) {
-      logError(scope, `${label}识别失败（等了 ${secsSince(startedAt)}s）`, e);
-      parts.push(`${label}${dur}：识别失败（${String(e?.message ?? e)}）`);
-      failed += 1;
-      firstError ??= e;
-    }
-  }
+      const startedAt = Date.now();
+      try {
+        const desc = await transcribeAudio(endpoint, prompt, voice);
+        logInfo(
+          scope,
+          `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
+        );
+        runner.audioCount += 1;
+        return { part: `${label}${dur}内容：${desc}`, err: null };
+      } catch (e) {
+        logError(scope, `${label}识别失败（等了 ${secsSince(startedAt)}s）`, e);
+        return { part: `${label}${dur}：识别失败（${String(e?.message ?? e)}）`, err: e };
+      }
+    })
+  );
+
+  const parts = settled.map((r) => r.part);
+  const failed = settled.filter((r) => r.err).length;
+  const firstError = settled.find((r) => r.err)?.err ?? null;
 
   const skipped =
     voices.length > use.length
@@ -1505,8 +1586,68 @@ function flushPending(runner, spaceId) {
   const slot = runner.pending.get(spaceId);
   if (!slot?.fire) return false;
   logDebug(scopeOf(runner, "桥接"), "有攒着的消息，先把它这一轮跑完再执行指令");
-  slot.fire();
+  // 硬引爆：附件还在下载也照发。这三处调用（指令 / 协助模式 / 线下模式）要的是
+  // 「排在它前面的那一轮先跑完」，等下载会把顺序又倒过来 —— 那正是这个函数要治的病
+  slot.fire(true);
   return true;
+}
+
+/**
+ * 占住这条会话的合并窗口：这条消息还在拆附件，到点了也先别发。
+ *
+ * ── 治的是什么 ──
+ *
+ * 用户报的原话：「发了图 + 字，LLM 先回了文字，图片过了好一会儿才发出去」。
+ * 根因是两件独立正确的事撞在一起：
+ *
+ *  - 合并窗口以**第一条**消息为基准，后来的不推后计时器（见 enqueue 的注释）；
+ *  - 附件字节是在消息循环里**同步**读的，断流还要重试，最多 17.8 秒
+ *    （见 attachread.js 的 RETRY_MS）。
+ *
+ * 于是文字先落地的那种顺序就成了：
+ *
+ *     T+0.0  文字进队列，窗口开，6s 后引爆
+ *     T+0.3  图片开始回源下载，断了自己重试
+ *     T+6.0  窗口到点 → 只带着文字去打模型      ← 角色回了文字
+ *     T+12   图片终于读到 → 进了一个新的空队列
+ *     T+18   第二轮才去识图                      ← 图「过了好一会儿」
+ *
+ * 图先落地时没事：消息循环是 `for await` 串行的，下载那会儿文字压根还没被读出来。
+ * 所以这个 bug 只在「字在前、图在后」时出现 —— 而那恰好是大多数人的习惯。
+ *
+ * ── 为什么不是「下载时把计时器推后」 ──
+ *
+ * 推后就等于把 debounce 请回来了（那是上一版刻意换掉的东西，见 enqueue）：
+ * 一直有附件在传，这一轮就一直不结算。这里的语义严格得多 —— 窗口该到点就到点，
+ * 只是**兑现推迟到手上的东西拆完**，而拆附件的时长本来就有上界。
+ *
+ * 计数不是布尔：一条消息可以同时带图、语音、视频、文件。而消息循环是串行的，
+ * 所以同一时刻只有一条消息在拆，计数实际只会是 0 或 1 —— 写成计数是为了下次
+ * 有人把某一路改成并发读时，这里不用跟着改。
+ */
+function holdPending(runner, spaceId) {
+  if (!runner.holds) runner.holds = new Map();
+  runner.holds.set(spaceId, (runner.holds.get(spaceId) ?? 0) + 1);
+}
+
+/**
+ * 拆完了，放掉窗口。要是这期间窗口已经到点（slot.due），就在这儿补上那一次引爆。
+ *
+ * **必须写在调用方的 finally 里**：漏放一次，这条会话的合并窗口就永久挂起了 ——
+ * 后面的消息全进同一个 slot、再也没人引爆它，表现是「这个号不说话了」。
+ * 读附件失败、超上限、甚至拆到一半抛异常，都得照放。
+ */
+function releasePending(runner, spaceId) {
+  const left = (runner.holds?.get(spaceId) ?? 0) - 1;
+  if (left > 0) {
+    runner.holds.set(spaceId, left);
+    return;
+  }
+  runner.holds?.delete(spaceId);
+  const slot = runner.pending.get(spaceId);
+  if (!slot?.due || !slot.fire) return;
+  logDebug(scopeOf(runner, "桥接"), "附件拆完了，把刚才等着的那一轮发出去");
+  slot.fire();
 }
 
 /**
@@ -2647,32 +2788,22 @@ async function handleTurn(
   // 只读这几条：磁盘上存了几千条也不影响内存占用。
   loadHistory(runner, role, sessionId, scope);
 
-  // 图片先转文字，再和用户文本拼成一条 user 消息进历史
-  const vision = await describeImages(
-    eps.vision,
-    eps.visionPrompt,
-    eps.maxImages,
-    runner,
-    images
-  );
-  // 语音同理。两条线是独立的：一条会话里可以既发图又发语音，
-  // 各自用各自的模型、各自的上限，一路失败也不影响另一路
-  const voice = await describeVoices(
-    eps.audio,
-    eps.audioPrompt,
-    eps.maxClips,
-    runner,
-    voices
-  );
-  // 视频第三条，规矩同上。识别完这个函数内部就把字节放掉了（见 describeVideos），
-  // 所以从这行往下，这一轮只剩几百字的描述在手上
-  const video = await describeVideos(
-    eps.video,
-    eps.videoPrompt,
-    eps.maxVideos,
-    runner,
-    videos
-  );
+  /*
+   * 图、语音、视频先各自转成文字，再和用户的原话拼成一条 user 消息进历史。
+   *
+   * 三条线**同时**跑：它们互相不依赖（各自的模型、各自的上限、一路失败不影响
+   * 另一路），以前串着 await 纯粹是白等 —— 图文语音混发的那一轮，用户等的是
+   * 三段时间的和。三个 describe* 内部都已经把单条的失败吃掉了，只会 resolve，
+   * 所以这里用 Promise.all 不会漏掉谁的清理。
+   *
+   * 视频那一路识别完会在自己内部把字节放掉（见 describeVideos），所以从这行
+   * 往下，这一轮只剩几百字的描述在手上。
+   */
+  const [vision, voice, video] = await Promise.all([
+    describeImages(eps.vision, eps.visionPrompt, eps.maxImages, runner, images),
+    describeVoices(eps.audio, eps.audioPrompt, eps.maxClips, runner, voices),
+    describeVideos(eps.video, eps.videoPrompt, eps.maxVideos, runner, videos),
+  ]);
   /*
    * 正则第一路：对方发来的原话。
    *
@@ -5023,6 +5154,12 @@ async function startRunner(getConfig, project, meta, retries = 0) {
     (async () => {
       try {
         for await (const [space, message] of instance.messages) {
+          /*
+           * 「这条消息拆完了」的收尾，**声明在 try 外面**：下面 catch 里也要调
+           * （拆到一半崩了同样得放掉合并窗口），而 try 块里的 const 在 catch 里
+           * 是看不见的。还没占过窗口就崩的情况留 null，那时候压根没东西要放。
+           */
+          let doneUnpacking = null;
           try {
             if (runner.stopped) break; // 这条连接已经被换掉了
             if (message.direction === "outbound") continue; // 忽略自己发的
@@ -5374,6 +5511,27 @@ async function startRunner(getConfig, project, meta, retries = 0) {
               );
               continue;
             }
+
+            /*
+             * 从这儿开始是「拆这条消息」：图片、语音、视频、文件、链接。
+             * 每一样都要回源下载或者出网抓，都是秒级的。
+             *
+             * **先把合并窗口占住**：这条会话可能已经有一轮在倒计时了（典型就是
+             * 对方先打字、紧接着发图），窗口到点时手上这些东西还没拆完，那一轮
+             * 就会只带着文字走 —— 用户报的「LLM 先回了文字、图片过了好一会儿才
+             * 发出去」正是这个。占住之后到点也会等，等拆完立刻发。
+             *
+             * 放和占必须配对，所以下面收尾和 catch 里都调 doneUnpacking()
+             * （它自己防重复）。漏放的后果是这条会话的窗口永久挂起，
+             * 表现为「这个号从此不说话了」—— 所以宁可多调一次。
+             */
+            holdPending(runner, spaceId);
+            let unpacked = false;
+            doneUnpacking = () => {
+              if (unpacked) return;
+              unpacked = true;
+              releasePending(runner, spaceId);
+            };
 
             // 图文混发时两样都要进队列：合并队列会在 queueWait 内攒成一轮，
             // 文字是「看这张图里的字」这种指令时缺一半就答不对
@@ -5749,8 +5907,22 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             if (effectHint) {
               enqueue(getConfig, runner, space, spaceId, { text: effectHint, message }, peer);
             }
+
+            /*
+             * 这条消息拆完了，放掉窗口。要是它是在**到点之后**才拆完的，
+             * 这一句就是那一轮真正的引爆点（见 releasePending）。
+             *
+             * 放在这儿而不是 finally 里：这样顺序是「这条消息的东西全进队列了，
+             * 然后才放」。放在 finally 里也对，但下面那个 catch 已经兜住了异常，
+             * 两处各调一次更看得出「正常走完」和「崩了也要放」是两件事。
+             */
+            doneUnpacking();
           } catch (err) {
             logError(scope, "处理消息出错", err);
+            // 拆到一半崩了也得放，不然这条会话的合并窗口就永久挂起了。
+            // 还没走到 holdPending 就崩的（过滤、取 spaceId 那一段）这里还是
+            // null，`?.` 正好跳过 —— 那时候压根没占过窗口
+            doneUnpacking?.();
           }
         }
       } catch (err) {

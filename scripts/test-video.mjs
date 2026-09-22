@@ -441,7 +441,8 @@ console.log("\n[3. release 的每一条路]");
   });
 
   okWith("桥接已停、定时器却先响了那条路也放掉（fire 里的早退）", () => {
-    const fire = IM_SRC.slice(IM_SRC.indexOf("const fire = () =>"));
+    // 锚点只截到 `const fire = (` —— 签名带了参数（force），写死 `() =>` 会失配
+    const fire = IM_SRC.slice(IM_SRC.indexOf("const fire = ("));
     const early = fire.slice(0, fire.indexOf("const merged"));
     assert.match(early, /runner\.stopped/);
     assert.match(early, /v\.release\?\.\(\)/);
@@ -464,11 +465,19 @@ console.log("\n[3. release 的每一条路]");
   });
 
   okWith("识别完那一步之后，这一轮手上只剩描述文字", () => {
-    // describeVideos 内部的 finally 是正常归宿，调用处的注释要说清这件事
-    const at = IM_SRC.indexOf("const video = await describeVideos(");
-    assert.ok(at > 0);
-    const around = IM_SRC.slice(at - 300, at);
+    /*
+     * describeVideos 内部的 finally 是正常归宿，调用处的注释要说清这件事。
+     *
+     * 三条 describe 现在是 Promise.all 一起跑的（图 / 语音 / 视频互不依赖，
+     * 串着 await 是白等），所以锚在那一句上 —— 别锚 `const video = await`，
+     * 那是并发之前的写法。
+     */
+    const at = IM_SRC.indexOf("const [vision, voice, video] = await Promise.all([");
+    assert.ok(at > 0, "找不到三条 describe 的调用处");
+    const around = IM_SRC.slice(at - 700, at);
     assert.match(around, /识别完|放掉|撒手/);
+    // 而且视频那一路必须真的在这一组里，不然它的 finally 压根跑不到
+    assert.match(IM_SRC.slice(at, at + 400), /describeVideos\(/);
   });
 }
 
