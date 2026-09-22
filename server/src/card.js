@@ -43,11 +43,19 @@
  * 预览图和标题是对方手机自己抓的，谁也没被冒充。
  */
 
-import { logDebug } from "./logs.js";
+import { logDebug, logWarn } from "./logs.js";
 import { closeClients, createLineClients } from "./photongrpc.js";
 
 /** 问一次原始消息最多等多久。收消息那条路在等它，不能久。 */
 const DETAIL_TIMEOUT_MS = 6000;
+
+/**
+ * 发 / 改一张转账卡片最多等多久。
+ *
+ * 比读详情那条宽一倍：这是一次真的发送（要落到对方手机上），而读详情只是
+ * 查一句本地数据。但也不能太宽 —— 用户正等着这条气泡出现在对话里。
+ */
+const SEND_TIMEOUT_MS = 12_000;
 
 /** app 扩展卡片的 balloonBundleId 前缀，后面跟 `:TEAMID:扩展bundleId`。 */
 const EXT_PREFIX = "com.apple.messages.MSMessageExtensionBalloonPlugin";
@@ -311,6 +319,249 @@ export async function cardHintFor(message, { projectId, projectSecret, label } =
   const hint = `[系统提示:{{user}}分享了${who}${what}${link}]`;
   logDebug(scope, `认出一张卡片（${info.bundleId}）→ ${hint}`);
   return hint;
+}
+
+/* ================= 转账卡片（发出去的那一半） ================= */
+
+/**
+ * 转账卡片的身份三件套。
+ *
+ * ── 为什么是假值，而且写死在这儿 ──
+ *
+ * `sendCustomizedMiniApp` 要 `teamId` + `extensionBundleId`，服务端**只验格式、
+ * 不验归属** —— 填腾讯的 team id 和 `com.tencent.xin.…`，对方手机上那张卡片
+ * 就会自称是微信发的。那是冒充一家公司的身份，这个文件从一开始就拒绝这么做
+ * （见文件头「出去的那一半」）。
+ *
+ * 所以这儿用一对明显不属于任何人的值：team id 全 A（格式合法：10 位大写
+ * 字母数字），bundle id 在我们自己的命名空间下。后果是对方手机上没有对应的
+ * 扩展 —— **点卡片不会有任何反应**，这恰好是我们想要的：它是一张给人看的
+ * 凭证，不该点开跳去任何地方。
+ *
+ * 用户能自己填的只有 `appName`（卡片上那行小字，见 role.transfer.appName）——
+ * 那是纯展示字符串，写「转账」还是写某家银行的名字由用户决定，代码不替他选。
+ */
+const TRANSFER_TEAM_ID = "AAAAAAAAAA";
+const TRANSFER_BUNDLE_ID = "codes.uranus.transfer";
+
+/**
+ * 点卡片时交给扩展的网址。
+ *
+ * 必填（proto 里是 `string url = 5`，不是 optional），但对方装不了我们那个
+ * 不存在的扩展，所以这条网址**永远不会被打开**。指向项目主页而不是随便编一个
+ * —— 万一哪天真被谁点开了，看到的也该是个说得清来路的地方。
+ */
+const TRANSFER_URL = "https://github.com/photon-hq/advanced-imessage-ts";
+
+/** 卡片右上角那行状态字。两种状态，别的没有（过期退回没做）。 */
+const TRANSFER_STATE_LABEL = {
+  pending: "待收款",
+  received: "已收款",
+};
+
+/**
+ * 金额那串**原文**规整成卡片上显示的样子。
+ *
+ * 模型写的可能是 `4000`、`4000.5`、`￥4000`、`4,000`。统一成两位小数加一个
+ * 人民币符号 —— 一笔转账写着「￥4000」和「￥4000.00」，后者才像凭证。
+ *
+ * 认不出数字时**原样带回**（只补个 ￥）：宁可显示一串怪东西，也不要把一笔
+ * 转账显示成 ￥0.00 —— 后者看起来完全正常，错得没人发现。
+ *
+ * @returns {string} 比如「￥4,000.00」
+ */
+export function formatAmount(raw) {
+  const text = String(raw ?? "").trim();
+  // 去掉货币符号和千分位逗号再认数字
+  const cleaned = text.replace(/[￥¥$,，\s]/g, "");
+  const n = Number(cleaned);
+  if (!Number.isFinite(n) || cleaned === "") {
+    return text.startsWith("￥") ? text : `￥${text}`;
+  }
+  return `￥${n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/**
+ * 一笔转账拼成 `MiniAppLayout`。
+ *
+ * 六个文字槽是苹果 `MSMessageTemplateLayout` 钉死的位置，我们只决定往哪个槽
+ * 里放什么（排版权拿不到，见文件头）：
+ *
+ *   caption            ￥4,000.00     左上、加粗，最显眼 —— 金额
+ *   subcaption         零花钱          金额下面 —— 备注
+ *   trailingCaption    待收款          右上 —— 状态
+ *   summary            转账 ￥4,000.00  渲染不出卡片的地方（通知、旧系统）显示这个
+ *
+ * `image` / `imageTitle` / `imageSubtitle` 三个**不填**：缩略图要一张真的
+ * JPEG 字节（服务端会验），而这个功能眼下不带图。proto 那边的约束是
+ * 「image 和 imageTitle 必须一起给」，都不给最省事也最安全。
+ *
+ * 备注可以是空的 —— 服务端只要求「caption/subcaption/trailingCaption/
+ * trailingSubcaption/image 至少有一个非空」，金额和状态都在，够了。
+ */
+function transferLayout({ amount, note, state }) {
+  const money = formatAmount(amount);
+  const label = TRANSFER_STATE_LABEL[state] ?? TRANSFER_STATE_LABEL.pending;
+  const memo = String(note ?? "").trim();
+  return {
+    caption: money,
+    ...(memo ? { subcaption: memo } : {}),
+    trailingCaption: label,
+    summary: `转账 ${money}${memo ? ` · ${memo}` : ""}（${label}）`,
+  };
+}
+
+/**
+ * 发一张转账卡片。
+ *
+ * 走底层 gRPC 的 `sendCustomizedMiniApp` —— Spectrum 没把这条 RPC 包出来
+ * （`space.send()` 认的那几种 content 里没有 miniApp），所以这儿和
+ * `fetchCardDetail` 一样临时开一个客户端，用完就关。
+ *
+ * **只有云端模式能发**：本地 Mac 模式没有 Photon 可问，调用方负责挡
+ * （`runner.mode === "cloud"`）。
+ *
+ * 专线模式下一个项目可能挂着多条线路，而这条消息只能从**发这个角色的那条**
+ * 发出去。所以挨个试，第一条成功就收工 —— 和 `fetchCardDetail` 同一个路子。
+ *
+ * @param {object} opts
+ * @param {string} opts.projectId
+ * @param {string} opts.projectSecret
+ * @param {string} opts.chatGuid 会话的 chat GUID（就是 imessage.js 里的 spaceId）
+ * @param {string} opts.amount 金额原文
+ * @param {string} opts.note 备注，可以是空串
+ * @param {string} opts.appName 卡片上那行小字，用户自己填的
+ * @param {string} [opts.scope] 日志前缀
+ * @returns {Promise<null | {messageGuid: string, chatGuid: string,
+ *   sessionId: string, targetMessageGuid: string}>}
+ *   发出去了就返回那四个 guid（存下来才能改状态，见 transferstore.js）；
+ *   一条线路都没成功返回 null
+ */
+export async function sendTransferCard({
+  projectId,
+  projectSecret,
+  chatGuid,
+  amount,
+  note,
+  appName,
+  scope = "转账",
+}) {
+  if (!projectId || !projectSecret || !chatGuid) return null;
+
+  let opened = [];
+  try {
+    opened = await createLineClients(projectId, projectSecret, { timeout: SEND_TIMEOUT_MS });
+    const message = {
+      appName: String(appName ?? "").trim() || "转账",
+      extensionBundleId: TRANSFER_BUNDLE_ID,
+      teamId: TRANSFER_TEAM_ID,
+      url: TRANSFER_URL,
+      layout: transferLayout({ amount, note, state: "pending" }),
+    };
+
+    let lastError = null;
+    for (const { client, instanceId } of opened) {
+      try {
+        const result = await client.messages.sendCustomizedMiniApp(chatGuid, message);
+        const session = result?.miniAppCardSession;
+        if (!session?.sessionId) {
+          // 发出去了但没给句柄：卡片在对方手机上，只是以后改不了状态。
+          // 当成功报，别让用户以为这笔没发出去
+          logWarn(scope, "卡片发出去了，但没拿到会话句柄，这笔以后改不了「已收款」");
+          return null;
+        }
+        logDebug(scope, `发了一张转账卡片（线路 ${instanceId}）：${formatAmount(amount)}`);
+        return {
+          messageGuid: String(session.messageGuid ?? result?.guid ?? ""),
+          chatGuid: String(session.chatGuid ?? chatGuid),
+          sessionId: String(session.sessionId),
+          targetMessageGuid: String(session.targetMessageGuid ?? ""),
+        };
+      } catch (e) {
+        lastError = e;
+        logDebug(scope, `线路 ${instanceId} 发不出这张卡片：${String(e?.message ?? e)}`);
+      }
+    }
+    if (lastError) logWarn(scope, "转账卡片没能发出去", lastError);
+    return null;
+  } catch (e) {
+    logWarn(scope, "转账卡片没能发出去（开不了客户端）", e);
+    return null;
+  } finally {
+    await closeClients(opened);
+  }
+}
+
+/**
+ * 把一张已经发出去的转账卡片原地改成另一个状态。
+ *
+ * 走 `updateCustomizedMiniApp` —— 对方看到的是**同一条气泡内容变了**，
+ * 不是新来一条消息。这是整个功能里最像真转账的一步。
+ *
+ * 身份三件套必须和发的时候**一模一样**（teamId / bundleId / appName / url）：
+ * 换了的话等于「另一个 app 来改这张卡片」。所以 appName 也从存下来的那笔里
+ * 取，不从当前配置读 —— 用户中途把 appName 改了，老卡片还得能收款。
+ *
+ * @param {object} opts
+ * @param {string} opts.projectId
+ * @param {string} opts.projectSecret
+ * @param {object} opts.session 存下来的那四个 guid（transferstore.js 的条目）
+ * @param {string} opts.amount
+ * @param {string} opts.note
+ * @param {string} opts.appName
+ * @param {"pending"|"received"} opts.state 要改成哪个状态
+ * @param {string} [opts.scope]
+ * @returns {Promise<boolean>} 改成功了没有
+ */
+export async function updateTransferCard({
+  projectId,
+  projectSecret,
+  session,
+  amount,
+  note,
+  appName,
+  state,
+  scope = "转账",
+}) {
+  if (!projectId || !projectSecret || !session?.sessionId) return false;
+
+  let opened = [];
+  try {
+    opened = await createLineClients(projectId, projectSecret, { timeout: SEND_TIMEOUT_MS });
+    const handle = {
+      messageGuid: String(session.messageGuid ?? ""),
+      chatGuid: String(session.chatGuid ?? ""),
+      sessionId: String(session.sessionId),
+      targetMessageGuid: String(session.targetMessageGuid ?? ""),
+    };
+    const message = {
+      appName: String(appName ?? "").trim() || "转账",
+      extensionBundleId: TRANSFER_BUNDLE_ID,
+      teamId: TRANSFER_TEAM_ID,
+      url: TRANSFER_URL,
+      layout: transferLayout({ amount, note, state }),
+    };
+
+    for (const { client, instanceId } of opened) {
+      try {
+        await client.messages.updateCustomizedMiniApp(handle, message);
+        logDebug(
+          scope,
+          `把一张转账卡片改成了「${TRANSFER_STATE_LABEL[state] ?? state}」（线路 ${instanceId}）`
+        );
+        return true;
+      } catch (e) {
+        logDebug(scope, `线路 ${instanceId} 改不了这张卡片：${String(e?.message ?? e)}`);
+      }
+    }
+    logWarn(scope, "转账卡片的状态没改过去（气泡还停在原来那个状态）");
+    return false;
+  } catch (e) {
+    logWarn(scope, "转账卡片的状态没改过去（开不了客户端）", e);
+    return false;
+  } finally {
+    await closeClients(opened);
+  }
 }
 
 /**

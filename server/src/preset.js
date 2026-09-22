@@ -116,6 +116,7 @@ export const FORMAT_CHILD_KINDS = [
   "image",
   "card",
   "location",
+  "transfer",
   "search",
   "leaveOnRead",
   "quote",
@@ -150,6 +151,7 @@ export const FORMAT_CHILD_TAGS = {
   image: "Generate_Image",
   card: "share_card",
   location: "share_location",
+  transfer: "转账",
   search: "联网搜索",
   leaveOnRead: "leave_on_read",
   quote: "引用回复",
@@ -172,6 +174,7 @@ export const FORMAT_CHILD_TAGS = {
  * 「会让角色不回消息」，sticker 是「会把你硬盘上的图发出去」，undoSend 是
  * 「会把已经发出去的消息收回去」，card 是「会把一条外部网址推给对方」，
  * location 是「会告诉对方自己在哪儿」（哪怕是编的，也是一条私事），
+ * transfer 是「会发一张长得像转账凭证的卡片」，
  * instagram 是「会发一条公开的帖子 / 快拍」—— 后者压的其实是**这个角色有没有
  * 这个账号**：`role.instagram.enabled` 关着的角色连主页都不建（instagram.js:
  * igOwners），提示词里再教它发帖就是教它写一条发不出去的标记。
@@ -197,6 +200,7 @@ export const ROLE_GATED_CHILDREN = {
   undoSend: "undoSend",
   card: "cardSend",
   location: "locationSend",
+  transfer: "transfer",
   react: "reactSend",
   effect: "effectSend",
   instagram: "instagram",
@@ -502,6 +506,20 @@ export const DEFAULT_FORMAT_CHILDREN = {
     "规则：位置卡片要单独占一条气泡，可以在它前后用 {{sep}} 接一句自己的话；" +
       "别自己拼地图网址，写地名和坐标就好，链接由系统生成。" +
       "一轮里最多发一条位置。",
+  ].join("\n"),
+  transfer: [
+    "转账",
+    "说明：想给对方转一笔钱时，写成 [transfer:金额:备注]，" +
+      "对方会收到一张转账卡片 —— 上面是金额、备注，右上角写着「待收款」。",
+    "金额只写数字，别带货币符号和逗号（写 4000，不要写 ￥4,000）；" +
+      "备注是给对方看的一句话，几个字就行（零花钱、打车、买鞋），" +
+      "不想写备注就只写金额：[transfer:4000]。",
+    "示例：「拿去买你上次看的那双{{sep}}[transfer:4000:买鞋]{{sep}}别省着」",
+    "规则：转账卡片要单独占一条气泡，可以在它前后用 {{sep}} 接一句自己的话；" +
+      "一轮里最多转一笔。金额按你的人设和当前情境自己定，别问对方要账号 —— " +
+      "卡片直接发在这个对话里。",
+    "对方收下之后卡片右上角会变成「已收款」，你会收到系统提示，" +
+      "那时候再顺着说一句就行；没收之前别催。",
   ].join("\n"),
   search: [
     "需要实时信息、最新资讯或你不掌握的外部知识时（尤其是发现自己答不上来、",

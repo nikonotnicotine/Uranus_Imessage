@@ -27,6 +27,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+// 只为了 formatAmount —— 退化成文字时那串金额要和卡片上显示的一模一样
+import { formatAmount } from "./card.js";
 import { IMAGES_DIR, REF_IMAGES_DIR, ensureLayout } from "./datadir.js";
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
@@ -85,6 +87,9 @@ export const MAX_TTS_CHARS = 1000;
  *           [react:😂:2]           ← 往回数第 2 条
  *           [react:❤️:我想你了]     ← 按原文找那条
  *           [回应:😂]/[贴纸:😂]/[tapback:😂]
+ *   转账    [transfer:4000:零花钱]  ← 发一张带金额和备注的转账卡片
+ *           [transfer:4000]        ← 不写备注也行
+ *           [转账:4000:零花钱]/[transfer_money:…]
  *
  * 认旧格式是因为**用户改过的提示词原文会留着**（见 preset.js 的
  * LEGACY_VOICE_CHILD）—— 那些配置里模型仍然按老格式写，解析不到就等于功能没了。
@@ -112,6 +117,12 @@ export const MAX_TTS_CHARS = 1000;
  * 的指令。标签体里第一个冒号之前是 emoji、之后是「贴哪条」（数字或原文片段），
  * emoji 本身不含冒号所以这么切没歧义 —— 真正的切分在 splitMedia 里做，正则只
  * 负责把整段抠出来。
+ *
+ * 转账那一节**要求金额打头必须是数字**（`\d`），这是故意的：`[transfer:…]`
+ * 发出去的是一张写着金额的卡片，金额认不出来就没有卡片可发。模型写
+ * `[transfer:一点钱:给你]` 时不切成转账段、原样留在文字里 —— 和卡片只认
+ * http(s) 是同一条规矩（内容不成立的标记压根不认，比切出来再在发送时失败好）。
+ * 备注是可选的尾巴，切分在 splitMedia 里按**第一个**冒号做。
  */
 /*
  * 语音和图片那两组的标记体：不许裸的方括号，但**允许嵌成对的**。
@@ -146,6 +157,7 @@ const MEDIA_TAG = new RegExp(
     "[[［]\\s*(?:music|song|音乐|歌曲|点歌)\\s*[:：]\\s*(?<music>[^\\]］]{1,120}?)\\s*[\\]］]",
     "[[［]\\s*(?:share_location|location|位置|定位|共享位置)\\s*[:：]\\s*(?<location>[^\\]］]{1,160}?)\\s*[\\]］]",
     "[[［]\\s*(?:reaction|react|tapback|回应|贴纸)\\s*[:：]\\s*(?<react>[^\\]］]{1,80}?)\\s*[\\]］]",
+    "[[［]\\s*(?:transfer_money|transfer|转账|转钱)\\s*[:：]\\s*(?<transfer>\\d[^\\]］]{0,80}?)\\s*[\\]］]",
   ].join("|"),
   /*
    * `i`：标签名不分大小写。
@@ -171,13 +183,16 @@ const MEDIA_TAG = new RegExp(
  * 跳过的那一段原样留在文字里（模型的思维链本来就会被正则收掉）。
  *
  * @param {string} text 一条气泡的正文（调用方已经按分隔符切过）
- * @returns {{kind:"text"|"audio"|"sticker"|"image"|"undo"|"card"|"music"|"location"|"react",
- *            text:string, ref?:string, n?:number, ll?:string, emoji?:string, spec?:string}[]}
+ * @returns {{kind:"text"|"audio"|"sticker"|"image"|"undo"|"card"|"music"|"location"|"react"
+ *            |"transfer",
+ *            text:string, ref?:string, n?:number, ll?:string, emoji?:string, spec?:string,
+ *            note?:string}[]}
  *          text 段已经 trim 过，空段不产出；sticker 段的 text 是情绪标签；
  *          image 段的 ref 是参考图名（没有就是空串）；undo 段的 n 是倒数第几条；
  *          card 段的 text 是那条网址；music 段的 text 是「歌手-歌名」那串；
  *          location 段的 text 是地名、ll 是「纬度,经度」（没写就是空串）；
- *          react 段的 emoji 是要贴的 emoji、spec 是贴哪条（没写就是空串）
+ *          react 段的 emoji 是要贴的 emoji、spec 是贴哪条（没写就是空串）；
+ *          transfer 段的 text 是金额原文、note 是备注（没写就是空串）
  */
 export function splitMedia(text) {
   const src = String(text ?? "");
@@ -239,6 +254,20 @@ export function splitMedia(text) {
       const emoji = (at < 0 ? body : body.slice(0, at)).trim();
       const spec = at < 0 ? "" : body.slice(at + 1).trim();
       if (emoji) parts.push({ kind: "react", text: "", emoji, spec });
+    } else if (g.transfer !== undefined) {
+      /*
+       * 按**第一个**冒号切：前面是金额，后面整段都是备注。
+       *
+       * 和 [location:] 反着 —— 那边按最后一个冒号切（地名在前、坐标在后，
+       * 而地名里可能有冒号）。这边金额在前，金额里不可能出现冒号，所以第一个
+       * 冒号就是分界；备注里出现冒号是很自然的事（`[transfer:500:房租:三月]`），
+       * 全都算备注。
+       */
+      const body = g.transfer.trim();
+      const at = body.search(/[:：]/);
+      const amount = (at < 0 ? body : body.slice(0, at)).trim();
+      const note = at < 0 ? "" : body.slice(at + 1).trim();
+      if (amount) parts.push({ kind: "transfer", text: amount, note });
     } else {
       const t = String(g.image ?? "").trim();
       if (t) parts.push({ kind: "image", text: t, ref: String(g.ref ?? "").trim() });
@@ -249,7 +278,7 @@ export function splitMedia(text) {
   return parts;
 }
 
-/** 这段文字里有没有语音 / 表情包 / 图片 / 撤回 / 卡片 / 点歌 / 位置 / 回应标记。 */
+/** 这段文字里有没有语音 / 表情包 / 图片 / 撤回 / 卡片 / 点歌 / 位置 / 回应 / 转账标记。 */
 export function hasMedia(text) {
   return splitMedia(text).some((p) => p.kind !== "text");
 }
@@ -263,6 +292,10 @@ export function hasMedia(text) {
  * 退化成「周杰伦-晴天」这句话 —— 对方照样知道说的是哪首歌，只是要自己去搜。
  * **位置**退化成那个地名（`[location:南宁万象城]` → `南宁万象城`），坐标丢掉 ——
  * 一串经纬度对人没用，地名本身就是要说的那句话。
+ * **转账**退化成一句话（`[transfer:4000:零花钱]` → `转账 ￥4000.00 零花钱`）：
+ * 卡片发不出去的时候，这笔钱的意思还是得说出来 —— 和语音退成那句话同一个道理。
+ * 说出来的形态和这个功能做出来之前用户手写的 `【转账：￥4000 零花钱】` 差不多，
+ * 对方照样看得懂。
  * 图片和表情包直接**丢掉**：图片那段是给出图模型看的画面描述（「浅木桌，
  * 蓝莓芋泥蛋糕，白瓷盘」），表情包那段是个情绪标签（「紧张」），单独发给人看
  * 都莫名其妙。撤回也丢掉 —— 它本来就不产出内容。**回应同理**：功能关着的时候
@@ -277,9 +310,21 @@ export function stripMediaTags(text) {
       (p) =>
         p.kind !== "image" && p.kind !== "sticker" && p.kind !== "undo" && p.kind !== "react"
     )
-    .map((p) => p.text)
+    .map((p) => (p.kind === "transfer" ? transferAsText(p) : p.text))
     .join("")
     .trim();
+}
+
+/**
+ * 一个转账段退化成能当普通文字发的一句话。
+ *
+ * 金额走 `formatAmount` 规整（和卡片上显示的那串一模一样），不是原样吐回 ——
+ * 退化版和卡片版说的该是同一笔钱。
+ */
+function transferAsText(part) {
+  const money = formatAmount(part?.text);
+  const note = String(part?.note ?? "").trim();
+  return `转账 ${money}${note ? ` ${note}` : ""}`;
 }
 
 /**

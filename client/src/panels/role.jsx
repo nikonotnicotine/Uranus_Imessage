@@ -2130,6 +2130,95 @@ function RoleLocationSendFields({ role }) {
 }
 
 /**
+ * 转账卡片：开关 + 卡片上那行小字 + 收款要不要靠贴表情。
+ *
+ * 发出去的是 iMessage 的 miniApp 卡片（苹果那套 `MSMessageTemplateLayout`），
+ * 不是生成的图片 —— 金额、备注、「待收款」三行字是真的文字槽，排版是苹果钉死的。
+ *
+ * 两件事在界面上必须说清楚，因为都反直觉：
+ *
+ *  - **卡片点不开**。身份三件套里那个 teamId / bundleId 是故意填的假值
+ *    （见服务端 card.js:TRANSFER_TEAM_ID），对方手机上没有对应的扩展。
+ *    这不是缺陷：它是一张给人看的凭证，不该点开跳去任何地方。
+ *  - **收款是贴表情**。苹果不给第三方在气泡里放按钮，「用户点了卡片」这个动作
+ *    也传不回来。所以对方只能长按那张卡片贴一个 emoji（贴什么都算），
+ *    我们收到之后把**同一条气泡**原地改成「已收款」。
+ *
+ * 只有云端模式能发（本地 Mac 模式没有那两条 RPC），那边会退化成发一句文字。
+ */
+function RoleTransferFields({ role }) {
+  const { updateRole } = useConfig();
+  const openGate = usePresetGate(role);
+  const tr = role.transfer ?? {};
+
+  return (
+    <div className="grid grid-cols-1 gap-6">
+      <label className="flex items-start justify-between gap-4">
+        <span className="min-w-0">
+          <span className="block text-ui text-ink">转账卡片</span>
+          <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+            模型写
+            <code className="mx-1 bg-sunken px-1">[transfer:4000:零花钱]</code>
+            时发一张转账卡片过去：左上角是金额、下面是备注、右上角写着「待收款」。
+            发的是 iMessage 的卡片气泡，不是生成的图片。
+            <br />
+            <b>这张卡片点不开</b> —— 它不挂在任何真实的 App 上，就是一张给人看的凭证。
+            也<b>不是真的钱</b>，没有任何账户被动过。
+            <br />
+            只有云端模式能发。本地 Mac 模式没有这条通道，会退化成发一句
+            <code className="mx-1 bg-sunken px-1">转账 ￥4,000.00 零花钱</code>
+            的文字。
+            <br />
+            预设里的那条子条目也要开着才会在提示词里教模型怎么写。
+          </span>
+        </span>
+        <Switch
+          checked={Boolean(tr.enabled)}
+          onChange={(v) => {
+            updateRole(role.id, { transfer: { ...tr, enabled: v } });
+            if (v) openGate("transfer");
+          }}
+          label="启用转账卡片"
+        />
+      </label>
+
+      <Field
+        label="卡片上那行小字"
+        hint="卡片底部显示的名字，随便填 —— 写「转账」也行，写某家银行的名字也行。留空就是「转账」"
+      >
+        <input
+          className={inputCls}
+          value={tr.appName ?? ""}
+          maxLength={40}
+          placeholder="转账"
+          onChange={(e) => updateRole(role.id, { transfer: { ...tr, appName: e.target.value } })}
+        />
+      </Field>
+
+      <label className="flex items-start justify-between gap-4">
+        <span className="min-w-0">
+          <span className="block text-ui text-ink">贴个表情就算收款</span>
+          <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+            你长按那张卡片贴一个 emoji（贴什么都算），卡片右上角就地从「待收款」变成「已收款」
+            —— 变的是<b>同一条气泡</b>，不会新来一条消息。角色那边会收到一句系统提示，
+            等你下次说话时一起送进去。
+            <br />
+            苹果不让第三方在气泡里放按钮，「点了卡片」这个动作也传不回来，所以贴表情是唯一能收款的动作。
+            <br />
+            关掉的话卡片会一直停在「待收款」。
+          </span>
+        </span>
+        <Switch
+          checked={tr.confirmOnReact !== false}
+          onChange={(v) => updateRole(role.id, { transfer: { ...tr, confirmOnReact: v } })}
+          label="贴表情算收款"
+        />
+      </label>
+    </div>
+  );
+}
+
+/**
  * 内置的 emoji 面板，按情绪分组。
  *
  * 苹果的 tapback 从 iOS 18 起可以贴**任意** emoji —— 全塞进提示词等于白烧几千
@@ -5032,6 +5121,14 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
           badge={onOff(role.locationSend?.enabled)}
         >
           <RoleLocationSendFields role={role} />
+        </Fold>
+
+        <Fold
+          title="转账卡片"
+          desc="写 [transfer:4000:零花钱] 发一张带金额的转账卡片，贴个表情就变「已收款」"
+          badge={onOff(role.transfer?.enabled)}
+        >
+          <RoleTransferFields role={role} />
         </Fold>
 
         <Fold

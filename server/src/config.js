@@ -1113,6 +1113,8 @@ function normalizeRole(input, id, legacy) {
     cardSend: normalizeCardSend(input?.cardSend),
     // 分享位置：只有开关。**不和 cardSend 合并**，理由见下面那个函数
     locationSend: normalizeLocationSend(input?.locationSend),
+    // 转账卡片：开关 + 卡片上那行小字。见下面那个函数
+    transfer: normalizeTransfer(input?.transfer),
     // 消息回应、消息特效：开关 + 白名单。两条都是「勾了才能用」，
     // 一个都没勾就整条不进提示词（省 token），见下面那两个函数
     reactSend: normalizeReactSend(input?.reactSend),
@@ -1478,6 +1480,39 @@ function normalizeCardSend(input) {
 function normalizeLocationSend(input) {
   return {
     enabled: Boolean(input?.enabled),
+  };
+}
+
+/**
+ * 转账卡片：开关 + 卡片上那行小字。
+ *
+ * 模型写 `[transfer:4000:零花钱]`，服务端发一张真的 iMessage app 扩展卡片
+ * 过去（`sendCustomizedMiniApp`）—— 左边是金额、下面是备注、右上角写着
+ * 「待收款」。对方在那条气泡上贴任意 emoji 就变成「已收款」，改的是**同一条
+ * 气泡**（见 card.js:updateTransferCard）。
+ *
+ * **只有云端模式能发**：本地 Mac 模式没有 Photon 的那两条 RPC。
+ *
+ * ── appName 为什么让用户自己填 ──
+ *
+ * 它是卡片上那行小字，纯展示、服务端不校验。填「转账」还是填某家银行的名字，
+ * 是用户自己的决定，代码不替他选、也不预置任何真实机构的名字。默认「转账」。
+ *
+ * 身份那两个字段（teamId / extensionBundleId）**不给用户配**，写死成明显不
+ * 属于任何人的假值（见 card.js 的 TRANSFER_TEAM_ID）—— 那两个填别人的值
+ * 就是冒充人家 app 的身份，这个项目从 card.js 的文件头开始就拒绝这么做。
+ *
+ * 默认关，和所有 *Send 一致：它会往对方手机上放一条看起来像金融凭证的气泡，
+ * 不该由一次误触发生。
+ */
+function normalizeTransfer(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+    // 卡片上那行小字。空着就在发的时候兜底成「转账」（见 card.js）
+    appName: str(input?.appName).slice(0, 40),
+    // 对方贴 emoji 时要不要把卡片改成「已收款」。默认开 —— 这是这个功能
+    // 最像真转账的一步，而且它只是改一张自己发出去的卡片，不外溢
+    confirmOnReact: input?.confirmOnReact === undefined ? true : Boolean(input.confirmOnReact),
   };
 }
 

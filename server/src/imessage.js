@@ -1,5 +1,13 @@
 import { readBytes } from "./attachread.js";
-import { cardHintFor, isCardUrl, mapsUrlFor, renderMapsLinks } from "./card.js";
+import {
+  cardHintFor,
+  formatAmount,
+  isCardUrl,
+  mapsUrlFor,
+  renderMapsLinks,
+  sendTransferCard,
+  updateTransferCard,
+} from "./card.js";
 import { watchChatBackground } from "./chatbg.js";
 import { normalizeForHistory, splitBubbles, sleep } from "./delay.js";
 import { checkLineRegistered, watchDelivery } from "./delivery.js";
@@ -95,6 +103,7 @@ import {
   spyTargetIn,
   stripSpyTags,
 } from "./spy.js";
+import { findTransfer, putTransfer } from "./transferstore.js";
 import { parseSearchQueries, runSearch, stripSearchTags } from "./websearch.js";
 
 /**
@@ -431,9 +440,21 @@ const REACT_QUOTE_MAX = 30;
  *
  * 存的是已经成文的那句提示，不是原始对象 —— 被贴的那条 Message 在
  * content.target 上，现在不抠出来，等会儿 target 可能已经不在手边了。
+ *
+ * `hint` 是给**收转账**用的口子：那件事也是「对方贴了个 emoji」触发的，
+ * 但要说的不是「他贴了个 👍」而是「他收下了你转的钱」，emoji 本身反倒
+ * 不重要（贴什么都算收）。给了 hint 就整句原样存，emoji / quoted 不看。
  */
-function noteReaction(runner, peerKey, emoji, quoted) {
-  if (!peerKey || !emoji) return;
+function noteReaction(runner, peerKey, emoji, quoted, hint) {
+  if (!peerKey) return;
+  if (hint) {
+    const list = runner.reactPending.get(peerKey) ?? [];
+    list.push({ hint, at: Date.now() });
+    while (list.length > REACT_PENDING_MAX) list.shift();
+    runner.reactPending.set(peerKey, list);
+    return;
+  }
+  if (!emoji) return;
   const list = runner.reactPending.get(peerKey) ?? [];
   list.push({ emoji, quoted, at: Date.now() });
   // 超了从头上丢：留新的那几条比留最早的有用
@@ -465,9 +486,12 @@ function takeReactHints(runner, peerKey) {
   if (!hits?.length) return [];
   runner.reactPending.delete(peerKey);
   return hits.map((r) =>
-    r.quoted
-      ? `[系统提示:{{user}}给"${r.quoted}"这句话贴上了${r.emoji}的贴纸]`
-      : `[系统提示:{{user}}给你的一条消息贴上了${r.emoji}的贴纸]`
+    // 已经成文的（收转账那一路）直接用
+    r.hint
+      ? r.hint
+      : r.quoted
+        ? `[系统提示:{{user}}给"${r.quoted}"这句话贴上了${r.emoji}的贴纸]`
+        : `[系统提示:{{user}}给你的一条消息贴上了${r.emoji}的贴纸]`
   );
 }
 
@@ -4615,6 +4639,147 @@ async function sendCardPart(runner, space, part, ctx) {
 }
 
 /**
+ * 执行一个 `[transfer:4000:零花钱]`：发一张转账卡片，并把句柄存下来。
+ *
+ * 三道闸：
+ *
+ *  1. **角色开关**（提示词里没注入不代表模型不会硬写）；
+ *  2. **只有云端模式**能发 —— 本地 Mac 模式没有 Photon 那两条 RPC。这一条
+ *     退化成「当普通文字发一句」而不是什么都不发：这笔钱的意思得说出去；
+ *  3. 金额认得出来（media.js 那条正则已经要求数字打头，这里不再重复判）。
+ *
+ * 句柄存不下来的时候**照样算发出去了** —— 卡片已经在对方手机上，只是以后
+ * 改不成「已收款」。报成失败会让用户以为这笔没发出去，那更糟。
+ *
+ * @returns {Promise<boolean>} 发出去了没有
+ */
+async function sendTransferPart(runner, space, part, ctx) {
+  const scope = scopeOf(runner, "转账");
+  const amount = String(part.text ?? "").trim();
+  const note = String(part.note ?? "").trim();
+  const role = ctx?.role;
+
+  if (!role?.transfer?.enabled) {
+    logInfo(scope, `这个角色没开「转账卡片」，跳过这条：[transfer:${amount}]`);
+    return false;
+  }
+  if (!amount) return false;
+
+  /*
+   * 本地 Mac 模式：没有 sendCustomizedMiniApp 这条路，退化成一句文字。
+   * 和 sendLinkCard 碰上 UnsupportedError 时退回纯网址是同一个处理。
+   */
+  if (runner.mode !== "cloud") {
+    const text = `转账 ${formatAmount(amount)}${note ? ` ${note}` : ""}`;
+    logWarn(scope, `本地 Mac 模式发不了转账卡片，改成发一句文字：${text}`);
+    try {
+      noteSent(runner, ctx, await space.send(text));
+      return true;
+    } catch (e) {
+      logError(scope, "这句转账文字也没能发出去", e);
+      return false;
+    }
+  }
+
+  const session = await sendTransferCard({
+    projectId: runner.projectId,
+    projectSecret: runner.projectSecret,
+    chatGuid: ctx?.spaceId ?? "",
+    amount,
+    note,
+    appName: role.transfer.appName,
+    scope,
+  });
+  if (!session) return false;
+
+  /*
+   * 存句柄。存不下来只 warn —— 卡片已经发出去了，这一步失败只意味着
+   * 「以后改不了状态」，不该反过来说这笔转账失败了。
+   *
+   * appName 也存进去：用户中途改了配置，老卡片还得能用原来那个名字去改
+   * （见 card.js:updateTransferCard 的注释）。
+   */
+  const ok = putTransfer(memoryKeyFor(role), {
+    ...session,
+    amount,
+    note,
+    state: "pending",
+    peerKey: peerKeyOf(ctx?.peer ?? ""),
+    appName: role.transfer.appName,
+  });
+  if (!ok) logWarn(scope, "这笔转账的句柄没存下来，之后改不了「已收款」");
+
+  logInfo(scope, `发了一张转账卡片：${formatAmount(amount)}${note ? `（${note}）` : ""}`);
+  return true;
+}
+
+/**
+ * 对方给一张转账卡片贴了 emoji → 把它原地改成「已收款」。
+ *
+ * 这是整个功能里最像真转账的一步：改的是**同一条气泡**，对方看着那张卡片
+ * 右上角从「待收款」变成「已收款」。
+ *
+ * ── 为什么用贴 emoji 而不是点卡片 ──
+ *
+ * 卡片上的文字槽是纯展示，苹果不给第三方在气泡里放按钮；而「用户点了卡片」
+ * 这个动作也**传不回来**（事件流只有消息/群/投票/会话四种变化）。贴 tapback
+ * 是唯一一个「在那条气泡上操作、而且我们收得到」的动作。
+ *
+ * ── 为什么拦在 reactSend 那道闸之前 ──
+ *
+ * 那道闸管的是「把对方贴的 emoji 告诉模型」。收款是另一件事 —— 用户没开
+ * 「消息回应」不代表他不想收款，卡在闸后面会让这个功能在大多数角色上悄悄失效。
+ *
+ * @param {object} message 那条 reaction 消息
+ * @returns {Promise<null | {amount: string, note: string}>}
+ *   真收了款就返回那笔的金额和备注（调用方拿它给模型写一句提示）；
+ *   不是转账卡片、功能没开、已经收过了、改失败了 —— 都返回 null
+ */
+async function claimTransferOnReact(runner, role, message, scope) {
+  if (!role?.transfer?.enabled || !role.transfer.confirmOnReact) return null;
+  if (runner.mode !== "cloud") return null;
+
+  /*
+   * 被贴的那条气泡。认不出 guid 就没法查。
+   *
+   * 相册/图文混发那种一条消息带好几个气泡的，provider 会把 target 收窄成其中
+   * 一个子项、id 长成 `p:0/<父 guid>`（@spectrum-ts/imessage 的 formatChildId）。
+   * 转账卡片是单气泡，照理撞不上，但 `parentId` 在的时候优先用它 ——
+   * 我们存的是父 guid，拿子 id 去查必定查不到。
+   */
+  const target = message?.content?.target;
+  const targetGuid = String(target?.parentId ?? target?.id ?? "").trim();
+  if (!targetGuid) return null;
+
+  const roleKey = memoryKeyFor(role);
+  const hit = findTransfer(roleKey, targetGuid);
+  if (!hit) return null; // 贴的是普通消息，不是转账卡片
+
+  if (hit.state === "received") {
+    // 已经收过了。再贴一个 emoji 不该让卡片闪一下、也不该再告诉模型一遍
+    logDebug(scope, `这笔转账早就收过了（${formatAmount(hit.amount)}），不重复处理`);
+    return null;
+  }
+
+  const ok = await updateTransferCard({
+    projectId: runner.projectId,
+    projectSecret: runner.projectSecret,
+    session: hit,
+    amount: hit.amount,
+    note: hit.note,
+    // 用**存下来那个** appName，不读当前配置：改卡片的身份必须和发的时候一致
+    appName: hit.appName,
+    state: "received",
+    scope,
+  });
+  if (!ok) return null;
+
+  putTransfer(roleKey, { ...hit, state: "received" });
+  logInfo(scope, `对方收了这笔转账：${formatAmount(hit.amount)}${hit.note ? `（${hit.note}）` : ""}`);
+  return { amount: hit.amount, note: hit.note };
+}
+
+/**
  * 执行一个 `[music:歌手-歌名]`：查出真实链接，发成一张音乐卡片。
  *
  * 和 `[card:…]` 共用「分享链接卡片」那个角色开关 —— 对用户来说这俩是同一件事
@@ -4840,9 +5005,10 @@ function effectAllowed(ctx, key, scope) {
  *
  * 每条气泡先摘掉 `[reply:…]`（那是**整条气泡**的属性，不是要发的内容），
  * 再过一遍 splitMedia，把 `[audio_message:…]` / `[send_emoji:…]` /
- * `[image:…]` / `[card:…]` / `[music:…]` / `[undosend:N]` 从正文里切出来，
- * 各自走自己那条路（合成语音 / 挑一张表情包 / 出图 / 发链接卡片 /
- * 查歌再发卡片 / 撤回刚发的那条），剩下的照旧当文字发。
+ * `[image:…]` / `[card:…]` / `[music:…]` / `[transfer:…]` / `[undosend:N]`
+ * 从正文里切出来，各自走自己那条路（合成语音 / 挑一张表情包 / 出图 /
+ * 发链接卡片 / 查歌再发卡片 / 发一张转账卡片 / 撤回刚发的那条），
+ * 剩下的照旧当文字发。
  * 一条气泡里混着文字和标记时按**原来的先后顺序**发，模型写
  * 「你看这个[image:…]好不好看」出来的就是三条消息，顺序不乱；
  * 撤回尤其依赖这个顺序 —— 它撤的就是紧挨着它前面那条。
@@ -5019,6 +5185,7 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
       else if (part.kind === "card") ok = await sendCardPart(runner, space, part, ctx);
       else if (part.kind === "music") ok = await sendMusicPart(runner, space, part, ctx);
       else if (part.kind === "location") ok = await sendLocationPart(runner, space, part, ctx);
+      else if (part.kind === "transfer") ok = await sendTransferPart(runner, space, part, ctx);
       else ok = await sendImagePart(runner, space, part, ctx);
       // 语音退化成文字时也算发出去了一条（sendVoicePart 里已经发过）
       if (ok || part.kind === "audio") {
@@ -5052,6 +5219,7 @@ const KIND_NAMES = {
   card: "链接卡片",
   music: "音乐卡片",
   location: "位置",
+  transfer: "转账卡片",
   react: "emoji 回应",
   undo: "撤回",
 };
@@ -5331,6 +5499,37 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             if (message.content?.type === "reaction") {
               if (message.id) noteSeen(runner, message.id);
               const who = currentRole(getConfig(), runner);
+
+              /*
+               * 先问一句：贴的是不是一张待收款的转账卡片。
+               *
+               * **拦在 reactSend 那道闸之前** —— 那道闸管的是「把对方贴的
+               * emoji 告诉模型」，收款是另一件事。用户没开「消息回应」不代表
+               * 他不想收款，卡在闸后面会让这个功能在大多数角色上悄悄失效。
+               *
+               * 收款成功了就攒一句提示（走和背景变更、tapback 同一条路：
+               * 不当场回一轮，等这个人下条真消息进来时一起送）—— 贴个 emoji
+               * 收钱太轻了，当场回等于角色被一次点击勾着说话。
+               */
+              const claimed = await claimTransferOnReact(
+                runner,
+                who,
+                message,
+                scopeOf(runner, "转账")
+              );
+              if (claimed) {
+                const money = formatAmount(claimed.amount);
+                const memo = claimed.note ? `（${claimed.note}）` : "";
+                noteReaction(
+                  runner,
+                  peerKeyOf(peer),
+                  "",
+                  "",
+                  `[系统提示:{{user}}收下了你转的 ${money}${memo}]`
+                );
+                continue;
+              }
+
               if (!who?.reactSend?.enabled) {
                 logDebug(scope, "这个角色没开「消息回应」，对方贴的 tapback 不告诉模型");
                 continue;

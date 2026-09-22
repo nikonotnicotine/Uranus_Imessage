@@ -180,6 +180,17 @@ export const OFFLINE_STORIES_DIR = path.join(OFFLINE_DIR, "stories");
 export const OFFLINE_MEDIA_DIR = path.join(OFFLINE_DIR, "media");
 
 /**
+ * 转账卡片的会话句柄，一个角色一份。
+ *
+ * 存的是 `MiniAppCardSession` 那四个 guid —— 没有它们就没法把一张已经发出去的
+ * 卡片从「待收款」原地改成「已收款」（见 transferstore.js 的文件头）。
+ *
+ * **不进 config.json**，和 IG、线下剧情同一条理由：`PUT /api/config` 会顺带
+ * 重启所有 iMessage 桥接，而这边是每笔转账都写。
+ */
+export const TRANSFERS_DIR = path.join(DATA_DIR, "transfers");
+
+/**
  * 记忆库。三样东西各一个子文件夹，都按角色分文件。
  *
  * 子文件夹用中文名，是为了让用户翻 data/ 的时候一眼知道哪个是哪个 ——
@@ -343,6 +354,7 @@ export function ensureLayout() {
     OFFLINE_INDEX_DIR,
     OFFLINE_STORIES_DIR,
     OFFLINE_MEDIA_DIR,
+    TRANSFERS_DIR,
   ]) {
     fs.mkdirSync(dir, { recursive: true });
   }
