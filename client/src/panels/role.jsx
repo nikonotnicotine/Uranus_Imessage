@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CATEGORY_LABELS,
   SPY_GROUP_NAMES,
@@ -2129,11 +2129,243 @@ function RoleLocationSendFields({ role }) {
   );
 }
 
+/** 单个 logo 文件的体积上限。比壁纸那边小得多 —— 这是张几十像素宽的小图标。 */
+const LOGO_MAX_BYTES = 2 * 1024 * 1024;
+
+const logoFileUrl = (file) => `/api/transfer-logo/file/${encodeURIComponent(file)}`;
+
 /**
- * 转账卡片：开关 + 卡片上那行小字 + 收款要不要靠贴表情。
+ * 硬盘上有哪些转账 logo。
+ *
+ * 和表情包标签同一个道理：素材在 `data/transfer-logos/`（还有随程序自带的
+ * `assets/transfer-logos/`），不在配置里，所以只能问后端。**「用哪张」才在配置里**
+ * （`role.transfer.logo`）—— 那是跟着角色走、要点保存的东西，而传图删图立刻落盘。
+ */
+function useTransferLogos() {
+  const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const reload = async () => {
+    try {
+      const r = await api("/api/transfer-logo");
+      setFiles(r.files ?? []);
+      setError("");
+    } catch (e) {
+      // 拉不到别装作「一张图都没有」—— 那会让用户以为素材丢了，其实是后端没起来
+      setError(e.message || "读不到 logo 文件夹");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    reload();
+  }, []);
+
+  return { files, loading, error, setError, reload, setFiles };
+}
+
+/**
+ * 挑一张卡片缩略图 + 调它的留白底色。
+ *
+ * ── 为什么不在浏览器里压一遍 ──
+ *
+ * 其他几处上传都走 `compressImage`（画到 canvas 上重编码）。这儿**故意不走**：
+ * 品牌 logo 基本是 SVG，而把 SVG 画到 canvas 上再编码就等于当场光栅化 ——
+ * 矢量的好处全没了，还得看浏览器认不认（Firefox 的 createImageBitmap 压根
+ * 不吃 SVG）。所以这儿照原文件传，服务端拿 skia 去渲（transferlogo.js）。
+ * 代价是没有前端压缩，所以上限卡得小：一个 logo 用不到 2MB。
+ */
+function RoleTransferLogoPicker({ role, tr }) {
+  const { updateRole } = useConfig();
+  const { files, loading, error, setError, reload, setFiles } = useTransferLogos();
+  const [busy, setBusy] = useState(false);
+  // 删除不可逆，先问一句。存的是待删的文件名
+  const [confirming, setConfirming] = useState("");
+  const fileRef = useRef(null);
+  const current = tr.logo ?? "";
+
+  /** 选中文件 → 原样转 base64 → 传上去 → 顺手选上它。 */
+  async function onPick(e) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // 不清的话连传两次同一个文件不触发 change
+    if (!file) return;
+    setError("");
+    if (file.size > LOGO_MAX_BYTES) {
+      setError(`这个文件 ${(file.size / 1024 / 1024).toFixed(1)}MB，超过 2MB 上限`);
+      return;
+    }
+    setBusy(true);
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const b = String(reader.result ?? "").split(",")[1];
+          b ? resolve(b) : reject(new Error("读不出这个文件的内容"));
+        };
+        reader.onerror = () => reject(new Error("读取文件失败"));
+        reader.readAsDataURL(file);
+      });
+      const r = await api("/api/transfer-logo/upload", {
+        method: "POST",
+        body: { name: file.name, base64, mimeType: file.type },
+      });
+      // 写盘失败回的是 200 + {ok:false}，api() 不会 throw
+      if (r?.ok === false || !r?.file) throw new Error(r?.error || "这个文件没能存进硬盘");
+      setFiles(r.files ?? []);
+      // 传完直接选上，不然还要再点一下
+      updateRole(role.id, { transfer: { ...tr, logo: r.file } });
+    } catch (err) {
+      setError(err.message || "传不上去");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onRemove(file) {
+    setConfirming("");
+    try {
+      // 读图是 /file/:file，删是 /:file —— 别写混了
+      const r = await api(`/api/transfer-logo/${encodeURIComponent(file)}`, { method: "DELETE" });
+      if (r?.ok === false) throw new Error(r.error || "删不掉这张图");
+      setFiles(r.files ?? []);
+      setError("");
+      // 删掉的正好是这个角色在用的那张：把选择也清掉，别留一个指向空气的文件名
+      if (current === file) updateRole(role.id, { transfer: { ...tr, logo: "" } });
+    } catch (e) {
+      setError(e.message || "删不掉这张图");
+    }
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-4">
+      <div>
+        <span className="mb-2 block text-eyebrow uppercase tracking-wide text-ink-faint">
+          卡片左边那张图
+        </span>
+        <p className="mb-3 text-meta leading-relaxed text-ink-meta">
+          金额左边那个小方块。<b>可以不选</b> —— 不选就是一张只有文字的卡片。
+          SVG、PNG、JPG、WebP 都行，服务端会等比缩放居中放到一块 600×300 的画布上，
+          所以方图和长条图发出来的卡片一样高，四周留白填下面那个底色。
+          <br />
+          自己往 <code className="mx-1 bg-sunken px-1">data/transfer-logos/</code> 里丢文件也行，
+          回来点一下「重新读取」。
+        </p>
+
+        {loading ? (
+          <p className="text-meta text-ink-faint">读取中…</p>
+        ) : (
+          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 lg:grid-cols-5">
+            {/* 第一格是「不要图」 */}
+            <button
+              type="button"
+              onClick={() => updateRole(role.id, { transfer: { ...tr, logo: "" } })}
+              className={`flex aspect-[2/1] items-center justify-center border text-meta transition-colors duration-150 ${
+                current ? "border-line text-ink-faint hover:text-ink" : "border-ink text-ink"
+              }`}
+            >
+              不要图
+            </button>
+
+            {files.map((l) => (
+              <div
+                key={l.file}
+                className={`relative aspect-[2/1] border transition-colors duration-150 ${
+                  current === l.file ? "border-ink" : "border-line hover:border-ink"
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => updateRole(role.id, { transfer: { ...tr, logo: l.file } })}
+                  title={l.builtin ? `${l.file}（自带的，删不掉）` : l.file}
+                  className="block h-full w-full overflow-hidden p-2"
+                  style={{ background: tr.logoBg || "#ffffff" }}
+                >
+                  <img
+                    src={logoFileUrl(l.file)}
+                    alt={l.file}
+                    loading="lazy"
+                    className="h-full w-full object-contain"
+                  />
+                </button>
+                {l.builtin ? (
+                  <span className="absolute left-0 top-0 bg-paper/85 px-1 text-meta text-ink-faint">
+                    自带
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    title={confirming === l.file ? "再点一次就真删了" : "删掉这张图"}
+                    onClick={() => (confirming === l.file ? onRemove(l.file) : setConfirming(l.file))}
+                    className={`absolute right-0 top-0 px-1 py-0.5 ${
+                      confirming === l.file ? "bg-warn text-paper" : "bg-paper/85 text-ink-faint hover:text-ink"
+                    }`}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                )}
+                <span className="absolute inset-x-0 bottom-0 truncate bg-paper/85 px-1 text-left text-meta text-ink">
+                  {l.file}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {error && <p className="mt-3 border-l-2 border-warn pl-3 text-meta text-warn">{error}</p>}
+
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          {/* 隐藏的 file input + 一个按钮去点它，和壁纸那边一个写法（Button 只渲染 button） */}
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".svg,.png,.jpg,.jpeg,.webp,image/*"
+            className="hidden"
+            onChange={onPick}
+          />
+          <Button variant="outline" disabled={busy} onClick={() => fileRef.current?.click()}>
+            <ImagePlus size={14} />
+            {busy ? "上传中…" : "传一张…"}
+          </Button>
+          <Button variant="ghost" onClick={reload}>
+            重新读取
+          </Button>
+          <span className="text-meta text-ink-faint">单个文件 2MB 以内，不会被压缩</span>
+        </div>
+      </div>
+
+      <Field
+        label="留白底色"
+        hint="图四周那块空白的颜色，默认白色。白字那种深色 logo 要在这儿换个深底，不然白底上看不见"
+      >
+        <div className="flex items-center gap-3">
+          <input
+            type="color"
+            className="h-8 w-12 shrink-0 cursor-pointer border border-line bg-transparent p-0.5"
+            value={tr.logoBg || "#ffffff"}
+            onChange={(e) => updateRole(role.id, { transfer: { ...tr, logoBg: e.target.value } })}
+            aria-label="留白底色"
+          />
+          <input
+            className={inputCls}
+            value={tr.logoBg ?? ""}
+            maxLength={7}
+            placeholder="#ffffff"
+            onChange={(e) => updateRole(role.id, { transfer: { ...tr, logoBg: e.target.value } })}
+          />
+        </div>
+      </Field>
+    </div>
+  );
+}
+
+/**
+ * 转账卡片：开关 + 缩略图 + 货币符号 + 那行署名 + 收款要不要靠贴表情。
  *
  * 发出去的是 iMessage 的 miniApp 卡片（苹果那套 `MSMessageTemplateLayout`），
  * 不是生成的图片 —— 金额、备注、「待收款」三行字是真的文字槽，排版是苹果钉死的。
+ * 唯一能自己画的地方是左边那张缩略图（见 RoleTransferLogoPicker）。
  *
  * 两件事在界面上必须说清楚，因为都反直觉：
  *
@@ -2197,8 +2429,8 @@ function RoleTransferFields({ role }) {
       </Field>
 
       <Field
-        label="卡片上那行小字"
-        hint="卡片底部显示的名字，随便填 —— 写「转账」也行，写某家银行的名字也行。留空就不显示那行（装了 Spectrum 的人那儿可能显示成它的名字，那是系统画的，我们管不着）"
+        label="气泡上方那行署名"
+        hint="卡片上面那行「某某发送了 XX 信息」里的 XX，随便填 —— 写「转账」也行，写某家银行的名字也行。留空就不显示那行"
       >
         <input
           className={inputCls}
@@ -2208,6 +2440,8 @@ function RoleTransferFields({ role }) {
           onChange={(e) => updateRole(role.id, { transfer: { ...tr, appName: e.target.value } })}
         />
       </Field>
+
+      <RoleTransferLogoPicker role={role} tr={tr} />
 
       <label className="flex items-start justify-between gap-4">
         <span className="min-w-0">

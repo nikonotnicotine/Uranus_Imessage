@@ -147,6 +147,13 @@ import {
   writeWallpaperSettings,
 } from "./wallpaper.js";
 import {
+  listLogos,
+  logoMime,
+  removeLogo,
+  resolveLogo,
+  saveLogo,
+} from "./transferlogo.js";
+import {
   MAX_HIGHLIGHTS,
   USER_OWNER,
   addPost,
@@ -1767,6 +1774,72 @@ app.get("/api/wallpaper/file/:file", (req, res) => {
   if (!file) return res.status(404).json({ ok: false, error: "找不到这张壁纸" });
   res.setHeader("Content-Type", mimeForExt(path.extname(file)));
   // 同名换图要能立刻看到，别让浏览器缓存住旧的那张
+  res.setHeader("Cache-Control", "no-cache");
+  fs.createReadStream(file).pipe(res);
+});
+
+// ---- 转账卡片的缩略图 ----
+
+/*
+ * 和壁纸那几条同一个道理：素材自己管一个目录（data/transfer-logos/），
+ * 传一张图不该顺带 syncBridges 把所有 Photon 线路重启一遍。
+ *
+ * **「用哪张」不在这儿** —— 那是 role.transfer.logo，跟着角色走、随配置保存。
+ * 这几条只管「有哪些图可选」。
+ */
+
+/** 有哪些 logo。前端打开角色那个转账分区时拉这一条。 */
+app.get("/api/transfer-logo", (_req, res) => {
+  res.json({ files: listLogos(), dir: path.join(getDataDir(), "transfer-logos") });
+});
+
+/** 传一张。和壁纸上传同一个形状：base64 JSON，不引 multipart。 */
+app.post("/api/transfer-logo/upload", (req, res) => {
+  const { name, base64, mimeType } = req.body ?? {};
+  if (!base64 || typeof base64 !== "string") {
+    return res.status(400).json({ ok: false, error: "没收到图片内容" });
+  }
+  try {
+    const file = saveLogo(name, base64, mimeType);
+    logInfo("转账", `已上传 logo ${file}`);
+    res.json({ ok: true, file, files: listLogos() });
+  } catch (e) {
+    logWarn("转账", "logo 上传失败", e);
+    res.json({ ok: false, error: String(e?.message ?? e) });
+  }
+});
+
+/**
+ * 删一张。
+ *
+ * **不去清哪个角色在用它** —— 配置那边只存文件名，真发的时候读不出来就退化成
+ * 不带图的卡片（renderLogo 返回 null）。反过来「删一张图顺手改所有角色的配置」
+ * 才是真会咬人的：那会 syncBridges 一次、还可能把用户正在编辑的草稿冲掉。
+ *
+ * 内置那几个抛错而不是返回 false，照壁纸的口径。
+ */
+app.delete("/api/transfer-logo/:file", (req, res) => {
+  try {
+    if (!removeLogo(req.params.file)) {
+      return res.status(404).json({ ok: false, error: "找不到这张 logo" });
+    }
+  } catch (e) {
+    return res.json({ ok: false, error: String(e?.message ?? e) });
+  }
+  res.json({ ok: true, files: listLogos() });
+});
+
+/**
+ * 读原图，给前端做预览。安全边界都在 resolveLogo 里（path.basename 挡路径穿越、
+ * 后缀白名单挡「让它读 data.config.json」）。
+ *
+ * 发出去的是**原文件**而不是渲染后那张 JPEG：预览要看的是「这个素材长什么样」。
+ */
+app.get("/api/transfer-logo/file/:file", (req, res) => {
+  const file = resolveLogo(req.params.file);
+  if (!file) return res.status(404).json({ ok: false, error: "找不到这张 logo" });
+  res.setHeader("Content-Type", logoMime(file));
+  // 同名换图要能立刻看到
   res.setHeader("Cache-Control", "no-cache");
   fs.createReadStream(file).pipe(res);
 });

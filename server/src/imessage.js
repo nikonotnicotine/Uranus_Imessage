@@ -103,6 +103,7 @@ import {
   spyTargetIn,
   stripSpyTags,
 } from "./spy.js";
+import { renderLogo } from "./transferlogo.js";
 import { findTransfer, putTransfer } from "./transferstore.js";
 import { parseSearchQueries, runSearch, stripSearchTags } from "./websearch.js";
 
@@ -4699,6 +4700,15 @@ async function sendTransferPart(runner, space, part, ctx) {
     return sendTransferText(runner, space, ctx, amount, note, scope, "本地 Mac 模式发不了转账卡片");
   }
 
+  /*
+   * 卡片上那张缩略图。没配 logo 就是 null，卡片照旧发（只是不带图）。
+   *
+   * 渲染放在发之前、`await` 着等：这一步有缓存，同一个 logo 第二次几乎零成本，
+   * 而**图和卡片必须一起送上去** —— 卡片一旦发出去就只能靠 updateCustomizedMiniApp
+   * 整条换掉，没有「补一张图上去」这种操作。
+   */
+  const image = await renderLogo(role.transfer.logo, { bg: role.transfer.logoBg, scope });
+
   const session = await sendTransferCard({
     projectId: runner.projectId,
     projectSecret: runner.projectSecret,
@@ -4707,6 +4717,7 @@ async function sendTransferPart(runner, space, part, ctx) {
     note,
     appName: role.transfer.appName,
     currency: role.transfer.currency,
+    image,
     scope,
   });
   /*
@@ -4730,8 +4741,10 @@ async function sendTransferPart(runner, space, part, ctx) {
    * 存句柄。存不下来只 warn —— 卡片已经发出去了，这一步失败只意味着
    * 「以后改不了状态」，不该反过来说这笔转账失败了。
    *
-   * appName 和 currency 也存进去：用户中途改了配置，老卡片还得能用原来那个
-   * 名字去改、还得显示原来那个符号（见 card.js:updateTransferCard 的注释）。
+   * appName / currency / logo 也存进去：用户中途改了配置，老卡片还得能用原来那个
+   * 名字去改、还得显示原来那个符号和同一张脸（见 card.js:updateTransferCard 的注释）。
+   *
+   * logo 存的是**文件名**，不是刚渲出来那堆字节 —— 收款时按名字重渲一遍。
    */
   const ok = putTransfer(memoryKeyFor(role), {
     ...session,
@@ -4741,6 +4754,8 @@ async function sendTransferPart(runner, space, part, ctx) {
     peerKey: peerKeyOf(ctx?.peer ?? ""),
     appName: role.transfer.appName,
     currency: role.transfer.currency,
+    logo: role.transfer.logo,
+    logoBg: role.transfer.logoBg,
   });
   if (!ok) logWarn(scope, "这笔转账的句柄没存下来，之后改不了「已收款」");
 
@@ -4799,6 +4814,20 @@ async function claimTransferOnReact(runner, role, message, scope) {
     return null;
   }
 
+  /*
+   * 重渲一遍那张缩略图。
+   *
+   * 字节没落盘（只存了文件名），而 updateCustomizedMiniApp 是**整条 layout 换掉**
+   * 而不是改某个字段 —— 这儿不给图，那张卡片收款时就会当场把图丢了。
+   *
+   * 按**存下来的** logo / logoBg 渲，不读当前配置：和 appName、currency 同一个
+   * 道理，用户中途换了 logo，老卡片收款时不该当场换张脸。
+   *
+   * 那个文件被删了的话 renderLogo 返回 null，卡片退化成不带图的样子 —— 认了，
+   * 总比为此把 JPEG 字节塞进转账记录里好。
+   */
+  const image = await renderLogo(hit.logo, { bg: hit.logoBg, scope });
+
   const ok = await updateTransferCard({
     projectId: runner.projectId,
     projectSecret: runner.projectSecret,
@@ -4809,6 +4838,7 @@ async function claimTransferOnReact(runner, role, message, scope) {
     appName: hit.appName,
     // 货币符号同理：用户中途换了符号，老卡片收款时不该当场换一个金额
     currency: hit.currency,
+    image,
     state: "received",
     scope,
   });

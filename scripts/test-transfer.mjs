@@ -94,6 +94,7 @@ mock.module("@photon-ai/advanced-imessage/grpc", {
 const M = await import("../server/src/media.js");
 const CARD = await import("../server/src/card.js");
 const TS = await import("../server/src/transferstore.js");
+const TL = await import("../server/src/transferlogo.js");
 const C = await import("../server/src/config.js");
 const P = await import("../server/src/preset.js");
 const PR = await import("../server/src/prompt.js");
@@ -245,11 +246,13 @@ okWith("六个文字槽按约定摆：金额 / 备注 / 状态 / 兜底文案", 
 });
 
 /*
- * 缩略图三个字段一个都不许有：image 要一张真 JPEG 字节（服务端会验），
- * 而 imageTitle / imageSubtitle 按 proto 的约束必须跟着 image 一起给。
- * 这一版不带图，都不给最省事。
+ * 没给 image 时**三个字段一个都不许有**。
+ *
+ * proto 的约束是「image 和 image_title 必须一起给」、「image_subtitle 要求先有
+ * image」—— 单给一个 imageTitle 是无效 layout，服务端会拒，一整笔转账发不出去。
+ * 所以「不带图」这条路必须干净地什么都不填。
  */
-okWith("不带缩略图（image / imageTitle / imageSubtitle 都不给）", () => {
+okWith("没选 logo → image / imageTitle / imageSubtitle 都不给", () => {
   const { layout } = calls.sent.at(-1).msg;
   for (const k of ["image", "imageTitle", "imageSubtitle"]) {
     assert.equal(layout[k], undefined, k);
@@ -291,7 +294,7 @@ okWith("点开落在一个说得清来路的地方", () => {
   assert.match(calls.sent.at(-1).msg.url, /^https:\/\//);
 });
 
-okWith("appName 是用户填的那个", async () => {
+okWith("appName 是用户填的那个", () => {
   assert.equal(calls.sent.at(-1).msg.appName, "Chase");
 });
 
@@ -330,6 +333,235 @@ okWith("货币符号一直传到卡片的槽里（金额和兜底文案两处都
   assert.equal(layout.summary, "转账 $4,000.00 · 零花钱（待收款）");
   assert.ok(!JSON.stringify(layout).includes("￥"), "换了符号就不该再有 ￥ 漏在别处");
 });
+
+/* ================= 缩略图 ================= */
+
+section("缩略图（transferlogo.js）");
+
+okWith("自带那两个素材在清单里，而且标着 builtin", () => {
+  const files = TL.listLogos();
+  assert.ok(files.length >= 2, "assets/transfer-logos/ 里应该有自带素材");
+  assert.ok(files.every((l) => l.builtin === true), "这会儿用户目录还是空的");
+  assert.ok(files.some((l) => l.file.toLowerCase().endsWith(".svg")), "至少有一个 SVG");
+});
+
+/*
+ * 路径穿越那道闸。`resolveLogo` 是唯一一个「文件名 → 磁盘路径」的入口
+ * （API 那条路由和渲染都走它），所以这里挡不住就等于把 data/ 整个开出去了。
+ *
+ * 两层：`path.basename` 把 `../` 削掉，后缀白名单挡住 config.json /
+ * data.config.json 这类**就在隔壁**的文件。
+ */
+okWith("resolveLogo 挡路径穿越和非图片后缀", () => {
+  for (const bad of [
+    "../../data.config.json",
+    "../config.json",
+    "data.config.json",
+    "config.json",
+    ".hidden.svg",
+    "",
+    null,
+  ]) {
+    assert.equal(TL.resolveLogo(bad), null, String(bad));
+  }
+});
+
+okWith("resolveLogo 认得出自带那几个", () => {
+  const first = TL.listLogos()[0].file;
+  const full = TL.resolveLogo(first);
+  assert.ok(full && fs.existsSync(full));
+  // 削掉路径之后照样认得出来：攻击者拼的路径不该改变最终落点
+  assert.equal(TL.resolveLogo(`../../${first}`), full);
+});
+
+okWith("normalizeColor：三位补成六位，不合法回 null", () => {
+  assert.equal(TL.normalizeColor("#fff"), "#ffffff");
+  assert.equal(TL.normalizeColor("FFF"), "#ffffff");
+  assert.equal(TL.normalizeColor("#1A2b3C"), "#1a2b3c");
+  assert.equal(TL.normalizeColor("07c160"), "#07c160");
+  for (const bad of ["", "红色", "#ffff", "#12345g", "rgb(0,0,0)", null]) {
+    assert.equal(TL.normalizeColor(bad), null, String(bad));
+  }
+  assert.equal(TL.DEFAULT_BG, "#ffffff");
+});
+
+/*
+ * 同名时以用户那份为准，而且清单里**只能出现一次** —— 两条一样的 `file`
+ * 会让前端的 key 撞上，resolveLogo 也会挑得莫名其妙。
+ */
+okWith("用户目录里同名的盖掉自带那个（清单里不出现两次）", () => {
+  const builtin = TL.listBuiltinLogos()[0].file;
+  const dir = path.join(tmp, "transfer-logos");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, builtin), "<svg xmlns='http://www.w3.org/2000/svg'/>");
+  const files = TL.listLogos();
+  assert.equal(files.filter((l) => l.file === builtin).length, 1);
+  assert.equal(files.find((l) => l.file === builtin)?.builtin, undefined);
+  // 解析也该落在用户那份上
+  assert.equal(TL.resolveLogo(builtin), path.join(dir, builtin));
+  fs.unlinkSync(path.join(dir, builtin));
+});
+
+okWith("自带的删不掉（抛错，不是静默返回 false）", () => {
+  const builtin = TL.listBuiltinLogos()[0].file;
+  assert.ok(TL.isBuiltinLogo(builtin));
+  assert.throws(() => TL.removeLogo(builtin), /删不掉/);
+  assert.ok(fs.existsSync(TL.resolveLogo(builtin)), "文件必须还在");
+});
+
+okWith("删不存在的返回 false，路径穿越的也是 false", () => {
+  assert.equal(TL.removeLogo("没这个.svg"), false);
+  assert.equal(TL.removeLogo("../../config.json"), false);
+  assert.equal(TL.removeLogo(".hidden.svg"), false);
+});
+
+okWith("传一张、选上、再删掉", () => {
+  const svg = Buffer.from(
+    "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10'/></svg>"
+  ).toString("base64");
+  const name = TL.saveLogo("我的图.svg", svg, "image/svg+xml");
+  assert.equal(name, "我的图.svg");
+  assert.ok(TL.listLogos().some((l) => l.file === name && !l.builtin));
+  // 同名再传一次要变成 -2，不能盖掉上一张
+  assert.equal(TL.saveLogo("我的图.svg", svg, "image/svg+xml"), "我的图-2.svg");
+  assert.equal(TL.removeLogo("我的图.svg"), true);
+  assert.equal(TL.removeLogo("我的图-2.svg"), true);
+});
+
+/*
+ * 名字里没后缀时按 MIME 补。传上来的文件名**不一定带后缀**，而后缀决定
+ * resolveLogo 认不认它 —— 补错了等于这张图传完就再也选不上。
+ */
+okWith("没后缀时按 MIME 补，认不出当 png", () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
+  const a = TL.saveLogo("无后缀", png, "image/svg+xml");
+  const b = TL.saveLogo("也没有", png, "image/webp");
+  const c = TL.saveLogo("认不出", png, "application/octet-stream");
+  assert.equal(a, "无后缀.svg");
+  assert.equal(b, "也没有.webp");
+  assert.equal(c, "认不出.png");
+  for (const f of [a, b, c]) assert.equal(TL.removeLogo(f), true);
+});
+
+okWith("logoMime 认得出 svg（不能按 png 发，浏览器会解成碎图）", () => {
+  assert.equal(TL.logoMime("a.svg"), "image/svg+xml");
+  assert.equal(TL.logoMime("a.jpg"), "image/jpeg");
+  assert.equal(TL.logoMime("a.webp"), "image/webp");
+  assert.equal(TL.logoMime("a.png"), "image/png");
+});
+
+/*
+ * **渲染失败一律 null，绝不抛错。** 这是卡片上的装饰 —— 一张图读不出来
+ * 不该让整笔转账发不出去。
+ */
+{
+  const junk = TL.saveLogo("坏的.png", Buffer.from("这不是图片").toString("base64"), "image/png");
+  // 先 await 完再进 okWith —— 那个包装器不 await，异步断言失败会漏成未捕获 rejection
+  const bad = [
+    await TL.renderLogo(""),
+    await TL.renderLogo("没这个文件.svg"),
+    await TL.renderLogo("../../data.config.json"),
+    // 后缀对但内容不是图：走到 loadImage 才炸，照样得咽下来
+    await TL.renderLogo(junk),
+  ];
+  TL.removeLogo(junk);
+  okWith("renderLogo 读不出来时返回 null，不抛", () => {
+    assert.deepEqual(bad, [null, null, null, null]);
+  });
+}
+
+/*
+ * 真渲一张自带的 SVG 出来。
+ *
+ * 三件事必须成立，缺一个卡片就发不出去或者变形：
+ *  - 出来的是**真 JPEG**（`ffd8` 开头）—— 服务端会验它能不能解码；
+ *  - 尺寸固定 600×300，跟原图比例无关（方图和 5.4:1 的长条出来一样高）；
+ *  - 体积在合理范围（这是要走 gRPC 的）。
+ *
+ * 装不上 @napi-rs/canvas 的机器上这条会拿到 null —— 那时候整个功能退化成
+ * 不带图，不算测试失败（renderLogo 的口径就是「失败返回 null」）。
+ */
+{
+  const svg = TL.listBuiltinLogos().find((l) => l.file.toLowerCase().endsWith(".svg"))?.file;
+  const buf = svg ? await TL.renderLogo(svg) : null;
+  if (buf) {
+    okWith("真把 SVG 渲成了 JPEG（600×300，ffd8 打头）", () => {
+      assert.equal(buf.subarray(0, 2).toString("hex"), "ffd8");
+      assert.ok(buf.length > 1000 && buf.length < 256 * 1024, `${buf.length} 字节不像一张 logo`);
+      assert.equal(TL.CANVAS_W, 600);
+      assert.equal(TL.CANVAS_H, 300);
+    });
+    const again = await TL.renderLogo(svg);
+    okWith("同一张图再渲一次走缓存（同一个 Buffer 实例）", () => {
+      assert.equal(again, buf);
+    });
+
+    const dark = await TL.renderLogo(svg, { bg: "#07c160" });
+    okWith("换个背景色就是另一份（缓存键带底色）", () => {
+      assert.ok(dark && dark !== buf);
+      assert.equal(dark.subarray(0, 2).toString("hex"), "ffd8");
+    });
+
+    /*
+     * 给了图就**必须给 imageTitle**（proto 的约束）。那行字用 appName，
+     * 空着退回「转账」—— 这不是配置兜底（空 appName 表示「气泡上方那行署名
+     * 不要」），是协议要求这个字段非空。
+     */
+    await CARD.sendTransferCard({
+      projectId: "p",
+      projectSecret: "s",
+      chatGuid: "c",
+      amount: "520",
+      note: "小狗",
+      appName: "Chase",
+      image: buf,
+    });
+    okWith("带图时 image 和 imageTitle 一起给（imageSubtitle 不给）", () => {
+      const { layout } = calls.sent.at(-1).msg;
+      assert.ok(Buffer.isBuffer(layout.image));
+      assert.equal(layout.image.length, buf.length);
+      assert.equal(layout.imageTitle, "Chase");
+      assert.equal(layout.imageSubtitle, undefined, "它会压在图上，把图挡住");
+      // 文字槽照旧，加了张图不该动别的
+      assert.equal(layout.caption, "￥520.00");
+      assert.equal(layout.trailingCaption, "待收款");
+    });
+
+    await CARD.sendTransferCard({
+      projectId: "p",
+      projectSecret: "s",
+      chatGuid: "c",
+      amount: "520",
+      note: "",
+      appName: "",
+      image: buf,
+    });
+    okWith("appName 空着但带了图 → imageTitle 退回「转账」（协议要它非空）", () => {
+      const { msg } = calls.sent.at(-1);
+      assert.equal(msg.appName, "", "气泡上方那行还是该不要");
+      assert.equal(msg.layout.imageTitle, "转账");
+    });
+
+    await CARD.updateTransferCard({
+      projectId: "p",
+      projectSecret: "s",
+      session,
+      amount: "520",
+      note: "小狗",
+      appName: "Chase",
+      image: buf,
+      state: "received",
+    });
+    okWith("改成已收款时图得跟着传一份（不传就当场把图丢了）", () => {
+      const { layout } = calls.updated.at(-1).msg;
+      assert.ok(Buffer.isBuffer(layout.image));
+      assert.equal(layout.imageTitle, "Chase");
+      assert.equal(layout.trailingCaption, "已收款");
+    });
+  } else {
+    console.log("  --  跳过真渲染那几条（这台机器没有 @napi-rs/canvas）");
+  }
+}
 
 /* ================= 改状态 ================= */
 
@@ -470,7 +702,31 @@ okWith("appName 和 currency 跟着落盘（改卡片时要用发的时候那一
   assert.equal(hit?.currency, "$");
 });
 
-okWith("没给 appName / currency 时存成空串，不是 undefined", () => {
+/*
+ * logo 走的是同一张白名单，所以同一个 bug 会再来一遍：漏了它，收款时
+ * `hit.logo` 读回来是 undefined，卡片当场把图丢了（气泡里那张脸变了）。
+ *
+ * 存的是**文件名不是字节** —— 一张 JPEG 塞进记录里，500 笔就是几兆 base64
+ * 躺在这个 JSON 里。
+ */
+okWith("logo / logoBg 跟着落盘，而且存的是文件名不是图片字节", () => {
+  TS.putTransfer(ROLE, {
+    ...session,
+    messageGuid: "G-logo",
+    amount: "520",
+    note: "",
+    state: "pending",
+    peerKey: "p1",
+    logo: "Chase.svg",
+    logoBg: "#07c160",
+  });
+  const hit = TS.findTransfer(ROLE, "G-logo");
+  assert.equal(hit?.logo, "Chase.svg");
+  assert.equal(hit?.logoBg, "#07c160");
+  assert.ok(!JSON.stringify(hit).includes("/9j/"), "图片字节不许进记录");
+});
+
+okWith("没给 appName / currency / logo 时存成空串，不是 undefined", () => {
   TS.putTransfer(ROLE, {
     ...session,
     messageGuid: "G-bare",
@@ -480,6 +736,8 @@ okWith("没给 appName / currency 时存成空串，不是 undefined", () => {
   const hit = TS.findTransfer(ROLE, "G-bare");
   assert.equal(hit?.appName, "");
   assert.equal(hit?.currency, "");
+  assert.equal(hit?.logo, "");
+  assert.equal(hit?.logoBg, "");
 });
 
 /*
@@ -492,9 +750,15 @@ okWith("messageGuid 和 targetMessageGuid 两个都能查到同一笔", () => {
   assert.equal(TS.findTransfer(ROLE, "没这个"), null);
 });
 
+/*
+ * 数的是**差值**，不是绝对条数：上面几条已经往 role_a 里存了好几笔，写死
+ * 「剩 1 笔」的话每加一条落盘用例都要回来改这个数 —— 而且改错方向（把 1 改成 4）
+ * 看着像修好了，其实什么都没验。
+ */
 okWith("同一个 guid 再 put 是覆盖，不是新增一笔", () => {
+  const before = TS.readTransfers(ROLE).items.length;
   TS.putTransfer(ROLE, { ...TS.findTransfer(ROLE, "G-1"), state: "received" });
-  assert.equal(TS.readTransfers(ROLE).items.length, 1);
+  assert.equal(TS.readTransfers(ROLE).items.length, before);
   assert.equal(TS.findTransfer(ROLE, "G-1")?.state, "received");
 });
 
@@ -596,6 +860,43 @@ okWith("appName 截到 40 字", () => {
     roles: [{ id: "r0", name: "x", transfer: { appName: "银".repeat(80) } }],
   }).roles[0];
   assert.equal(role.transfer.appName.length, 40);
+});
+
+okWith("默认不带缩略图，底色默认白", () => {
+  const role = C.normalizeConfig({ roles: [{ id: "r0", name: "x" }] }).roles[0];
+  assert.equal(role.transfer.logo, "");
+  assert.equal(role.transfer.logoBg, "#ffffff");
+});
+
+/*
+ * 底色在**配置这一层**就归成合法值，不留到渲染时才发现。
+ * 不然一个「红色」会一路传到 skia 的 fillStyle，那边不认就画成透明/黑块 ——
+ * 用户看到的是一张脏图，而不是「这个颜色填错了」。
+ */
+okWith("底色不合法就归成默认，三位补成六位", () => {
+  const bg = (v) =>
+    C.normalizeConfig({ roles: [{ id: "r0", name: "x", transfer: { logoBg: v } }] }).roles[0]
+      .transfer.logoBg;
+  assert.equal(bg("#FFF"), "#ffffff");
+  assert.equal(bg("07c160"), "#07c160");
+  assert.equal(bg("红色"), "#ffffff");
+  assert.equal(bg(""), "#ffffff");
+  assert.equal(bg("rgb(0,0,0)"), "#ffffff");
+});
+
+/*
+ * 配置里**不校验文件在不在**：配置随时能改，而文件可能等会儿才传上来。
+ * 真发的时候读不出来，renderLogo 退化成不带图，不会让转账发不出去。
+ */
+okWith("logo 只存名字、不校验文件存在（截 200 字挡异常长名）", () => {
+  const role = C.normalizeConfig({
+    roles: [{ id: "r0", name: "x", transfer: { logo: "还没传的图.svg" } }],
+  }).roles[0];
+  assert.equal(role.transfer.logo, "还没传的图.svg");
+  const long = C.normalizeConfig({
+    roles: [{ id: "r0", name: "x", transfer: { logo: `${"长".repeat(400)}.svg` } }],
+  }).roles[0];
+  assert.equal(long.transfer.logo.length, 200);
 });
 
 {
@@ -732,8 +1033,33 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
 
   okWith("改卡片用的是**存下来那个** appName（不读当前配置）", () => {
     const at = src.indexOf("async function claimTransferOnReact(");
-    const body = src.slice(at, at + 2000);
+    const body = src.slice(at, at + 3000);
     assert.ok(body.includes("appName: hit.appName"));
+  });
+
+  /*
+   * 发的时候渲一张图、存**文件名**；改的时候按存下来那个名字**重渲一份**。
+   *
+   * 这三处任缺一处的后果都不是报错，是悄悄变样：
+   *  - 发的时候不渲 → 卡片没图；
+   *  - 存的时候漏了 logo → 收款时 hit.logo 是 undefined，图当场丢了；
+   *  - 改的时候不渲 → 同上（updateCustomizedMiniApp 是整条 layout 换掉的）。
+   */
+  okWith("发的时候渲图 + 存文件名，改的时候按存下来那个重渲", () => {
+    const send = src.slice(
+      src.indexOf("async function sendTransferPart("),
+      src.indexOf("async function claimTransferOnReact(")
+    );
+    assert.ok(send.includes("renderLogo(role.transfer.logo"), "发的时候没渲图");
+    assert.ok(send.includes("logo: role.transfer.logo"), "logo 没跟着落盘");
+    assert.ok(send.includes("logoBg: role.transfer.logoBg"), "logoBg 没跟着落盘");
+
+    const claim = src.slice(
+      src.indexOf("async function claimTransferOnReact("),
+      src.indexOf("async function sendMusicPart(")
+    );
+    assert.ok(claim.includes("renderLogo(hit.logo"), "改的时候没按存下来那个重渲");
+    assert.ok(!claim.includes("renderLogo(role"), "改的时候不许读当前配置");
   });
 
   okWith("已经收过的不重复处理（重复贴表情不该让卡片闪一下）", () => {

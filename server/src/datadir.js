@@ -13,6 +13,7 @@
  *   data/images/emojis/     表情包，一个情绪一个子文件夹
  *   data/sessions/          对话存档
  *   data/wallpapers/        后台界面的壁纸，外加一份 settings.json
+ *   data/transfer-logos/    转账卡片上那张缩略图的素材
  *
  * 另有一个 assets/ 在**项目根**（不在 data/ 里）：随代码发的内置素材，只读。
  *
@@ -41,6 +42,12 @@ const ROOT = path.resolve(__dirname, "../..");
  */
 export const ASSETS_DIR = path.join(ROOT, "assets");
 export const BUILTIN_WALLPAPER_DIR = path.join(ASSETS_DIR, "wallpapers");
+
+/**
+ * 内置的转账卡片 logo。和内置壁纸同一个待遇：只读、界面上删不掉、
+ * 不进备份包、`URANUS_DATA_DIR` 也不影响它。
+ */
+export const BUILTIN_TRANSFER_LOGO_DIR = path.join(ASSETS_DIR, "transfer-logos");
 
 /**
  * 开箱预设的**种子**（线上一份、线下一份）。
@@ -189,6 +196,18 @@ export const OFFLINE_MEDIA_DIR = path.join(OFFLINE_DIR, "media");
  * 重启所有 iMessage 桥接，而这边是每笔转账都写。
  */
 export const TRANSFERS_DIR = path.join(DATA_DIR, "transfers");
+
+/**
+ * 转账卡片上那张缩略图的素材（品牌 logo 之类）。
+ *
+ * 和壁纸一样分两处：`assets/transfer-logos/` 是随代码发的内置素材（只读，
+ * 界面上删不掉），这个是用户自己放的。**不进 config.json** —— 存的是图片
+ * 字节，而配置是「草稿 + 点保存」的模型，图要的是放进去立刻能选。
+ *
+ * 用哪个 logo 是**角色配置**（role.transfer.logo），因为那决定这个角色的卡片
+ * 长什么样；文件本身在这儿，两边靠文件名对上（见 transferlogo.js）。
+ */
+export const TRANSFER_LOGO_DIR = path.join(DATA_DIR, "transfer-logos");
 
 /**
  * 记忆库。三样东西各一个子文件夹，都按角色分文件。
@@ -355,6 +374,7 @@ export function ensureLayout() {
     OFFLINE_STORIES_DIR,
     OFFLINE_MEDIA_DIR,
     TRANSFERS_DIR,
+    TRANSFER_LOGO_DIR,
   ]) {
     fs.mkdirSync(dir, { recursive: true });
   }

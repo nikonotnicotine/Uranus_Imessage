@@ -451,21 +451,30 @@ export function formatAmount(raw, currency) {
  *   trailingCaption    待收款          右上 —— 状态
  *   summary            转账 ￥4,000.00  渲染不出卡片的地方（通知、旧系统）显示这个
  *
- * `image` / `imageTitle` / `imageSubtitle` 三个**不填**：缩略图要一张真的
- * JPEG 字节（服务端会验），而这个功能眼下不带图。proto 那边的约束是
- * 「image 和 imageTitle 必须一起给」，都不给最省事也最安全。
+ * `image` 是**唯一一块我们能自己画的地方**（六个文字槽的位置全是苹果定的）。
+ * 给了图就**必须给 `imageTitle`** —— proto 的约束是「image 和 imageTitle 必须
+ * 一起给」。那行字用 `appName`，空着退回「转账」：这不是配置的兜底
+ * （空 appName 本来就表示「那行来源小字不要」，而且它在气泡外面、不在卡片里），
+ * 是协议要求这个字段非空，总得写点什么。
+ *
+ * `imageSubtitle` 不填 —— 它压在图的下边缘上，金额已经在 caption 里了，
+ * 再写一遍只是把图挡住。
+ *
+ * 没选 logo 就**一个都不给**（图和标题一起消失），卡片退回纯文字那个样子。
  *
  * 备注可以是空的 —— 服务端只要求「caption/subcaption/trailingCaption/
  * trailingSubcaption/image 至少有一个非空」，金额和状态都在，够了。
  */
-function transferLayout({ amount, note, state, currency }) {
+function transferLayout({ amount, note, state, currency, appName, image }) {
   const money = formatAmount(amount, currency);
   const label = TRANSFER_STATE_LABEL[state] ?? TRANSFER_STATE_LABEL.pending;
   const memo = String(note ?? "").trim();
+  const title = String(appName ?? "").trim() || "转账";
   return {
     caption: money,
     ...(memo ? { subcaption: memo } : {}),
     trailingCaption: label,
+    ...(image?.length ? { image, imageTitle: title } : {}),
     summary: `转账 ${money}${memo ? ` · ${memo}` : ""}（${label}）`,
   };
 }
@@ -489,8 +498,10 @@ function transferLayout({ amount, note, state, currency }) {
  * @param {string} opts.chatGuid 会话的 chat GUID（就是 imessage.js 里的 spaceId）
  * @param {string} opts.amount 金额原文
  * @param {string} opts.note 备注，可以是空串
- * @param {string} opts.appName 卡片上那行小字，用户自己填的；空串 = 那行不要
+ * @param {string} opts.appName 气泡上方那行来源署名；空串 = 那行不要
  * @param {string} [opts.currency] 货币符号，空的话用 DEFAULT_CURRENCY
+ * @param {Buffer} [opts.image] 缩略图的 JPEG 字节（transferlogo.js 渲染的），
+ *   不给就是不带图
  * @param {string} [opts.scope] 日志前缀
  * @returns {Promise<null | {messageGuid: string, chatGuid: string,
  *   sessionId: string, targetMessageGuid: string}>}
@@ -505,6 +516,7 @@ export async function sendTransferCard({
   note,
   appName,
   currency,
+  image,
   scope = "转账",
 }) {
   if (!projectId || !projectSecret || !chatGuid) return null;
@@ -518,7 +530,7 @@ export async function sendTransferCard({
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,
       url: TRANSFER_URL,
-      layout: transferLayout({ amount, note, state: "pending", currency }),
+      layout: transferLayout({ amount, note, state: "pending", currency, appName, image }),
     };
 
     let lastError = null;
@@ -564,9 +576,15 @@ export async function sendTransferCard({
  * 换了的话等于「另一个 app 来改这张卡片」。所以 appName 也从存下来的那笔里
  * 取，不从当前配置读 —— 用户中途把 appName 改了，老卡片还得能收款。
  *
- * `currency` 同理从存下来的那笔取：它不算身份（只影响 layout 里那串字），但
- * 用户中途把符号从 ￥ 换成 $ 的话，一张老卡片收款时不该当场从「￥4,000.00」
- * 跳成「$4,000.00」—— 那是同一张凭证上的金额变了。
+ * `currency` 和 `logo` 同理从存下来的那笔取：它们不算身份（只影响 layout 里那
+ * 几个槽），但用户中途把符号从 ￥ 换成 $ 的话，一张老卡片收款时不该当场从
+ * 「￥4,000.00」跳成「$4,000.00」—— 那是同一张凭证上的金额变了。
+ *
+ * **图的字节不落盘，改的时候重新渲染一份**（调用方负责，见
+ * imessage.js:claimTransferOnReact）。存下来的只是文件名 —— 一张 JPEG 存进
+ * 转账记录里，500 笔就是几兆的 base64 躺在 JSON 里，而重渲染有缓存、几乎免费。
+ * 代价是：用户把那个 logo 文件删了之后，老卡片收款时会变成不带图的样子。
+ * 认了 —— 总比为此把图片字节塞进记录里好。
  *
  * @param {object} opts
  * @param {string} opts.projectId
@@ -574,8 +592,10 @@ export async function sendTransferCard({
  * @param {object} opts.session 存下来的那四个 guid（transferstore.js 的条目）
  * @param {string} opts.amount
  * @param {string} opts.note
- * @param {string} opts.appName 空串 = 那行小字不要（和发的时候一致）
+ * @param {string} opts.appName 空串 = 那行来源署名不要（和发的时候一致）
  * @param {string} [opts.currency] 发的时候用的那个符号
+ * @param {Buffer} [opts.image] 发的时候那张缩略图的字节，**得重新渲染一份传进来**
+ *   （字节不落盘，见 imessage.js:claimTransferOnReact）
  * @param {"pending"|"received"} opts.state 要改成哪个状态
  * @param {string} [opts.scope]
  * @returns {Promise<boolean>} 改成功了没有
@@ -588,6 +608,7 @@ export async function updateTransferCard({
   note,
   appName,
   currency,
+  image,
   state,
   scope = "转账",
 }) {
@@ -608,7 +629,7 @@ export async function updateTransferCard({
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,
       url: TRANSFER_URL,
-      layout: transferLayout({ amount, note, state, currency }),
+      layout: transferLayout({ amount, note, state, currency, appName, image }),
     };
 
     for (const { client, instanceId } of opened) {

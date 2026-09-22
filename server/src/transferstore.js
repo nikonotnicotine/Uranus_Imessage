@@ -113,8 +113,10 @@ export function readTransfers(roleKey) {
  * @param {string} entry.note 备注
  * @param {"pending"|"received"} entry.state
  * @param {string} entry.peerKey 哪条会话上的，收款时反查用
- * @param {string} [entry.appName] 发的时候那行小字（空串 = 那行不要）
+ * @param {string} [entry.appName] 发的时候气泡上方那行署名（空串 = 那行不要）
  * @param {string} [entry.currency] 发的时候那个货币符号
+ * @param {string} [entry.logo] 发的时候那张缩略图的**文件名**（空串 = 不带图）
+ * @param {string} [entry.logoBg] 发的时候那张图的留白底色
  * @returns {boolean} 写进去了没有
  */
 export function putTransfer(roleKey, entry) {
@@ -132,7 +134,11 @@ export function putTransfer(roleKey, entry) {
    * imessage.js 一直在传、claimTransferOnReact 一直在读 `hit.appName`，
    * 于是它读回来永远是 undefined、改卡片时悄悄用了兜底值。两边正好都兜底成
    * 「转账」所以一直没露馅；`appName` 一旦真填了点什么，发和改就用的是两个
-   * 名字了 —— 那等于「另一个 app 来改这张卡片」。
+   * 名字了 —— 那等于「另一个 app 来改这张卡片」。**往这个功能加展示字段时
+   * 记得回来加一行**，漏了就是同一个 bug 再来一遍。
+   *
+   * `logo` 存的是**文件名不是图片字节**：一张 JPEG 塞进记录里，500 笔就是几兆
+   * base64 躺在这个 JSON 里；改卡片时按名字重渲染一遍就行，还有缓存。
    */
   next.push({
     messageGuid: guid,
@@ -145,6 +151,8 @@ export function putTransfer(roleKey, entry) {
     peerKey: String(entry.peerKey ?? ""),
     appName: String(entry.appName ?? ""),
     currency: String(entry.currency ?? ""),
+    logo: String(entry.logo ?? ""),
+    logoBg: String(entry.logoBg ?? ""),
     at: Number(entry.at) || Date.now(),
   });
 
