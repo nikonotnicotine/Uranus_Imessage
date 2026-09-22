@@ -349,12 +349,12 @@ export async function cardHintFor(message, { projectId, projectSecret, label } =
  * 的** —— 填腾讯的 team id 和 `com.tencent.xin.…`，对方手机上那张卡片
  * 就会自称是微信发的（见文件头「出去的那一半」）。这条线还在。
  *
- * 用户能自己填的只有 `appName`（卡片上那行小字，见 role.transfer.appName）——
- * 那是纯展示字符串，写「转账」还是写某家银行的名字由用户决定，代码不替他选，
- * **留空就整个字段不传**（proto 里它是 `string app_name = 4`，空串在 wire 上
- * 等于不传）。那行到底是不画了、还是被 Messages 换成 Spectrum 自己的名字，
- * 取决于对方那台 iPhone，我们说不准 —— 原来这儿是空了就兜底成「转账」，
- * 于是「不要那行字」压根没法表达。
+ * 用户能自己填的只有 `appName`（气泡上方那行署名，见 role.transfer.appName）——
+ * 那是纯展示字符串，写「转账」还是写某家银行的名字由用户决定，代码不替他选。
+ * 但**它不能是空的**：proto 里它是 `string app_name = 4`（空串在 wire 上等于
+ * 不传），而服务端要求这个字段非空，空着整条 RPC 直接被打回
+ * `[upstream] app_name must not be empty` —— 卡片压根发不出去。
+ * 所以空着的时候这儿兜底成「转账」，见 TRANSFER_APP_NAME_FALLBACK。
  */
 const TRANSFER_TEAM_ID = "P8XT6232SL";
 const TRANSFER_BUNDLE_ID = "codes.photon.Spectrum.MessagesExtension";
@@ -382,6 +382,36 @@ const TRANSFER_APP_STORE_ID = 6777616651;
  * 意义，何况那是台后台）。
  */
 const TRANSFER_URL = "https://photon.codes";
+
+/**
+ * `appName` 空着时顶上去的那个词。
+ *
+ * ── 为什么非得有个兜底 ──
+ *
+ * 服务端要求 `app_name` 非空，空着整条 RPC 被打回
+ * `[upstream] app_name must not be empty`（SDK 本地不校验这个字段，所以是发出去
+ * 才知道，报错带 `[upstream]` 前缀）。也就是说「那行署名不要」**协议上表达不了**：
+ * 上一版按「空串 = 那行不画」原样把空串传下去，结果没填名字的用户一张卡片都发不
+ * 出去，全退化成一句文字。
+ *
+ * 兜底的词和 `imageTitle` 共用一个 —— 那儿本来就因为同一类原因（proto 要求
+ * image/imageTitle 一起给）在兜底。两处用同一个值，卡片上下不会一个写「转账」
+ * 一个写别的。
+ *
+ * **发和改必须算出同一个值**：改卡片的身份得和发的时候一模一样（见
+ * updateTransferCard），所以兜底放在这一层、两条路都走 wireAppName，
+ * 而不是在配置里悄悄把空值填成「转账」—— 配置里存的还是用户填的原样。
+ */
+const TRANSFER_APP_NAME_FALLBACK = "转账";
+
+/**
+ * 用户填的那行署名规整成能上 wire 的样子。
+ *
+ * 空着（或者只有空白）兜底成 TRANSFER_APP_NAME_FALLBACK：服务端不收空的。
+ */
+function wireAppName(appName) {
+  return String(appName ?? "").trim() || TRANSFER_APP_NAME_FALLBACK;
+}
 
 /** 卡片右上角那行状态字。两种状态，别的没有（过期退回没做）。 */
 const TRANSFER_STATE_LABEL = {
@@ -453,9 +483,9 @@ export function formatAmount(raw, currency) {
  *
  * `image` 是**唯一一块我们能自己画的地方**（六个文字槽的位置全是苹果定的）。
  * 给了图就**必须给 `imageTitle`** —— proto 的约束是「image 和 imageTitle 必须
- * 一起给」。那行字用 `appName`，空着退回「转账」：这不是配置的兜底
- * （空 appName 本来就表示「那行来源小字不要」，而且它在气泡外面、不在卡片里），
- * 是协议要求这个字段非空，总得写点什么。
+ * 一起给」。那行字和顶层的 `app_name` 走同一个 wireAppName：两处都不许为空
+ * （一个是 proto 的约束，一个是服务端的），兜底成同一个词，卡片上下才不会
+ * 一个写「转账」一个写别的。
  *
  * `imageSubtitle` 不填 —— 它压在图的下边缘上，金额已经在 caption 里了，
  * 再写一遍只是把图挡住。
@@ -469,7 +499,7 @@ function transferLayout({ amount, note, state, currency, appName, image }) {
   const money = formatAmount(amount, currency);
   const label = TRANSFER_STATE_LABEL[state] ?? TRANSFER_STATE_LABEL.pending;
   const memo = String(note ?? "").trim();
-  const title = String(appName ?? "").trim() || "转账";
+  const title = wireAppName(appName);
   return {
     caption: money,
     ...(memo ? { subcaption: memo } : {}),
@@ -498,7 +528,8 @@ function transferLayout({ amount, note, state, currency, appName, image }) {
  * @param {string} opts.chatGuid 会话的 chat GUID（就是 imessage.js 里的 spaceId）
  * @param {string} opts.amount 金额原文
  * @param {string} opts.note 备注，可以是空串
- * @param {string} opts.appName 气泡上方那行来源署名；空串 = 那行不要
+ * @param {string} opts.appName 气泡上方那行来源署名；空串会兜底成「转账」
+ *   （服务端不收空的，见 wireAppName）
  * @param {string} [opts.currency] 货币符号，空的话用 DEFAULT_CURRENCY
  * @param {Buffer} [opts.image] 缩略图的 JPEG 字节（transferlogo.js 渲染的），
  *   不给就是不带图
@@ -525,7 +556,8 @@ export async function sendTransferCard({
   try {
     opened = await createLineClients(projectId, projectSecret, { timeout: SEND_TIMEOUT_MS });
     const message = {
-      appName: String(appName ?? "").trim(),
+      // 空着兜底成「转账」——服务端不收空的 app_name，见 wireAppName
+      appName: wireAppName(appName),
       appStoreId: TRANSFER_APP_STORE_ID,
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,
@@ -592,7 +624,8 @@ export async function sendTransferCard({
  * @param {object} opts.session 存下来的那四个 guid（transferstore.js 的条目）
  * @param {string} opts.amount
  * @param {string} opts.note
- * @param {string} opts.appName 空串 = 那行来源署名不要（和发的时候一致）
+ * @param {string} opts.appName 发的时候那行署名（空串同样兜底成「转账」，
+ *   得和发的时候算出同一个值）
  * @param {string} [opts.currency] 发的时候用的那个符号
  * @param {Buffer} [opts.image] 发的时候那张缩略图的字节，**得重新渲染一份传进来**
  *   （字节不落盘，见 imessage.js:claimTransferOnReact）
@@ -624,7 +657,8 @@ export async function updateTransferCard({
       targetMessageGuid: String(session.targetMessageGuid ?? ""),
     };
     const message = {
-      appName: String(appName ?? "").trim(),
+      // 和发的时候同一个 wireAppName —— 身份必须一模一样，兜底也得一致
+      appName: wireAppName(appName),
       appStoreId: TRANSFER_APP_STORE_ID,
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,

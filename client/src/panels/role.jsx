@@ -2499,15 +2499,21 @@ function RoleTransferFields({ role }) {
         />
       </Field>
 
+      {/*
+        这行字不能是空的 —— 服务端要求 app_name 非空，空着整张卡片发不出去
+        （见 server/src/card.js 的 wireAppName）。所以空着是兜底成「转账」，
+        不是「那行不显示」。hint 和 placeholder 都得这么说：原来写的是
+        「留空就不显示那行」，照着填空的人只会得到一句纯文字。
+      */}
       <Field
         label="气泡上方那行署名"
-        hint="卡片上面那行「某某发送了 XX 信息」里的 XX，随便填 —— 写「转账」也行，写某家银行的名字也行。留空就不显示那行"
+        hint="卡片上面那行「某某发送了 XX 信息」里的 XX，随便填 —— 写「转账」也行，写某家银行的名字也行。这行不能空着，留空就用「转账」"
       >
         <input
           className={inputCls}
           value={tr.appName ?? ""}
           maxLength={40}
-          placeholder="留空就不显示"
+          placeholder="留空就用「转账」"
           onChange={(e) => updateRole(role.id, { transfer: { ...tr, appName: e.target.value } })}
         />
       </Field>

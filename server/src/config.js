@@ -1515,9 +1515,10 @@ function normalizeLocationSend(input) {
  *
  * ── appName 和 currency 为什么让用户自己填 ──
  *
- * 两个都是纯展示、服务端不校验的字符串。填「转账」还是填某家银行的名字、
- * 用 ￥ 还是 $，是用户自己的决定，代码不替他选、也不预置任何真实机构的名字。
- * `appName` 空着 = 气泡上方那行署名不要；`currency` 空着 = ￥。
+ * 两个都是纯展示字符串。填「转账」还是填某家银行的名字、用 ￥ 还是 $，是用户
+ * 自己的决定，代码不替他选、也不预置任何真实机构的名字。两个都空着有兜底：
+ * `appName` → 「转账」（**服务端不收空的 `app_name`**，见 card.js:wireAppName），
+ * `currency` → ￥。兜底都在 card.js 那层算，这儿存的是用户填的原样。
  *
  * ── logo / logoBg / logoStyle ──
  *
@@ -1541,8 +1542,13 @@ function normalizeLocationSend(input) {
 function normalizeTransfer(input) {
   return {
     enabled: Boolean(input?.enabled),
-    // 卡片上那行小字。**空着就是那行不要**（原来是空了兜底成「转账」，于是
-    // 「不显示那行」压根没法表达，见 card.js:sendTransferCard）
+    /*
+     * 气泡上方那行署名。空着**发的时候**兜底成「转账」——服务端要求
+     * `app_name` 非空，空串整条 RPC 被打回（见 card.js:wireAppName）。
+     *
+     * 这儿不替用户填上那个词：兜底是协议逼出来的，不是他的设定。存原样，
+     * 输入框才好显示「空着 = 用『转账』」而不是凭空多出两个字。
+     */
     appName: str(input?.appName).slice(0, 40),
     /*
      * 金额前面那个货币符号。空着 = ￥（card.js:DEFAULT_CURRENCY）。

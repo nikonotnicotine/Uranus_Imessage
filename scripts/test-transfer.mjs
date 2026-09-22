@@ -307,15 +307,35 @@ await CARD.sendTransferCard({
   appName: "",
 });
 /*
- * appName 留空 = **那行小字不要**，不是兜底成「转账」。原来是兜底的，于是
- * 「不显示那行」压根没法表达 —— 用户想要一张只有金额和备注的卡片时没有办法。
- * 空串在 wire 上等于不传这个字段（proto 里它是 `string app_name = 4`）。
+ * appName 留空必须兜底成「转账」，**不能把空串传下去**。
+ *
+ * 这条是回归测试。1.2.2 到 1.2.4 那三版做的是反过来的事（空串 = 那行署名不要，
+ * 原样传下去），因为 proto 里 `app_name` 是个普通 scalar、空串在 wire 上等于不传。
+ * 但服务端要求它非空，于是没填署名的用户一张卡片都发不出去：
+ *
+ *   ValidationError: [upstream] app_name must not be empty
+ *
+ * 带 `[upstream]` 前缀 —— SDK 本地不校验这个字段，发出去才知道，所以这个假的
+ * 上游一直放行、自测时压根没露馅。断言盯着 wire 上那个值，别只盯 layout。
  */
-okWith("appName 留空 → 空串传下去（那行不要），不兜底成「转账」", () => {
+okWith("appName 留空 → 兜底成「转账」（服务端不收空的，空着整张卡片发不出去）", () => {
   const { msg } = calls.sent.at(-1);
-  assert.equal(msg.appName, "");
+  assert.equal(msg.appName, "转账");
+  assert.ok(msg.appName, "app_name 空着上游会打回 must not be empty");
   assert.equal(msg.layout.subcaption, undefined);
   assert.equal(msg.layout.summary, "转账 ￥4,000.00（待收款）");
+});
+
+await CARD.sendTransferCard({
+  projectId: "p",
+  projectSecret: "s",
+  chatGuid: "c",
+  amount: "4000",
+  note: "",
+  appName: "   ",
+});
+okWith("只填了几个空格也算空（trim 完兜底）", () => {
+  assert.equal(calls.sent.at(-1).msg.appName, "转账");
 });
 
 await CARD.sendTransferCard({
@@ -537,9 +557,8 @@ okWith("normalizeLogoStyle 只认那两档", () => {
     });
 
     /*
-     * 给了图就**必须给 imageTitle**（proto 的约束）。那行字用 appName，
-     * 空着退回「转账」—— 这不是配置兜底（空 appName 表示「气泡上方那行署名
-     * 不要」），是协议要求这个字段非空。
+     * 给了图就**必须给 imageTitle**（proto 的约束）。那行字和顶层的 app_name
+     * 走同一个 wireAppName，空着一起兜底成「转账」。
      */
     await CARD.sendTransferCard({
       projectId: "p",
@@ -570,10 +589,13 @@ okWith("normalizeLogoStyle 只认那两档", () => {
       appName: "",
       image: buf,
     });
-    okWith("appName 空着但带了图 → imageTitle 退回「转账」（协议要它非空）", () => {
+    okWith("appName 空着带了图 → 顶层和 imageTitle 兜底成同一个词", () => {
       const { msg } = calls.sent.at(-1);
-      assert.equal(msg.appName, "", "气泡上方那行还是该不要");
+      // 两处都不许为空（一个是服务端的要求、一个是 proto 的），而且得是同一个值 ——
+      // 不然卡片外面写「转账」、图上写别的
+      assert.equal(msg.appName, "转账");
       assert.equal(msg.layout.imageTitle, "转账");
+      assert.equal(msg.layout.imageTitle, msg.appName);
     });
 
     await CARD.updateTransferCard({
@@ -636,6 +658,24 @@ okWith("身份和发的时候完全一致（appStoreId 也算）", () => {
   for (const k of ["appName", "teamId", "extensionBundleId", "appStoreId", "url"]) {
     assert.equal(b[k], a[k], k);
   }
+});
+
+/*
+ * 空 appName 的兜底**两条路都得算出同一个值**。兜底放在 card.js 的 wireAppName、
+ * 发和改都走它，就是为了这个：要是只在发的那条路上兜底，一张没填署名的卡片
+ * 发出去时署名是「转账」、收款时变成空串 —— 那等于换了个 app 来改这张卡片。
+ */
+await CARD.updateTransferCard({
+  projectId: "p",
+  projectSecret: "s",
+  session,
+  amount: "4000",
+  note: "",
+  appName: "",
+  state: "received",
+});
+okWith("改的时候 appName 空着也兜底成「转账」（和发的那条路一致）", () => {
+  assert.equal(calls.updated.at(-1).msg.appName, "转账");
 });
 
 /* ================= 退路 ================= */

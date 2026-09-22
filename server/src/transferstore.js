@@ -113,7 +113,8 @@ export function readTransfers(roleKey) {
  * @param {string} entry.note 备注
  * @param {"pending"|"received"} entry.state
  * @param {string} entry.peerKey 哪条会话上的，收款时反查用
- * @param {string} [entry.appName] 发的时候气泡上方那行署名（空串 = 那行不要）
+ * @param {string} [entry.appName] 发的时候气泡上方那行署名（存原样；空串在
+ *   card.js:wireAppName 那层兜底成「转账」）
  * @param {string} [entry.currency] 发的时候那个货币符号
  * @param {string} [entry.logo] 发的时候那张缩略图的**文件名**（空串 = 不带图）
  * @param {string} [entry.logoBg] 发的时候那张图的留白底色
