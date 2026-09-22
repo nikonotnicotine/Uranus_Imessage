@@ -324,34 +324,61 @@ export async function cardHintFor(message, { projectId, projectSecret, label } =
 /* ================= 转账卡片（发出去的那一半） ================= */
 
 /**
- * 转账卡片的身份三件套。
+ * 转账卡片的身份三件套 —— 骑的是 Spectrum 自己那个扩展。
  *
- * ── 为什么是假值，而且写死在这儿 ──
+ * ── 为什么是这几个值 ──
  *
- * `sendCustomizedMiniApp` 要 `teamId` + `extensionBundleId`，服务端**只验格式、
- * 不验归属** —— 填腾讯的 team id 和 `com.tencent.xin.…`，对方手机上那张卡片
- * 就会自称是微信发的。那是冒充一家公司的身份，这个文件从一开始就拒绝这么做
- * （见文件头「出去的那一半」）。
+ * `sendCustomizedMiniApp` 的前提是「你有一个已经上架 App Store 的 iMessage
+ * 扩展」，那三个字段是让 Messages 能把点击路由到你那个扩展上去。我们没有
+ * 这么一个扩展，所以填的是 Photon 自己那个（`Spectrum`，苹果审核过的
+ * mini app hub，官方管它叫 Mini App Hub，就是给没自带扩展的人用的）。
  *
- * 所以这儿用一对明显不属于任何人的值：team id 全 A（格式合法：10 位大写
- * 字母数字），bundle id 在我们自己的命名空间下。后果是对方手机上没有对应的
- * 扩展 —— **点卡片不会有任何反应**，这恰好是我们想要的：它是一张给人看的
- * 凭证，不该点开跳去任何地方。
+ * 这四个值一个字都不能改 —— 抄自 `@spectrum-ts/imessage` 里的
+ * `SPECTRUM_MINI_APP`，那边 `app()` 发卡片用的就是这一份。抄一份而不是
+ * import：那是人家的内部常量，没从包里导出来。
+ *
+ * ── 原来为什么不这样 ──
+ *
+ * 上一版填的是一对明显假的值（team id 全 A + `codes.uranus.transfer`），
+ * 想的是「服务端只验格式不验归属，所以填谁的都行，那就谁的都不填」。
+ * 但共享线路的服务端**只放行 Spectrum 这一个扩展**，填别的直接
+ * `AuthenticationError`，卡片压根发不出去。官方文档里没记载这条。
+ *
+ * 换成这份身份不是「冒充 Photon」：卡片确实经由 Spectrum 发出，而这个
+ * 扩展本来就是给我们这种没自带扩展的调用方骑的。真不能填的是**别人家
+ * 的** —— 填腾讯的 team id 和 `com.tencent.xin.…`，对方手机上那张卡片
+ * 就会自称是微信发的（见文件头「出去的那一半」）。这条线还在。
  *
  * 用户能自己填的只有 `appName`（卡片上那行小字，见 role.transfer.appName）——
  * 那是纯展示字符串，写「转账」还是写某家银行的名字由用户决定，代码不替他选。
+ * 对方装了 Spectrum 的话，那行字可能被换成 Spectrum 自己的名字和图标。
  */
-const TRANSFER_TEAM_ID = "AAAAAAAAAA";
-const TRANSFER_BUNDLE_ID = "codes.uranus.transfer";
+const TRANSFER_TEAM_ID = "P8XT6232SL";
+const TRANSFER_BUNDLE_ID = "codes.photon.Spectrum.MessagesExtension";
+
+/**
+ * Spectrum 在 App Store 上的 id。
+ *
+ * 填了它，对方没装那个扩展时点卡片会被引导去 App Store；不填就是「点了
+ * 完全没反应」。两种都不难看，填上是因为它和上面那三个值是同一套身份的
+ * 一部分，缺一个反而奇怪。
+ */
+const TRANSFER_APP_STORE_ID = 6777616651;
 
 /**
  * 点卡片时交给扩展的网址。
  *
- * 必填（proto 里是 `string url = 5`，不是 optional），但对方装不了我们那个
- * 不存在的扩展，所以这条网址**永远不会被打开**。指向项目主页而不是随便编一个
- * —— 万一哪天真被谁点开了，看到的也该是个说得清来路的地方。
+ * 必填（proto 里是 `string url = 5`，不是 optional）。以前这里指向
+ * `advanced-imessage-ts` 那个仓库，反正填的是假身份、点了不会有反应；
+ * 现在骑的是真的 Spectrum 扩展，**装了它的人是真能点开的**，那就不能
+ * 把人送去看 SDK 源码了。
+ *
+ * 换成 Spectrum 的官网首页：一张转账凭证点开该落在一个说得清来路的地方，
+ * 而这张卡片确实是经由它发出去的。没有更合适的落点 —— 我们自己没有能给
+ * 外人看的页面（控制台跑在用户自己机器上，8787 那个地址对收卡片的人毫无
+ * 意义，何况那是台后台）。
  */
-const TRANSFER_URL = "https://github.com/photon-hq/advanced-imessage-ts";
+const TRANSFER_URL = "https://photon.codes";
 
 /** 卡片右上角那行状态字。两种状态，别的没有（过期退回没做）。 */
 const TRANSFER_STATE_LABEL = {
@@ -453,6 +480,7 @@ export async function sendTransferCard({
     opened = await createLineClients(projectId, projectSecret, { timeout: SEND_TIMEOUT_MS });
     const message = {
       appName: String(appName ?? "").trim() || "转账",
+      appStoreId: TRANSFER_APP_STORE_ID,
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,
       url: TRANSFER_URL,
@@ -536,6 +564,7 @@ export async function updateTransferCard({
     };
     const message = {
       appName: String(appName ?? "").trim() || "转账",
+      appStoreId: TRANSFER_APP_STORE_ID,
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,
       url: TRANSFER_URL,

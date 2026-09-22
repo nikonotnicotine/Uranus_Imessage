@@ -1516,9 +1516,10 @@ function normalizeLocationSend(input) {
  * 它是卡片上那行小字，纯展示、服务端不校验。填「转账」还是填某家银行的名字，
  * 是用户自己的决定，代码不替他选、也不预置任何真实机构的名字。默认「转账」。
  *
- * 身份那两个字段（teamId / extensionBundleId）**不给用户配**，写死成明显不
- * 属于任何人的假值（见 card.js 的 TRANSFER_TEAM_ID）—— 那两个填别人的值
- * 就是冒充人家 app 的身份，这个项目从 card.js 的文件头开始就拒绝这么做。
+ * 身份那几个字段（teamId / extensionBundleId / appStoreId）**不给用户配**，
+ * 写死成 Spectrum 那个官方扩展的值（见 card.js 的 TRANSFER_TEAM_ID）——
+ * 共享线路只放行它，填别的压根发不出去；而填**别人家的**就是冒充人家 app
+ * 的身份，这个项目从 card.js 的文件头开始就拒绝这么做。两头都不该开给用户。
  *
  * 默认关，和所有 *Send 一致：它会往对方手机上放一条看起来像金融凭证的气泡，
  * 不该由一次误触发生。

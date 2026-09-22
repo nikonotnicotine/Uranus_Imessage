@@ -219,16 +219,38 @@ okWith("不带缩略图（image / imageTitle / imageSubtitle 都不给）", () =
 });
 
 /*
- * 身份三件套必须是**假值**。填真机构的 teamId / bundleId，对方手机上那张卡片
- * 就会自称是那家 app 发的 —— 服务端只验格式不验归属，所以这道线只能由我们
- * 自己守。这一条挂了说明有人把某家公司的 id 填进去了。
+ * 身份必须是 Spectrum 那个官方扩展，**一个字都不能改**。
+ *
+ * 两头都钉着：
+ *
+ *  - 共享线路的服务端只放行这一个 bundle id，填别的直接 AuthenticationError，
+ *    卡片压根发不出去（官方文档里没记载这条，是踩出来的）。所以这几个值
+ *    错一个字，功能就整个哑掉。
+ *  - 另一头是**不许填别人家的**：填腾讯的 team id 和 com.tencent.xin.…，
+ *    对方手机上那张卡片就会自称是微信发的。这道线只能由我们自己守。
+ *
+ * 这一条挂了先看是哪一头：值对不上 Spectrum（发不出去），还是变成了某家
+ * 真公司的 id（冒充）。
  */
-okWith("身份三件套是明显不属于任何人的假值（不冒充任何 app）", () => {
+okWith("身份是 Spectrum 那个官方扩展（共享线路只放行它）", () => {
   const { msg } = calls.sent.at(-1);
-  assert.equal(msg.teamId, "AAAAAAAAAA");
-  assert.match(msg.teamId, /^[A-Z0-9]{10}$/); // 格式还得是合法的，不然服务端拒
-  assert.equal(msg.extensionBundleId, "codes.uranus.transfer");
-  assert.ok(!/tencent|alipay|apple|chase|paypal|wechat/i.test(msg.extensionBundleId));
+  assert.equal(msg.teamId, "P8XT6232SL");
+  assert.match(msg.teamId, /^[A-Z0-9]{10}$/); // 格式也得合法，不然服务端拒
+  assert.equal(msg.extensionBundleId, "codes.photon.Spectrum.MessagesExtension");
+  assert.equal(msg.appStoreId, 6777616651);
+  assert.ok(Number.isInteger(msg.appStoreId) && msg.appStoreId > 0); // 必须正整数
+  // 不许换成任何一家真金融机构 / 社交 app 的身份
+  assert.ok(!/tencent|alipay|chase|paypal|wechat|unionpay/i.test(msg.extensionBundleId));
+});
+
+/*
+ * 点卡片落在哪。装了 Spectrum 的人是**真能点开**的，所以这条不能指向
+ * SDK 源码那种地方（上一版填的是 advanced-imessage-ts 那个仓库，当时
+ * 身份是假的、点了不会有反应）。
+ */
+okWith("点开落在一个说得清来路的地方", () => {
+  assert.equal(calls.sent.at(-1).msg.url, "https://photon.codes");
+  assert.match(calls.sent.at(-1).msg.url, /^https:\/\//);
 });
 
 okWith("appName 是用户填的那个，留空兜底成「转账」", async () => {
@@ -283,10 +305,10 @@ okWith("句柄四个字段原样传回去（少一个就改不到那条气泡）
  * 身份必须和发的时候一模一样，否则等于「另一个 app 来改这张卡片」。
  * appName 也算身份的一部分 —— 这正是它要跟着那笔存下来的原因。
  */
-okWith("身份三件套和发的时候完全一致", () => {
+okWith("身份和发的时候完全一致（appStoreId 也算）", () => {
   const a = calls.sent[0].msg;
   const b = calls.updated.at(-1).msg;
-  for (const k of ["appName", "teamId", "extensionBundleId", "url"]) {
+  for (const k of ["appName", "teamId", "extensionBundleId", "appStoreId", "url"]) {
     assert.equal(b[k], a[k], k);
   }
 });
@@ -571,11 +593,31 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
     assert.ok(claim < gate, "收款检查跑到 reactSend 闸后面去了");
   });
 
-  okWith("本地 Mac 模式退化成发一句文字，不是什么都不做", () => {
-    const at = src.indexOf("async function sendTransferPart(");
-    const body = src.slice(at, at + 2400);
-    assert.ok(body.includes('runner.mode !== "cloud"'));
+  okWith("退路那句文字确实是「转账 ￥…」，不是空话", () => {
+    const at = src.indexOf("async function sendTransferText(");
+    assert.ok(at > 0, "找不到 sendTransferText");
+    const body = src.slice(at, at + 700);
     assert.ok(body.includes("转账 ${formatAmount(amount)}"));
+    assert.ok(body.includes("space.send(text)"));
+  });
+
+  /*
+   * **两条**发不出去的路都得退化成文字，不是什么都不做：本地 Mac 模式
+   * （压根没这条 RPC）和云端发失败（线路拒了、超时、凭据过期…）。
+   *
+   * 后者原来是 `return false`，于是只写了一个 [transfer:…] 的那一轮会被上游
+   * 判成「一件事都没做成」，这笔钱的意思一个字都没送出去。两条都盯着。
+   */
+  okWith("本地 Mac 模式和云端发失败都退化成发一句文字", () => {
+    const at = src.indexOf("async function sendTransferPart(");
+    const body = src.slice(at, src.indexOf("async function claimTransferOnReact("));
+    assert.ok(body.includes('runner.mode !== "cloud"'), "找不到本地模式那道判断");
+    assert.ok(body.includes("if (!session) {"), "找不到云端发失败那道判断");
+    assert.equal(
+      body.match(/sendTransferText\(/g)?.length,
+      2,
+      "两条退路都该走 sendTransferText"
+    );
   });
 
   okWith("句柄存不下来只 warn，不报成「这笔没发出去」", () => {

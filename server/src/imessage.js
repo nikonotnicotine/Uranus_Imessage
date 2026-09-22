@@ -4639,14 +4639,37 @@ async function sendCardPart(runner, space, part, ctx) {
 }
 
 /**
+ * 转账发不成卡片时的退路：当普通文字发一句。
+ *
+ * 两处都用它 —— 本地 Mac 模式（压根没这条 RPC）和云端发失败。这笔钱的意思
+ * 必须送出去，哪怕丢了卡片那层样子。
+ *
+ * @param {string} why 日志里说清是哪一种，两种排查方向完全不同
+ * @returns {Promise<boolean>} 这句文字发出去了没有
+ */
+async function sendTransferText(runner, space, ctx, amount, note, scope, why) {
+  const text = `转账 ${formatAmount(amount)}${note ? ` ${note}` : ""}`;
+  logWarn(scope, `${why}，改成发一句文字：${text}`);
+  try {
+    noteSent(runner, ctx, await space.send(text));
+    return true;
+  } catch (e) {
+    logError(scope, "这句转账文字也没能发出去", e);
+    return false;
+  }
+}
+
+/**
  * 执行一个 `[transfer:4000:零花钱]`：发一张转账卡片，并把句柄存下来。
  *
  * 三道闸：
  *
  *  1. **角色开关**（提示词里没注入不代表模型不会硬写）；
- *  2. **只有云端模式**能发 —— 本地 Mac 模式没有 Photon 那两条 RPC。这一条
- *     退化成「当普通文字发一句」而不是什么都不发：这笔钱的意思得说出去；
+ *  2. **只有云端模式**能发 —— 本地 Mac 模式没有 Photon 那两条 RPC；
  *  3. 金额认得出来（media.js 那条正则已经要求数字打头，这里不再重复判）。
+ *
+ * 第 2 条和「云端发失败」都退化成**当普通文字发一句**（sendTransferText），
+ * 不是什么都不发：这笔钱的意思得说出去。
  *
  * 句柄存不下来的时候**照样算发出去了** —— 卡片已经在对方手机上，只是以后
  * 改不成「已收款」。报成失败会让用户以为这笔没发出去，那更糟。
@@ -4670,15 +4693,7 @@ async function sendTransferPart(runner, space, part, ctx) {
    * 和 sendLinkCard 碰上 UnsupportedError 时退回纯网址是同一个处理。
    */
   if (runner.mode !== "cloud") {
-    const text = `转账 ${formatAmount(amount)}${note ? ` ${note}` : ""}`;
-    logWarn(scope, `本地 Mac 模式发不了转账卡片，改成发一句文字：${text}`);
-    try {
-      noteSent(runner, ctx, await space.send(text));
-      return true;
-    } catch (e) {
-      logError(scope, "这句转账文字也没能发出去", e);
-      return false;
-    }
+    return sendTransferText(runner, space, ctx, amount, note, scope, "本地 Mac 模式发不了转账卡片");
   }
 
   const session = await sendTransferCard({
@@ -4690,7 +4705,22 @@ async function sendTransferPart(runner, space, part, ctx) {
     appName: role.transfer.appName,
     scope,
   });
-  if (!session) return false;
+  /*
+   * 云端也没发出去（线路不让发这种卡片、超时、凭据过期…）：同样退化成一句
+   * 文字，不能让整轮回复跟着一起没。
+   *
+   * 这条以前是 `return false`，于是「只写了一个 [transfer:…] 的那一轮」会被
+   * 上游判成「一件事都没做成」，对方收到的是一句「这条没能发出来」——
+   * 这笔钱的意思一个字都没送出去。而本地模式明明早就退化成文字了，
+   * 两边不一致纯属漏了一处。
+   *
+   * 卡片发出去但**没拿到句柄**的情况也走到这儿（sendTransferCard 返回 null）。
+   * 那种情况下对方手机上已经有一张卡片了，再补一句文字等于说两遍 —— 认了，
+   * 说两遍比一笔转账彻底消失好，而且那条路极少见（见 card.js 那句 logWarn）。
+   */
+  if (!session) {
+    return sendTransferText(runner, space, ctx, amount, note, scope, "这张转账卡片没发出去");
+  }
 
   /*
    * 存句柄。存不下来只 warn —— 卡片已经发出去了，这一步失败只意味着
