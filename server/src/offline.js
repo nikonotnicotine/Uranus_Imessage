@@ -274,7 +274,11 @@ export function splitChoices(text) {
  * 顺带把「这个角色现在要不要显示选项」一起算好（`choices`）—— 那是两道闸
  * （角色开关 + 预设条目）的结果，让前端自己再推一遍就多一处会分叉的规则。
  *
- * @returns {{story: object, choices: boolean, presetName: string}}
+ * `folded` 同理：哪几轮因为超出上下文上限被总结顶掉了，由这边算完告诉前端。
+ * 让前端拿 `maxContext` 自己推一遍，就等于把「切点落在总结边界上」那套规则
+ * 抄第二份 —— 两份一分叉，界面上折起来的和真正没发出去的就不是同一批。
+ *
+ * @returns {{story: object, choices: boolean, presetName: string, folded: object}}
  */
 export function storyForView(config, role, story) {
   const preset = resolvePreset(config, role, "offline");
@@ -298,20 +302,124 @@ export function storyForView(config, role, story) {
         }
       : { ...t, display: t.content }
   );
+  const cut = offlineCut(story, role);
   return {
     story: { ...story, turns },
     choices: choicesOn(role, preset),
     presetName: presetLabel(preset),
+    /*
+     * 折起来的那截。三个字段各有用处：
+     *   - `count` 是**消息条数**，前端拿它切数组；
+     *   - `rounds` 是**轮数**（角色开口几次），给人看的那行文案用它 ——
+     *     用户在设置里填的是「轮」，界面上报条数会对不上；
+     *   - `text` 是顶替它们的总结正文，展开时直接给人看「模型这轮读到的是什么」。
+     */
+    folded: {
+      count: cut.at,
+      rounds: assistantCount((story?.turns ?? []).slice(0, cut.at)),
+      text: cut.text,
+    },
   };
+}
+
+/* ================= 上下文上限 ================= */
+
+/**
+ * 盖住 `[0, at)` 这段轮次的总结正文。**大的优先**。
+ *
+ * 用户的原话是「有小总结用小总结有大总结用大总结」：同一段两边都盖到时用大的
+ * 更省 token，大的没盖到的那截再拿小的补上。所以是从头往后走，每一步先找能盖住
+ * 当前位置的大总结（取伸得最远的那份），找不到再退回小总结。
+ *
+ * 返回的 `to` 是**实际**盖到第几轮。中间断了一截（用户手删过总结）就停在断口，
+ * 由调用方把切点缩回来 —— 宁可多发几轮原文，也绝不让哪几轮既不在总结里
+ * 又不在原文里。
+ */
+function summaryCover(story, at) {
+  const list = (story?.summaries ?? []).filter((s) => s.text?.trim() && s.to <= at);
+  const texts = [];
+  let p = 0;
+  while (p < at) {
+    const pick = (kind) =>
+      list
+        .filter((s) => s.kind === kind && s.from <= p && s.to > p)
+        .sort((a, b) => b.to - a.to)[0] ?? null;
+    const one = pick("big") ?? pick("small");
+    if (!one) break;
+    texts.push(one.text.trim());
+    p = one.to;
+  }
+  return { text: texts.join("\n\n"), to: p };
+}
+
+/**
+ * 这条剧情的前几轮该折起来换成总结吗，该折到第几轮。
+ *
+ * `role.offline.maxContext` 是**轮**数（默认 6 轮 = 12 条消息），0 = 不限制。
+ * 一轮按「角色开口一次」算，和 `smallEvery` 同一个口径；隐藏的轮次不计数
+ * ——它本来就不进上下文，算上它等于偷偷把上限调小。
+ *
+ * 切点**只落在总结边界上**，这是这个函数里唯一要紧的规则：
+ *
+ *  - 往回找不超过「至少要留的那截」的最后一个边界，所以实际发出去的原文在
+ *    `maxContext` 到 `maxContext + smallEvery` 轮之间浮动；
+ *  - 于是同一段绝不会既在总结里又在原文里（那是白烧两遍 token），
+ *    也绝不会有哪几轮既没进总结又被丢掉（那是剧情凭空消失）。
+ *
+ * 一份总结都还没出的时候返回 `{at: 0}` —— 宁可这一轮超出上限，也不能把还没
+ * 被总结过的剧情扔了。
+ *
+ * @returns {{at: number, text: string}} `at` = 原文从第几轮开始发，`text` = 顶上那段总结
+ */
+export function offlineCut(story, role) {
+  const none = { at: 0, text: "" };
+  const limit = Number(role?.offline?.maxContext ?? 6);
+  const turns = story?.turns ?? [];
+  if (!Number.isFinite(limit) || limit <= 0 || !turns.length) return none;
+
+  // 从末尾往前数够 limit 轮，多出来的那一轮开头就是「最多能切到哪」
+  let want = 0;
+  let seen = 0;
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const t = turns[i];
+    if (t.role === "assistant" && !t.hidden && t.content?.trim()) seen += 1;
+    if (seen > limit) {
+      want = i + 1;
+      break;
+    }
+  }
+  if (!want) return none;
+
+  const bounds = (story.summaries ?? [])
+    .filter((s) => s.text?.trim() && s.to <= want)
+    .map((s) => s.to);
+  if (!bounds.length) return none;
+
+  const cover = summaryCover(story, Math.max(...bounds));
+  return cover.to > 0 && cover.text ? { at: cover.to, text: cover.text } : none;
 }
 
 /* ================= 一轮剧情 ================= */
 
-/** 存档里的轮次 → 发给模型的上文。隐藏的那些不进（用户点了「隐藏回复」）。 */
-function historyOf(story) {
-  return story.turns
-    .filter((t) => !t.hidden && t.content.trim())
-    .map((t) => ({ role: t.role, content: t.content }));
+/**
+ * 存档里的轮次 → 发给模型的上文。
+ *
+ * 两处要扣掉的：用户点了「隐藏回复」的那些（`hidden`），和超出上下文上限、
+ * 已经被总结盖住的开头那截（`offlineCut`）。后者不是凭空删掉 —— 顶上会补一条
+ * `<剧情前情>`，里面是那段的总结正文，所以剧情记得住、token 又省下来了。
+ *
+ * 那条补出来的是 `system`：`filterHistory` 只对 assistant 跑正则，system 原样
+ * 穿过去，正好。它落在 `<Chat_History>` 里面，紧贴着第一条原文。
+ */
+function historyOf(story, role) {
+  const cut = offlineCut(story, role);
+  const out = [];
+  if (cut.text) out.push({ role: "system", content: wrap("剧情前情", cut.text) });
+  for (const t of story.turns.slice(cut.at)) {
+    if (t.hidden || !t.content.trim()) continue;
+    out.push({ role: t.role, content: t.content });
+  }
+  return out;
 }
 
 /**
@@ -423,7 +531,7 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
 
   let built;
   try {
-    built = await buildPrompt(config, role, user, historyOf(story), weatherNote, {
+    built = await buildPrompt(config, role, user, historyOf(story, role), weatherNote, {
       mode: "offline",
     });
   } catch (e) {

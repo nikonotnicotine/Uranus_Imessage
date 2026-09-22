@@ -2907,6 +2907,8 @@ function offlineState(config, role, roleKey) {
     // 现在要不要显示那四条选项：角色开关和预设条目两道闸的结果（offline.js 算）
     choices: view?.choices ?? false,
     presetName: view?.presetName ?? "",
+    // 超出线下上下文上限、已经被总结顶掉的开头那几轮（offline.js:offlineCut 算）
+    folded: view?.folded ?? { count: 0, text: "" },
     avatar: role.offline?.avatar ?? "",
     userAvatar: role.offline?.userAvatar ?? "",
     userName: resolveUser(config, role)?.name ?? "",

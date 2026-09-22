@@ -70,12 +70,19 @@ export const HISTORY_CLOSE = "</Chat_History>";
  * 原样搬自 buildMessages —— 内存里只留这么多，磁盘上的完整存档另算。
  * 发给模型的越少越省 token，小 VPS 上同时挂几个号码也不会被历史撑爆。
  *
+ * **线下那条链不走这儿**（`opts.offline`）。它有自己一套上限
+ * （`role.offline.maxContext`，单位是轮不是条），而且砍掉的那截会被总结顶上，
+ * 在 `offline.js:historyOf` 里就已经裁好了。这儿再按 `role.maxContext`
+ * 裁一遍的后果是**把顶上那条 `<剧情前情>` 连总结一起丢掉** —— 它是数组里最旧的
+ * 一条，正好第一个被 slice 掉，于是剧情既没原文也没总结。
+ *
  * @returns 裁剪后的数组（可能就是原数组本身，没超上限时不复制）
  */
-export function trimHistory(history, role) {
+export function trimHistory(history, role, opts = {}) {
+  let hist = Array.isArray(history) ? history : [];
+  if (opts?.offline) return hist;
   const maxContext = role?.maxContext ?? 20;
   const dropCount = role?.dropCount ?? 1;
-  let hist = Array.isArray(history) ? history : [];
   while (hist.length > maxContext) {
     hist = hist.slice(dropCount);
   }
@@ -705,7 +712,7 @@ function formatHistoryLines(messages, charName, userName, maxChars = 6000) {
 export async function buildPrompt(config, role, user, history, weatherNote = "", opts = {}) {
   const offline = opts?.mode === "offline";
   const preset = resolvePreset(config, role, offline ? "offline" : "online");
-  const hist = trimHistory(history, role);
+  const hist = trimHistory(history, role, { offline });
 
   const vars = {
     char: role?.name ?? "",

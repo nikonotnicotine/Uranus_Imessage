@@ -26,6 +26,8 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
+  ChevronDown,
+  ChevronRight,
   CircleAlert,
   CirclePlay,
   CircleStop,
@@ -1390,6 +1392,8 @@ export function OfflinePanel({ onGoto }) {
   const [showPrompt, setShowPrompt] = useState(false);
   // 往上补了多少轮（只算「更早的那批」，不含 SHOW_TURNS 那份基数）
   const [loadedMore, setLoadedMore] = useState(0);
+  // 折起来那几轮（已经换成总结的）现在展开着没有
+  const [foldedOpen, setFoldedOpen] = useState(false);
   /*
    * 「往上补一批」和「补完把滚动位置钉回去」之间传的两样东西。
    *
@@ -1688,9 +1692,27 @@ export function OfflinePanel({ onGoto }) {
   const skipped = Math.max(0, turns.length - SHOW_TURNS - loadedMore);
   const shown = skipped ? turns.slice(skipped) : turns;
 
+  /*
+   * 超出线下上下文上限、已经换成总结的开头那几轮，收成一行。
+   *
+   * 条数是**后端算的**（`state.folded.count`，见 offline.js:offlineCut）——
+   * 切点要落在总结边界上，那套规则在前端抄第二份就多一处会分叉的地方。
+   *
+   * 和上面那个 `skipped` 是两件事，只是长得像：`skipped` 是画面上的分批加载
+   * （那些轮次照旧发给模型），这里是真的没进上下文。两者叠在一起时，靠
+   * `foldedShown` 只折 `shown` 里落在切点之前的那截 —— 用户往上补出来的
+   * 更早轮次也要跟着折进去，不然会出现「折叠行上面还摆着几条已经不生效的」。
+   */
+  const foldedCount = Math.min(Number(state?.folded?.count) || 0, turns.length);
+  const foldedRounds = Number(state?.folded?.rounds) || 0;
+  const foldedText = state?.folded?.text ?? "";
+  const foldedShown = foldedOpen ? 0 : Math.max(0, foldedCount - skipped);
+  const visible = foldedShown ? shown.slice(foldedShown) : shown;
+
   /* 换了一条剧情就收回去，别把上一条补出来的几十轮带过来 */
   useEffect(() => {
     setLoadedMore(0);
+    setFoldedOpen(false);
     anchor.current = null;
     // 新开一条剧情从底部看起，上一条翻到一半的状态不带过来
     stick.current = true;
@@ -2209,7 +2231,31 @@ export function OfflinePanel({ onGoto }) {
                     </div>
                   )}
 
-                  {shown.map((t, i) => (
+                  {/*
+                    * 已经换成总结的那几轮，收成这一行。
+                    *
+                    * 展开的时候把总结正文也摆出来 —— 那就是模型这一轮真正读到的
+                    * 东西，比只说「已折叠」有用得多。原文一条都没删，展开就在下面。
+                    */}
+                  {foldedCount > 0 && (
+                    <div className="grid grid-cols-1 gap-2 border border-dashed border-line bg-sunken px-3.5 py-3">
+                      <button
+                        type="button"
+                        onClick={() => setFoldedOpen((v) => !v)}
+                        className="flex items-center gap-2 text-left text-meta text-ink-faint hover:text-ink-soft"
+                      >
+                        {foldedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        前 {foldedRounds || foldedCount} 轮已折叠 · 换成了总结，省 token
+                      </button>
+                      {foldedOpen && foldedText && (
+                        <p className="whitespace-pre-wrap break-words border-t border-line pt-2 text-meta leading-relaxed text-ink-soft">
+                          {foldedText}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {visible.map((t, i) => (
                     <div
                       key={t.id}
                       /* 补更早那批之前，把这一条的位置记下来当锚点 */

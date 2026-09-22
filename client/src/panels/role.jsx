@@ -3769,6 +3769,43 @@ export function RoleOfflineFields({ role, onGoto }) {
             </p>
           </div>
 
+          {/* 上下文上限 */}
+          <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
+            <div>
+              <p className="text-ui text-ink">上下文</p>
+              <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
+                线下一轮动辄上千字，演几十轮就能把上下文顶满。超出这个轮数的开头
+                那几轮会
+                <strong className="text-ink-soft">换成总结</strong>
+                （有大总结用大总结，没有就用小总结），页面上收成一行、点开还能看
+                原文。和「角色 · 上下文」里那个条数是
+                <strong className="text-ink-soft">两套</strong>
+                ，线下只认这一个。
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+              <NumberField
+                label="最多带几轮原文"
+                value={off.maxContext ?? 6}
+                min={0}
+                max={500}
+                step={1}
+                onChange={(v) => patch({ maxContext: v })}
+                hint="1 轮 = 你一句 + 角色一句。0 = 不限制，整条剧情全发"
+                suffix="轮"
+              />
+            </div>
+
+            <p className="text-meta leading-relaxed text-ink-faint">
+              切点只落在总结的边界上，所以实际带的原文会比这个数多一点（多不过一份
+              小总结的跨度）。这样同一段不会既在总结里又在原文里白烧两遍，也不会有
+              哪几轮既没进总结又被丢掉。一份总结都还没出的时候这条
+              <strong className="text-ink-soft">不生效</strong>
+              —— 宁可这一轮超出上限，也不能把还没总结过的剧情扔了。
+            </p>
+          </div>
+
           {/* 总结节奏 */}
           <div className="grid grid-cols-1 gap-6 border-t border-line pt-6">
             <div>

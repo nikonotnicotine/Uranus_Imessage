@@ -641,6 +641,176 @@ console.log("\n=== 9. storyForView：显示那份和存档那份分开 ===");
   check("两道都开：true", O.storyForView(bothOn, roleOn, story).choices, true);
 }
 
+console.log("\n=== 9b. 线下自己那份上下文上限 ===");
+{
+  /*
+   * 造一条剧情：N 轮，每轮「用户一句 + 角色一句」，所以第 k 轮占下标
+   * 2k 和 2k+1。总结的 from/to 是**轮次下标**（含头不含尾），所以「盖住前 3 轮」
+   * 就是 {from: 0, to: 6}。
+   */
+  const mkStory = (rounds, summaries = []) => ({
+    id: "st-cut",
+    roleId: role.id,
+    name: "长剧情",
+    presetRef: "ps-offline",
+    turns: Array.from({ length: rounds * 2 }, (_, i) => ({
+      id: `t${i}`,
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: i % 2 === 0 ? `我第 ${Math.floor(i / 2) + 1} 句` : `他第 ${Math.floor(i / 2) + 1} 句`,
+      options: [],
+      hidden: false,
+      ts: "",
+    })),
+    summaries: summaries.map((s, i) => ({ id: `s${i}`, ts: `2026-01-0${i + 1}`, ...s })),
+  });
+  const withLimit = (n) => ({ ...role, offline: { ...role.offline, maxContext: n } });
+  const small = (from, to, text) => ({ kind: "small", from, to, text });
+  const big = (from, to, text) => ({ kind: "big", from, to, text });
+
+  // 没到上限 → 一轮都不折
+  check("没超上限：不折", O.offlineCut(mkStory(4, [small(0, 6, "前三轮")]), withLimit(6)).at, 0);
+
+  /*
+   * 这一条是整节最要紧的：一份总结都没出的时候**绝不折**。
+   * 折了就等于把还没被总结过的剧情直接扔掉，剧情凭空消失。
+   */
+  check("超了但没总结：不折", O.offlineCut(mkStory(20, []), withLimit(6)).at, 0);
+
+  /*
+   * 14 轮、上限 6，总结盖到第 6 轮（轮次下标 12）→ 切在那儿，留 8 轮原文。
+   *
+   * 这里刻意用 14 而不是 10：10 轮的话切了只剩 4 轮原文，比上限还少，按
+   * 「至少留够 limit 轮」的规则就**不该折**（下面 s10 那条验的正是这个）。
+   */
+  const s14 = mkStory(14, [small(0, 12, "前六轮发生了")]);
+  const cut14 = O.offlineCut(s14, withLimit(6));
+  check("切在总结边界上", cut14.at, 12);
+  check("顶上那段是总结正文", cut14.text, "前六轮发生了");
+
+  // 切了会让原文少于上限 → 宁可这一轮多发，也不折
+  const s10 = mkStory(10, [small(0, 12, "前六轮发生了")]);
+  check("折了会低于上限：不折", O.offlineCut(s10, withLimit(6)).at, 0);
+
+  /*
+   * 切点只落在边界上：总结只盖到第 2 轮，上限 6、实际有 10 轮 ——
+   * 最多能切到第 4 轮，但边界只有第 2 轮，就切第 2 轮。
+   * 于是发出去的原文是 8 轮（比上限多），这是刻意的：宁可多发，
+   * 也不让哪几轮既没进总结又被丢掉。
+   */
+  const s10b = mkStory(10, [small(0, 4, "前两轮")]);
+  check("边界比上限保守：切在边界", O.offlineCut(s10b, withLimit(6)).at, 4);
+
+  // 总结伸过了「至少要留的那截」→ 不能用它，退回不折
+  const s8 = mkStory(8, [small(0, 14, "盖到第七轮")]);
+  check("总结伸太远：不折", O.offlineCut(s8, withLimit(6)).at, 0);
+
+  // 0 = 不限制（老行为）
+  check("0 就是不限制", O.offlineCut(s10, withLimit(0)).at, 0);
+
+  /*
+   * 「有小总结用小总结有大总结用大总结」：同一段两边都盖到时用大的（更省），
+   * 大的没盖到的那截拿小的补。
+   */
+  const both = mkStory(14, [
+    small(0, 4, "小一"),
+    small(4, 8, "小二"),
+    big(0, 8, "大的盖了前四轮"),
+    small(8, 12, "小三"),
+  ]);
+  const cutBoth = O.offlineCut(both, withLimit(6));
+  check("大小都有：切到最远那份", cutBoth.at, 12);
+  check("大的优先，剩下的用小的", cutBoth.text, "大的盖了前四轮\n\n小三");
+  checkThat("被大的盖住的小总结不重复进去", !cutBoth.text.includes("小一"), cutBoth.text);
+
+  // 中间断了一截（用户手删过总结）→ 停在断口，后半段照旧发原文
+  const gap = mkStory(20, [small(0, 4, "小一"), small(8, 12, "小三")]);
+  const cutGap = O.offlineCut(gap, withLimit(6));
+  check("总结中间断了：停在断口", cutGap.at, 4);
+  check("断口之后那份不进来", cutGap.text, "小一");
+
+  // 空正文的总结不算边界 —— 拿它当切点等于那几轮什么都没留下
+  const blank = mkStory(10, [small(0, 12, "   ")]);
+  check("空总结不算边界", O.offlineCut(blank, withLimit(6)).at, 0);
+
+  // 隐藏的轮次不参与计数：它本来就不进上下文，算上它等于偷偷把上限调小
+  const hidden = mkStory(10, [small(0, 12, "前六轮")]);
+  for (const t of hidden.turns.slice(12)) t.hidden = true;
+  check("隐藏的不算进上限", O.offlineCut(hidden, withLimit(6)).at, 0);
+
+  // storyForView 把切点报给前端，条数和轮数两个都在
+  const view = O.storyForView(config, withLimit(6), s14);
+  check("view 报了折叠条数", view.folded.count, 12);
+  check("view 报了折叠轮数", view.folded.rounds, 6);
+  check("view 带了总结正文", view.folded.text, "前六轮发生了");
+  check("没折的时候是 0", O.storyForView(config, withLimit(0), s14).folded.count, 0);
+
+  /*
+   * 真正发给模型的那份：折掉的那几轮不在，顶上多一条 <剧情前情>。
+   * 这条要走 buildPrompt —— historyOf 是私有的，从提示词正文里验才算数。
+   */
+  const textOf = (b) => b.messages.map((m) => m.content).join("\n");
+  S.setCurrent(KEY, "");
+  const built = await buildPrompt(
+    config,
+    withLimit(6),
+    user,
+    // 直接模拟 historyOf 的产物：前六轮换成总结
+    [
+      { role: "system", content: "<剧情前情>\n前六轮发生了\n</剧情前情>" },
+      ...s14.turns.slice(12).map((t) => ({ role: t.role, content: t.content })),
+    ],
+    "",
+    { mode: "offline" }
+  );
+  const bt = textOf(built);
+  checkThat("提示词里有剧情前情", /<剧情前情>/.test(bt), bt.slice(0, 200));
+  checkThat("折掉那几轮的原文不在", !/我第 1 句/.test(bt), "");
+  checkThat("留下那几轮的原文在", /我第 7 句/.test(bt) && /他第 14 句/.test(bt), "");
+
+  /*
+   * 线上那对 maxContext / dropCount 不能再砍线下这份。
+   * 它砍的是数组头几条，第一个被砍掉的正好是 <剧情前情> —— 那样剧情既没原文
+   * 也没总结，是这次改动里最容易悄悄回归的一处。
+   */
+  const tight = { ...withLimit(6), maxContext: 2, dropCount: 1 };
+  const kept = await buildPrompt(
+    config,
+    tight,
+    user,
+    [
+      { role: "system", content: "<剧情前情>\n前六轮发生了\n</剧情前情>" },
+      ...s14.turns.slice(12).map((t) => ({ role: t.role, content: t.content })),
+    ],
+    "",
+    { mode: "offline" }
+  );
+  const kt = textOf(kept);
+  checkThat("线上上限砍不动线下", /<剧情前情>/.test(kt) && /我第 7 句/.test(kt), kt.slice(0, 300));
+  // 反过来，线上那条链照旧受它管 —— 这是老行为，不能被顺手改掉
+  const on = await buildPrompt(
+    config,
+    tight,
+    user,
+    [
+      { role: "user", content: "最旧那条" },
+      { role: "assistant", content: "中间那条" },
+      { role: "user", content: "最新那条" },
+    ]
+  );
+  const ot = textOf(on);
+  checkThat("线上还是被 maxContext 管着", !/最旧那条/.test(ot) && /最新那条/.test(ot), ot.slice(0, 300));
+
+  /*
+   * 配置层。角色文件里压根没写这个字段（见 ROLE_RAW），所以这一条同时验了
+   * 「老配置升级上来是默认 6 轮」—— 不是 undefined、也不是 0。
+   */
+  check("老配置回落到 6 轮", role.offline.maxContext, 6);
+  // 0 要放得过去（用户明确要「不限制」），垃圾值和负数不能把它当成上限 1
+  check("0 放得过去", O.offlineCut(s10, withLimit(0)).at, 0);
+  check("负数当不限制处理", O.offlineCut(s10, withLimit(-5)).at, 0);
+  check("垃圾值当不限制处理", O.offlineCut(s10, withLimit("六")).at, 0);
+}
+
 console.log("\n=== 10. 四条快捷指令 ===");
 {
   const ctx = { config, role, projectRefId: "proj-1", spaceId: "sp-1" };

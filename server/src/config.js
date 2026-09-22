@@ -1359,7 +1359,8 @@ function normalizePromptAssist(input) {
  * 两个头像存的是 `data/offline/media/` 下的**文件名**，图片本身不进备份包 ——
  * 换机器之后头像会退回首字母占位，剧情内容一条不少。
  *
- * 三个默认值是用户钉死的：小总结 6 轮、大总结默认关、大总结攒 8 个小总结。
+ * 四个默认值是用户钉死的：上下文 6 轮、小总结 6 轮、大总结默认关、大总结攒
+ * 8 个小总结。
  */
 function normalizeOffline(input) {
   return {
@@ -1369,6 +1370,17 @@ function normalizeOffline(input) {
       ? [...new Set(input.worldBookRefs.map((r) => str(r).trim()).filter(Boolean))]
       : [],
     model: normalizeModelRef(input?.model),
+    /*
+     * 线下自己的上下文上限，单位是**轮**（6 轮 = 12 条消息）。
+     *
+     * 和线上那对 `maxContext` / `dropCount` 是两套，因为两条链的一条消息压根
+     * 不是一个量级：线上一条短信几十个字，线下一轮动辄上千字。以前线下是跟着
+     * 线上 `maxContext` 走的（`prompt.js:trimHistory` 无条件跑），砍掉的那几轮
+     * 直接消失、什么都不留 —— 这儿这个限制存在的意义就是把砍掉的那截换成总结。
+     *
+     * 0 = 不限制，把整条剧情全发出去（老行为）。
+     */
+    maxContext: clampInt(input?.maxContext, 6, 0, 500),
     // 小总结：每这么多轮出一份。1 轮 = 用户一句 + 角色一句
     smallEvery: clampInt(input?.smallEvery, 6, 1, 200),
     // 大总结：默认关。开着的话每攒够这么多份小总结出一份大的
