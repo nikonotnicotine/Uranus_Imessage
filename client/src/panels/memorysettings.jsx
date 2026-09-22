@@ -134,7 +134,7 @@ function MemorySettings({ onGoto }) {
           <div>
             <p className="text-ui text-ink">检索</p>
             <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
-              每轮拿对方最后那句话去检索一遍，把相关的老记忆捞回来。
+              每轮拿最近几轮上下文去检索一遍，把相关的老记忆捞回来。
               打分是<span className="font-mono">语义 × 0.7 + 关键词 × 0.3</span>，
               再按天数扣分 ——
               <strong className="text-ink-soft">门槛判在扣分之前</strong>
@@ -160,6 +160,16 @@ function MemorySettings({ onGoto }) {
               step={0.05}
               onChange={(v) => patch({ threshold: v })}
               hint="0～1，调高就更严"
+            />
+            <NumberField
+              label="查询用几轮上下文"
+              value={cfg.queryRounds ?? 3}
+              min={1}
+              max={20}
+              step={1}
+              onChange={(v) => patch({ queryRounds: v })}
+              hint="一轮 = 对方的一条消息，连中间的回复一起。填 1 = 只用最后那句"
+              suffix="轮"
             />
           </div>
 

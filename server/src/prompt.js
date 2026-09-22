@@ -27,6 +27,7 @@
 
 import { applyVars, resolveEndpoint } from "./config.js";
 import { listEmojiTags } from "./emoji.js";
+import { stripEnvPrefix } from "./env.js";
 import { embedText } from "./llm.js";
 import { logWarn } from "./logs.js";
 import { EFFECT_LABELS, SCREEN_EFFECT_KEYS } from "./media.js";
@@ -421,11 +422,61 @@ function dropEmptyBlocks(text, vars) {
 }
 
 /**
+ * 拼检索用的查询词：最近 N 轮上下文，**剥掉环境前缀**。
+ *
+ * 一「轮」按 user 消息数，和 commands.js:trimRounds 同一个口径 —— 从倒数第 N 条
+ * user 消息起，到最后，中间模型的回复一起带上。带回复是因为话题往往在那边：
+ * 「排在第几」四个字本身什么都检索不到，前一轮的「Mr Lucien可以」才是题眼。
+ *
+ * **必须剥 env 前缀**（env.js:stripEnvPrefix），这是这个函数存在的另一半理由。
+ * 进上文的 user 消息长这样：
+ *
+ *   [niki发送当地时间 CST : 2026-09-22 19:25:58 | 周二, 工作日 | niki当地天气:
+ *    南宁 多云 28.7°C … ; Charlie当地天气: 旧金山 …]Lucien先生这个称呼排在第几
+ *
+ * 两百来字的时间和天气，裹着十四个字的正文。而记忆**入库时是剥过的**
+ * （memoryhooks.js:recordTurn），两边根本不在一个文本分布上：向量被样板
+ * 稀释，keywordScore 更惨 —— 它按「查询里的词命中了几成」算，一百个
+ * 时间戳 2-gram 配七个真词，满打满算也就 0.07 分。不剥的话按轮数取上下文
+ * 只是把同一段样板抄三遍，比原来更糟。
+ *
+ * 空消息跳过；全空就返回空串，调用方据此跳过整个检索。
+ *
+ * 导出只是给 scripts/test-memory.mjs 用的 —— 轮数边界和剥前缀这两件事
+ * 坏了都不会报错，只会让召回悄悄变差，值得钉住。
+ */
+export function buildQuery(sent, rounds) {
+  const list = Array.isArray(sent) ? sent : [];
+  const want = Math.max(1, Number(rounds) || 1);
+
+  // 从尾往前数 user 消息，数够 N 条就停 —— i 落在第 N 条 user 消息上
+  let i = list.length;
+  let seen = 0;
+  while (i > 0) {
+    i -= 1;
+    if (list[i]?.role === "user") {
+      seen += 1;
+      if (seen >= want) break;
+    }
+  }
+  if (!seen) return "";
+
+  return list
+    .slice(i)
+    .map((m) => stripEnvPrefix(m?.content ?? "").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
  * 语义检索那一路：算查询向量 → 逐条比余弦 → 混合打分 → 按预算挑几条。
  *
  * 拆出来是因为它整个包在调用方的 try 里，而这里面有五处可以「直接返回空」
  * 的前置检查（没开检索、没配向量模型、没有存了向量的记忆、抽不出查询词），
  * 混在 memoryBlock 里会让那边的主干读不出来。
+ *
+ * 查询词是**最近 queryRounds 轮上下文**（默认 3 轮），不是最后一句话，
+ * 理由见 buildQuery。同一段文本喂给向量和 keywordScore 两路。
  *
  * 只比**存了向量的**那些记忆。没存向量的（生成时向量接口正好挂了，或者
  * 用户手改过正文）不参与语义比对，但它们仍然走近 N 天那一路 —— 所以
@@ -436,9 +487,7 @@ async function recallMemories(all, recent, role, config, sent, now) {
   const ref = cfg.embedModel;
   if (!ref?.provider || !ref?.modelId) return [];
 
-  // 拿最后一条 user 消息当查询词 —— 检索要回答的是「和对方刚说的这句话有关的」
-  const lastUser = [...(sent ?? [])].reverse().find((m) => m.role === "user");
-  const query = truncate(lastUser?.content ?? "", cfg.maxInputChars ?? 4000);
+  const query = truncate(buildQuery(sent, cfg.queryRounds ?? 3), cfg.maxInputChars ?? 4000);
   if (!query) return [];
 
   const withVec = all.filter((m) => Array.isArray(m.embedding) && m.embedding.length);

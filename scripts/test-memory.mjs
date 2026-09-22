@@ -446,6 +446,73 @@ check("限长 0 = 别打接口了", mem.truncate("abc", 0), "");
 check("限长为负也返回空串", mem.truncate("abc", -1), "");
 check("没超长就原样", mem.truncate("abc", 100), "abc");
 
+/*
+ * ================= 11.5 检索用的查询词 =================
+ *
+ * 语义检索拿什么去比，决定了能不能召回 —— 这一步错了，后面打分再准也是白搭。
+ * 两件事在这儿钉死：
+ *
+ *  1. **取最近 N 轮**，不是最后那一句。iMessage 那种碎片化短句单拎出来
+ *     几乎没有可检索的语义（「排在第几」四个字什么都比不出来），题眼在
+ *     前一两轮里（「Mr Lucien可以」）。
+ *  2. **剥掉环境前缀**。记忆入库时是剥过的（memoryhooks.js:recordTurn），
+ *     查询这边不剥就是拿两百字的时间天气样板去比正文 —— 向量被稀释，
+ *     keywordScore 更惨。不剥的话取 3 轮只是把同一段样板抄三遍，比原来更糟。
+ */
+console.log("\n=== 11.5 检索用的查询词（最近 N 轮上下文）===");
+const { buildQuery } = await import("../server/src/prompt.js");
+
+const PFX =
+  "[米洛发送当地时间 CST : 2026-09-22 19:25:58 | 周二, 工作日 | " +
+  "米洛当地天气: 南宁 多云 28.7°C; Charlie当地天气: 旧金山 晴 18°C]";
+const convo = [
+  { role: "user", content: `${PFX}你觉得叫你什么好` },
+  { role: "assistant", content: "Mr Lucien可以" },
+  { role: "user", content: `${PFX}那老公呢` },
+  { role: "assistant", content: "……也行" },
+  { role: "user", content: `${PFX}Lucien先生这个称呼排在第几` },
+];
+
+check(
+  "查询词：3 轮 = 从倒数第 3 条 user 起，中间的回复一起带上",
+  buildQuery(convo, 3),
+  "你觉得叫你什么好\nMr Lucien可以\n那老公呢\n……也行\nLucien先生这个称呼排在第几"
+);
+check("查询词：2 轮就从倒数第 2 条 user 起", buildQuery(convo, 2), "那老公呢\n……也行\nLucien先生这个称呼排在第几");
+check("查询词：1 轮 = 只要对方最后那句（老行为）", buildQuery(convo, 1), "Lucien先生这个称呼排在第几");
+checkThat(
+  "查询词：时间、星期、天气一个字都不留（不剥就是拿样板比正文）",
+  !/发送当地时间|当地天气|工作日|°C|CST/.test(buildQuery(convo, 3))
+);
+check("查询词：要的轮数比现有的多，就把有的全给", buildQuery(convo, 99), buildQuery(convo, 3));
+check("查询词：轮数填 0 或负数按 1 算", buildQuery(convo, 0), buildQuery(convo, 1));
+check(
+  "查询词：一条 user 都没有 → 空串（调用方据此整个跳过检索，不白打接口）",
+  buildQuery([{ role: "assistant", content: "在" }], 3),
+  ""
+);
+check("查询词：空数组 → 空串", buildQuery([], 3), "");
+check("查询词：传 null 不抛", buildQuery(null, 3), "");
+check("查询词：剥完只剩空的那条不占一行", buildQuery([{ role: "user", content: PFX }], 1), "");
+check(
+  "查询词：中间的空消息跳过，不留空行",
+  buildQuery(
+    [
+      { role: "user", content: "第一句" },
+      { role: "assistant", content: "   " },
+      { role: "user", content: "第二句" },
+    ],
+    2
+  ),
+  "第一句\n第二句"
+);
+// 对方自己打的方括号不是环境前缀，一个字都不许吃（和 recordTurn 那边同一条规矩）
+check(
+  "查询词：用户自己打的方括号原样留着",
+  buildQuery([{ role: "user", content: "[备注] 记得带伞" }], 1),
+  "[备注] 记得带伞"
+);
+
 console.log("\n=== 12. 注入：四个变量和三道角色闸 ===");
 const { buildPrompt } = await import("../server/src/prompt.js");
 const { DEFAULT_MEMORY_ENTRY, LEGACY_MEMORY_ENTRY, defaultEntries } = await import(

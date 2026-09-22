@@ -648,6 +648,8 @@ export const DEFAULT_CONFIG = {
       prompt: DEFAULT_MEMORY_PROMPT,
       topK: 5,
       threshold: 0.35,
+      // 检索时拿最近几轮上下文当查询词。1 = 只用对方最后那句话（老行为）
+      queryRounds: 3,
       decay: 0.01,
       // 默认**关**：入选门槛（threshold）已经在把不相关的记忆挡在外面了，
       // 再按天数扣分只会让「久远但要紧」的事排到「昨天随口一句」后面
@@ -2391,6 +2393,15 @@ function normalizeMemories(input) {
       topK: clampInt(memory.topK, 5, 1, 50),
       // 入选门槛，判在时间衰减**之前** —— 老而准的记忆不该只因为旧就被踢掉
       threshold: clampNum(memory.threshold, 0.35, 0, 1),
+      /*
+       * 检索时拿最近几轮上下文当查询词（一轮 = 一条 user 消息，和 /clear 同口径）。
+       *
+       * 默认 3 而不是 1：iMessage 那种碎片化短句单拎出来几乎没有可检索的语义
+       * （「排在第几」），题眼在前一两轮里。填 1 就是老行为。
+       * 老配置没有这个字段，升上来会**从 1 变成 3** —— 这是刻意的，
+       * 那个老行为是个 bug 不是偏好。
+       */
+      queryRounds: clampInt(memory.queryRounds, 3, 1, 20),
       // 每老一天扣多少分。只改排序，不改入选资格
       decay: clampNum(memory.decay, 0.01, 0, 1),
       // 缺字段算**关**，和 DEFAULT_CONFIG 那边保持一致
