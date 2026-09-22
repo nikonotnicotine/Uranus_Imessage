@@ -178,6 +178,44 @@ okWith("认不出数字时原样带回，绝不变成 ￥0.00", () => {
   assert.ok(!CARD.formatAmount("一点钱").includes("0.00"));
 });
 
+/*
+ * **从残渣里凑不出数来。** 剔掉符号和千分位之后必须整串都是数字才算认出来，
+ * 光看 `Number()` 不行 —— `Number("-1")` 对「abc-1」这种残渣照样给 -1，
+ * 于是一句「abc-1」会显示成「￥-1.00」，正是上面那条要挡的「看着完全正常、
+ * 错得没人发现」。（这一条是加自定义货币时真踩出来的：那一版改成「只留数字、
+ * 小数点和负号」，就是这个下场。）
+ */
+okWith("剔完符号剩下的不是纯数字 → 原样带回，不凑一个数出来", () => {
+  assert.equal(CARD.formatAmount("abc-1"), "￥abc-1");
+  assert.equal(CARD.formatAmount("12-34"), "￥12-34");
+  assert.equal(CARD.formatAmount("１２３"), "￥１２３"); // 全角数字不认
+});
+
+/*
+ * 货币符号由用户自己填（role.transfer.currency）。这个功能一开始是写死人民币的，
+ * 没有任何技术理由 —— 就是当时只有一个角色一种钱。
+ */
+okWith("货币符号跟着传进来的那个走，留空是 ￥", () => {
+  assert.equal(CARD.formatAmount("4000", "$"), "$4,000.00");
+  assert.equal(CARD.formatAmount("4000", "€"), "€4,000.00");
+  assert.equal(CARD.formatAmount("4000", "HK$"), "HK$4,000.00");
+  assert.equal(CARD.formatAmount("4000", ""), "￥4,000.00");
+  assert.equal(CARD.formatAmount("4000", undefined), "￥4,000.00");
+  assert.equal(CARD.DEFAULT_CURRENCY, "￥");
+});
+
+/*
+ * 剔符号那一刀得认**用户填的那个**，不能只认一张写死的清单。
+ * 原来是 `[￥¥$,，\s]`，用户填 € 时模型跟着写 `€4000` 就认不出数字了 ——
+ * 一笔 4000 显示成「€€4000」。现在按 Unicode 货币符号类（\p{Sc}）剔，
+ * 再补一刀剔用户填的（「元」「円」这种汉字不属于 Sc）。
+ */
+okWith("模型把符号也写进金额里时不会重一遍", () => {
+  assert.equal(CARD.formatAmount("€4000", "€"), "€4,000.00");
+  assert.equal(CARD.formatAmount("4000元", "元"), "元4,000.00");
+  assert.equal(CARD.formatAmount("￥4000", "$"), "$4,000.00"); // 换了符号也认得出数
+});
+
 /* ================= 卡片拼装 ================= */
 
 section("卡片拼装（card.js:sendTransferCard）");
@@ -253,7 +291,7 @@ okWith("点开落在一个说得清来路的地方", () => {
   assert.match(calls.sent.at(-1).msg.url, /^https:\/\//);
 });
 
-okWith("appName 是用户填的那个，留空兜底成「转账」", async () => {
+okWith("appName 是用户填的那个", async () => {
   assert.equal(calls.sent.at(-1).msg.appName, "Chase");
 });
 
@@ -265,11 +303,32 @@ await CARD.sendTransferCard({
   note: "",
   appName: "",
 });
-okWith("没填 appName → 「转账」；没备注 → 不给 subcaption", () => {
+/*
+ * appName 留空 = **那行小字不要**，不是兜底成「转账」。原来是兜底的，于是
+ * 「不显示那行」压根没法表达 —— 用户想要一张只有金额和备注的卡片时没有办法。
+ * 空串在 wire 上等于不传这个字段（proto 里它是 `string app_name = 4`）。
+ */
+okWith("appName 留空 → 空串传下去（那行不要），不兜底成「转账」", () => {
   const { msg } = calls.sent.at(-1);
-  assert.equal(msg.appName, "转账");
+  assert.equal(msg.appName, "");
   assert.equal(msg.layout.subcaption, undefined);
   assert.equal(msg.layout.summary, "转账 ￥4,000.00（待收款）");
+});
+
+await CARD.sendTransferCard({
+  projectId: "p",
+  projectSecret: "s",
+  chatGuid: "c",
+  amount: "4000",
+  note: "零花钱",
+  appName: "Chase",
+  currency: "$",
+});
+okWith("货币符号一直传到卡片的槽里（金额和兜底文案两处都得改）", () => {
+  const { layout } = calls.sent.at(-1).msg;
+  assert.equal(layout.caption, "$4,000.00");
+  assert.equal(layout.summary, "转账 $4,000.00 · 零花钱（待收款）");
+  assert.ok(!JSON.stringify(layout).includes("￥"), "换了符号就不该再有 ￥ 漏在别处");
 });
 
 /* ================= 改状态 ================= */
@@ -382,6 +441,45 @@ okWith("存一笔，读回来是待收款", () => {
   assert.equal(hit?.state, "pending");
   assert.equal(hit?.amount, "4000");
   assert.equal(hit?.note, "零花钱");
+});
+
+/*
+ * **appName / currency 必须落盘。** 落盘那儿是一张白名单（不是 `...entry`），
+ * 而原来那张单子里**没有 appName** —— imessage.js 一直在传、
+ * claimTransferOnReact 一直在读 `hit.appName`，读回来永远是 undefined。
+ * 当时发和改两边都兜底成「转账」，所以一直没露馅；`appName` 真填了点什么
+ * （或者像现在这样取消了兜底），发和改就是两个名字了 —— 那等于「另一个 app
+ * 来改这张卡片」，卡片改不动、收款静默失效。
+ *
+ * 那时候的测试只在源码里 grep `appName: hit.appName`，所以 46 项全绿也照样漏。
+ * 这一条改成真存一笔再读回来。
+ */
+okWith("appName 和 currency 跟着落盘（改卡片时要用发的时候那一份）", () => {
+  TS.putTransfer(ROLE, {
+    ...session,
+    messageGuid: "G-money",
+    amount: "4000",
+    note: "",
+    state: "pending",
+    peerKey: "p1",
+    appName: "Chase",
+    currency: "$",
+  });
+  const hit = TS.findTransfer(ROLE, "G-money");
+  assert.equal(hit?.appName, "Chase");
+  assert.equal(hit?.currency, "$");
+});
+
+okWith("没给 appName / currency 时存成空串，不是 undefined", () => {
+  TS.putTransfer(ROLE, {
+    ...session,
+    messageGuid: "G-bare",
+    amount: "1",
+    state: "pending",
+  });
+  const hit = TS.findTransfer(ROLE, "G-bare");
+  assert.equal(hit?.appName, "");
+  assert.equal(hit?.currency, "");
 });
 
 /*
@@ -593,11 +691,15 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
     assert.ok(claim < gate, "收款检查跑到 reactSend 闸后面去了");
   });
 
-  okWith("退路那句文字确实是「转账 ￥…」，不是空话", () => {
+  okWith("退路那句文字确实是「转账 ￥…」，而且金额跟着角色那个符号走", () => {
     const at = src.indexOf("async function sendTransferText(");
     assert.ok(at > 0, "找不到 sendTransferText");
-    const body = src.slice(at, at + 700);
-    assert.ok(body.includes("转账 ${formatAmount(amount)}"));
+    const body = src.slice(at, at + 900);
+    assert.ok(body.includes("转账 ${money}"));
+    assert.ok(
+      body.includes("formatAmount(amount, ctx?.role?.transfer?.currency)"),
+      "退化的那句文字得和卡片上同一个货币符号，不然一笔钱两种写法"
+    );
     assert.ok(body.includes("space.send(text)"));
   });
 

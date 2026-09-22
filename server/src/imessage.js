@@ -2437,7 +2437,7 @@ async function runOfflineTurnHere(getConfig, runner, space, spaceId, userText, p
      * 一对方括号，所以照线上「功能关着」的同一套待遇退化 —— 语音变文字、
      * 图片描述丢弃。整条都是要丢的标记时这条就不发了。
      */
-    const plain = degradeToPlain(bubble.text);
+    const plain = degradeToPlain(bubble.text, role?.transfer?.currency);
     if (!plain) continue;
     try {
       await sleep(bubble.delay); // 秒。按字数算的打字停顿，和线上一套（delay.js）
@@ -4644,11 +4644,14 @@ async function sendCardPart(runner, space, part, ctx) {
  * 两处都用它 —— 本地 Mac 模式（压根没这条 RPC）和云端发失败。这笔钱的意思
  * 必须送出去，哪怕丢了卡片那层样子。
  *
+ * 金额跟着角色那个货币符号走 —— 退化版和卡片版说的该是同一笔钱。
+ *
  * @param {string} why 日志里说清是哪一种，两种排查方向完全不同
  * @returns {Promise<boolean>} 这句文字发出去了没有
  */
 async function sendTransferText(runner, space, ctx, amount, note, scope, why) {
-  const text = `转账 ${formatAmount(amount)}${note ? ` ${note}` : ""}`;
+  const money = formatAmount(amount, ctx?.role?.transfer?.currency);
+  const text = `转账 ${money}${note ? ` ${note}` : ""}`;
   logWarn(scope, `${why}，改成发一句文字：${text}`);
   try {
     noteSent(runner, ctx, await space.send(text));
@@ -4703,6 +4706,7 @@ async function sendTransferPart(runner, space, part, ctx) {
     amount,
     note,
     appName: role.transfer.appName,
+    currency: role.transfer.currency,
     scope,
   });
   /*
@@ -4726,8 +4730,8 @@ async function sendTransferPart(runner, space, part, ctx) {
    * 存句柄。存不下来只 warn —— 卡片已经发出去了，这一步失败只意味着
    * 「以后改不了状态」，不该反过来说这笔转账失败了。
    *
-   * appName 也存进去：用户中途改了配置，老卡片还得能用原来那个名字去改
-   * （见 card.js:updateTransferCard 的注释）。
+   * appName 和 currency 也存进去：用户中途改了配置，老卡片还得能用原来那个
+   * 名字去改、还得显示原来那个符号（见 card.js:updateTransferCard 的注释）。
    */
   const ok = putTransfer(memoryKeyFor(role), {
     ...session,
@@ -4736,10 +4740,14 @@ async function sendTransferPart(runner, space, part, ctx) {
     state: "pending",
     peerKey: peerKeyOf(ctx?.peer ?? ""),
     appName: role.transfer.appName,
+    currency: role.transfer.currency,
   });
   if (!ok) logWarn(scope, "这笔转账的句柄没存下来，之后改不了「已收款」");
 
-  logInfo(scope, `发了一张转账卡片：${formatAmount(amount)}${note ? `（${note}）` : ""}`);
+  logInfo(
+    scope,
+    `发了一张转账卡片：${formatAmount(amount, role.transfer.currency)}${note ? `（${note}）` : ""}`
+  );
   return true;
 }
 
@@ -4787,7 +4795,7 @@ async function claimTransferOnReact(runner, role, message, scope) {
 
   if (hit.state === "received") {
     // 已经收过了。再贴一个 emoji 不该让卡片闪一下、也不该再告诉模型一遍
-    logDebug(scope, `这笔转账早就收过了（${formatAmount(hit.amount)}），不重复处理`);
+    logDebug(scope, `这笔转账早就收过了（${formatAmount(hit.amount, hit.currency)}），不重复处理`);
     return null;
   }
 
@@ -4799,14 +4807,19 @@ async function claimTransferOnReact(runner, role, message, scope) {
     note: hit.note,
     // 用**存下来那个** appName，不读当前配置：改卡片的身份必须和发的时候一致
     appName: hit.appName,
+    // 货币符号同理：用户中途换了符号，老卡片收款时不该当场换一个金额
+    currency: hit.currency,
     state: "received",
     scope,
   });
   if (!ok) return null;
 
   putTransfer(roleKey, { ...hit, state: "received" });
-  logInfo(scope, `对方收了这笔转账：${formatAmount(hit.amount)}${hit.note ? `（${hit.note}）` : ""}`);
-  return { amount: hit.amount, note: hit.note };
+  logInfo(
+    scope,
+    `对方收了这笔转账：${formatAmount(hit.amount, hit.currency)}${hit.note ? `（${hit.note}）` : ""}`
+  );
+  return { amount: hit.amount, note: hit.note, currency: hit.currency };
 }
 
 /**
@@ -5548,7 +5561,8 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                 scopeOf(runner, "转账")
               );
               if (claimed) {
-                const money = formatAmount(claimed.amount);
+                // 用**那笔存下来的**符号，不读当前配置：告诉模型的金额和卡片上一致
+                const money = formatAmount(claimed.amount, claimed.currency);
                 const memo = claimed.note ? `（${claimed.note}）` : "";
                 noteReaction(
                   runner,

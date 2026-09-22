@@ -313,13 +313,13 @@ export function hasMedia(text) {
  * 几段之间不加分隔符 —— 正常情况下模型会用气泡分隔符隔开，走到这儿的都是
  * 同一条气泡里的相邻内容。
  */
-export function stripMediaTags(text) {
+export function stripMediaTags(text, currency) {
   return splitMedia(text)
     .filter(
       (p) =>
         p.kind !== "image" && p.kind !== "sticker" && p.kind !== "undo" && p.kind !== "react"
     )
-    .map((p) => (p.kind === "transfer" ? transferAsText(p) : p.text))
+    .map((p) => (p.kind === "transfer" ? transferAsText(p, currency) : p.text))
     .join("")
     .trim();
 }
@@ -328,10 +328,10 @@ export function stripMediaTags(text) {
  * 一个转账段退化成能当普通文字发的一句话。
  *
  * 金额走 `formatAmount` 规整（和卡片上显示的那串一模一样），不是原样吐回 ——
- * 退化版和卡片版说的该是同一笔钱。
+ * 退化版和卡片版说的该是同一笔钱。货币符号同理跟着角色走，没给就是 ￥。
  */
-function transferAsText(part) {
-  const money = formatAmount(part?.text);
+function transferAsText(part, currency) {
+  const money = formatAmount(part?.text, currency);
   const note = String(part?.note ?? "").trim();
   return `转账 ${money}${note ? ` ${note}` : ""}`;
 }
@@ -346,11 +346,12 @@ function transferAsText(part) {
  * 语音变成它要念的那句话、卡片退成网址、位置退成地名，图片/表情包/撤回/
  * 回应直接丢掉 —— 再加上摘掉引用和特效这两个「气泡属性」标记。
  *
+ * @param {string} [currency] 角色那个货币符号，只给转账那段用
  * @returns {string} 可能是空串（整条都是要丢的标记）—— 调用方跳过这条不发
  */
-export function degradeToPlain(text) {
+export function degradeToPlain(text, currency) {
   const noReply = takeReplyTag(String(text ?? "")).text;
-  return stripMediaTags(takeEffectTag(noReply).text);
+  return stripMediaTags(takeEffectTag(noReply).text, currency);
 }
 
 /* ================= 引用回复 ================= */

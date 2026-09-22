@@ -350,8 +350,11 @@ export async function cardHintFor(message, { projectId, projectSecret, label } =
  * 就会自称是微信发的（见文件头「出去的那一半」）。这条线还在。
  *
  * 用户能自己填的只有 `appName`（卡片上那行小字，见 role.transfer.appName）——
- * 那是纯展示字符串，写「转账」还是写某家银行的名字由用户决定，代码不替他选。
- * 对方装了 Spectrum 的话，那行字可能被换成 Spectrum 自己的名字和图标。
+ * 那是纯展示字符串，写「转账」还是写某家银行的名字由用户决定，代码不替他选，
+ * **留空就整个字段不传**（proto 里它是 `string app_name = 4`，空串在 wire 上
+ * 等于不传）。那行到底是不画了、还是被 Messages 换成 Spectrum 自己的名字，
+ * 取决于对方那台 iPhone，我们说不准 —— 原来这儿是空了就兜底成「转账」，
+ * 于是「不要那行字」压根没法表达。
  */
 const TRANSFER_TEAM_ID = "P8XT6232SL";
 const TRANSFER_BUNDLE_ID = "codes.photon.Spectrum.MessagesExtension";
@@ -387,25 +390,54 @@ const TRANSFER_STATE_LABEL = {
 };
 
 /**
+ * 卡片上不填货币符号时用这个。
+ *
+ * 这个功能一开始只有人民币、而且是写死在 formatAmount 里的一个字面量 ——
+ * 现在符号由用户自己填（`role.transfer.currency`），这儿只是那个字段留空时
+ * 的兜底，不再是「这个功能就是人民币的」。
+ */
+export const DEFAULT_CURRENCY = "￥";
+
+/**
  * 金额那串**原文**规整成卡片上显示的样子。
  *
  * 模型写的可能是 `4000`、`4000.5`、`￥4000`、`4,000`。统一成两位小数加一个
- * 人民币符号 —— 一笔转账写着「￥4000」和「￥4000.00」，后者才像凭证。
+ * 货币符号 —— 一笔转账写着「￥4000」和「￥4000.00」，后者才像凭证。
  *
- * 认不出数字时**原样带回**（只补个 ￥）：宁可显示一串怪东西，也不要把一笔
+ * 认不出数字时**原样带回**（只补个符号）：宁可显示一串怪东西，也不要把一笔
  * 转账显示成 ￥0.00 —— 后者看起来完全正常，错得没人发现。
  *
- * @returns {string} 比如「￥4,000.00」
+ * 千分位和小数位固定按 `zh-CN` 排（`4,000.00`）—— 那套排法在 ￥$€£ 上都一样，
+ * 按符号去猜该用哪个 locale 不值得：猜错的代价是金额显示成另一个数
+ * （`4.000,50` 和 `4,000.50` 差一千倍），而猜对也只是让欧洲用户看着顺眼一点。
+ *
+ * @param {string} raw 金额原文
+ * @param {string} [currency] 货币符号，留空用 DEFAULT_CURRENCY
+ * @returns {string} 比如「￥4,000.00」或「$4,000.00」
  */
-export function formatAmount(raw) {
+export function formatAmount(raw, currency) {
   const text = String(raw ?? "").trim();
-  // 去掉货币符号和千分位逗号再认数字
-  const cleaned = text.replace(/[￥¥$,，\s]/g, "");
-  const n = Number(cleaned);
-  if (!Number.isFinite(n) || cleaned === "") {
-    return text.startsWith("￥") ? text : `￥${text}`;
+  const sym = String(currency ?? "").trim() || DEFAULT_CURRENCY;
+  /*
+   * 剔掉货币符号和千分位再认数字。原来列的是一张写死的清单（`[￥¥$,，\s]`），
+   * 符号变成用户自己填之后那张清单就列不全了 —— 用户填 `€`、模型跟着写
+   * `€4000`，清单里没有 € 就认不出数字，一笔 4000 会显示成「€€4000」。
+   * 所以改成按 Unicode 货币符号类（`\p{Sc}`，￥¥$€£₩₽ 都在里面）剔，再补一刀
+   * 剔用户填的那个 —— 有人填「元」「円」这种汉字，那不属于 Sc。
+   *
+   * 剔完之后**必须整串都是数字**才算认出来（这里是正则、不是 Number()）：
+   * `Number("-1")` 对「abc-1」这种残渣照样给 -1，于是一句「abc-1」会显示成
+   * 「￥-1.00」—— 那正是下面这段注释要挡的「看起来完全正常但错得没人发现」。
+   */
+  const cleaned = text
+    .replace(/\p{Sc}/gu, "")
+    .replaceAll(sym, "")
+    .replace(/[,，\s]/g, "");
+  if (!/^-?\d+(?:\.\d+)?$/.test(cleaned)) {
+    return text.startsWith(sym) ? text : `${sym}${text}`;
   }
-  return `￥${n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const n = Number(cleaned);
+  return `${sym}${n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 /**
@@ -426,8 +458,8 @@ export function formatAmount(raw) {
  * 备注可以是空的 —— 服务端只要求「caption/subcaption/trailingCaption/
  * trailingSubcaption/image 至少有一个非空」，金额和状态都在，够了。
  */
-function transferLayout({ amount, note, state }) {
-  const money = formatAmount(amount);
+function transferLayout({ amount, note, state, currency }) {
+  const money = formatAmount(amount, currency);
   const label = TRANSFER_STATE_LABEL[state] ?? TRANSFER_STATE_LABEL.pending;
   const memo = String(note ?? "").trim();
   return {
@@ -457,7 +489,8 @@ function transferLayout({ amount, note, state }) {
  * @param {string} opts.chatGuid 会话的 chat GUID（就是 imessage.js 里的 spaceId）
  * @param {string} opts.amount 金额原文
  * @param {string} opts.note 备注，可以是空串
- * @param {string} opts.appName 卡片上那行小字，用户自己填的
+ * @param {string} opts.appName 卡片上那行小字，用户自己填的；空串 = 那行不要
+ * @param {string} [opts.currency] 货币符号，空的话用 DEFAULT_CURRENCY
  * @param {string} [opts.scope] 日志前缀
  * @returns {Promise<null | {messageGuid: string, chatGuid: string,
  *   sessionId: string, targetMessageGuid: string}>}
@@ -471,6 +504,7 @@ export async function sendTransferCard({
   amount,
   note,
   appName,
+  currency,
   scope = "转账",
 }) {
   if (!projectId || !projectSecret || !chatGuid) return null;
@@ -479,12 +513,12 @@ export async function sendTransferCard({
   try {
     opened = await createLineClients(projectId, projectSecret, { timeout: SEND_TIMEOUT_MS });
     const message = {
-      appName: String(appName ?? "").trim() || "转账",
+      appName: String(appName ?? "").trim(),
       appStoreId: TRANSFER_APP_STORE_ID,
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,
       url: TRANSFER_URL,
-      layout: transferLayout({ amount, note, state: "pending" }),
+      layout: transferLayout({ amount, note, state: "pending", currency }),
     };
 
     let lastError = null;
@@ -526,9 +560,13 @@ export async function sendTransferCard({
  * 走 `updateCustomizedMiniApp` —— 对方看到的是**同一条气泡内容变了**，
  * 不是新来一条消息。这是整个功能里最像真转账的一步。
  *
- * 身份三件套必须和发的时候**一模一样**（teamId / bundleId / appName / url）：
+ * 身份必须和发的时候**一模一样**（teamId / bundleId / appStoreId / appName / url）：
  * 换了的话等于「另一个 app 来改这张卡片」。所以 appName 也从存下来的那笔里
  * 取，不从当前配置读 —— 用户中途把 appName 改了，老卡片还得能收款。
+ *
+ * `currency` 同理从存下来的那笔取：它不算身份（只影响 layout 里那串字），但
+ * 用户中途把符号从 ￥ 换成 $ 的话，一张老卡片收款时不该当场从「￥4,000.00」
+ * 跳成「$4,000.00」—— 那是同一张凭证上的金额变了。
  *
  * @param {object} opts
  * @param {string} opts.projectId
@@ -536,7 +574,8 @@ export async function sendTransferCard({
  * @param {object} opts.session 存下来的那四个 guid（transferstore.js 的条目）
  * @param {string} opts.amount
  * @param {string} opts.note
- * @param {string} opts.appName
+ * @param {string} opts.appName 空串 = 那行小字不要（和发的时候一致）
+ * @param {string} [opts.currency] 发的时候用的那个符号
  * @param {"pending"|"received"} opts.state 要改成哪个状态
  * @param {string} [opts.scope]
  * @returns {Promise<boolean>} 改成功了没有
@@ -548,6 +587,7 @@ export async function updateTransferCard({
   amount,
   note,
   appName,
+  currency,
   state,
   scope = "转账",
 }) {
@@ -563,12 +603,12 @@ export async function updateTransferCard({
       targetMessageGuid: String(session.targetMessageGuid ?? ""),
     };
     const message = {
-      appName: String(appName ?? "").trim() || "转账",
+      appName: String(appName ?? "").trim(),
       appStoreId: TRANSFER_APP_STORE_ID,
       extensionBundleId: TRANSFER_BUNDLE_ID,
       teamId: TRANSFER_TEAM_ID,
       url: TRANSFER_URL,
-      layout: transferLayout({ amount, note, state }),
+      layout: transferLayout({ amount, note, state, currency }),
     };
 
     for (const { client, instanceId } of opened) {

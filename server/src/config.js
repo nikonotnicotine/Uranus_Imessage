@@ -1502,7 +1502,7 @@ function normalizeLocationSend(input) {
 }
 
 /**
- * 转账卡片：开关 + 卡片上那行小字。
+ * 转账卡片：开关 + 货币符号 + 卡片上那行小字。
  *
  * 模型写 `[transfer:4000:零花钱]`，服务端发一张真的 iMessage app 扩展卡片
  * 过去（`sendCustomizedMiniApp`）—— 左边是金额、下面是备注、右上角写着
@@ -1511,10 +1511,14 @@ function normalizeLocationSend(input) {
  *
  * **只有云端模式能发**：本地 Mac 模式没有 Photon 的那两条 RPC。
  *
- * ── appName 为什么让用户自己填 ──
+ * ── appName 和 currency 为什么让用户自己填 ──
  *
- * 它是卡片上那行小字，纯展示、服务端不校验。填「转账」还是填某家银行的名字，
- * 是用户自己的决定，代码不替他选、也不预置任何真实机构的名字。默认「转账」。
+ * 两个都是纯展示、服务端不校验的字符串。填「转账」还是填某家银行的名字、
+ * 用 ￥ 还是 $，是用户自己的决定，代码不替他选、也不预置任何真实机构的名字。
+ * `appName` 空着 = 那行小字不要；`currency` 空着 = ￥。
+ *
+ * 这两个字段**都要跟着每一笔一起存**（transferstore.js），改卡片时从那笔里取、
+ * 不读当前配置：用户中途改了设置，一张老卡片收款时不该当场换个名字、换个符号。
  *
  * 身份那几个字段（teamId / extensionBundleId / appStoreId）**不给用户配**，
  * 写死成 Spectrum 那个官方扩展的值（见 card.js 的 TRANSFER_TEAM_ID）——
@@ -1527,8 +1531,17 @@ function normalizeLocationSend(input) {
 function normalizeTransfer(input) {
   return {
     enabled: Boolean(input?.enabled),
-    // 卡片上那行小字。空着就在发的时候兜底成「转账」（见 card.js）
+    // 卡片上那行小字。**空着就是那行不要**（原来是空了兜底成「转账」，于是
+    // 「不显示那行」压根没法表达，见 card.js:sendTransferCard）
     appName: str(input?.appName).slice(0, 40),
+    /*
+     * 金额前面那个货币符号。空着 = ￥（card.js:DEFAULT_CURRENCY）。
+     *
+     * 截 4 字：正常是一个字符（￥ $ € £），留点余量给「HK$」「NT$」这种。
+     * 放宽到几十字没意义 —— 那行是卡片上最显眼的一串，符号长了金额就被挤掉。
+     * 不做白名单：谁的角色用什么钱是他自己的设定，写「金币」「点券」也行。
+     */
+    currency: str(input?.currency).slice(0, 4),
     // 对方贴 emoji 时要不要把卡片改成「已收款」。默认开 —— 这是这个功能
     // 最像真转账的一步，而且它只是改一张自己发出去的卡片，不外溢
     confirmOnReact: input?.confirmOnReact === undefined ? true : Boolean(input.confirmOnReact),

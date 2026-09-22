@@ -113,6 +113,8 @@ export function readTransfers(roleKey) {
  * @param {string} entry.note 备注
  * @param {"pending"|"received"} entry.state
  * @param {string} entry.peerKey 哪条会话上的，收款时反查用
+ * @param {string} [entry.appName] 发的时候那行小字（空串 = 那行不要）
+ * @param {string} [entry.currency] 发的时候那个货币符号
  * @returns {boolean} 写进去了没有
  */
 export function putTransfer(roleKey, entry) {
@@ -122,6 +124,16 @@ export function putTransfer(roleKey, entry) {
 
   const { items } = readTransfers(roleKey);
   const next = items.filter((it) => String(it?.messageGuid ?? "") !== guid);
+  /*
+   * 这儿是**白名单**（不是 `...entry`）：落盘的字段一个个列出来，免得调用方
+   * 手上那个大对象里的东西顺手漏进磁盘。
+   *
+   * appName / currency 是后补的 —— 原来这张白名单里没有 appName，而
+   * imessage.js 一直在传、claimTransferOnReact 一直在读 `hit.appName`，
+   * 于是它读回来永远是 undefined、改卡片时悄悄用了兜底值。两边正好都兜底成
+   * 「转账」所以一直没露馅；`appName` 一旦真填了点什么，发和改就用的是两个
+   * 名字了 —— 那等于「另一个 app 来改这张卡片」。
+   */
   next.push({
     messageGuid: guid,
     chatGuid: String(entry.chatGuid ?? ""),
@@ -131,6 +143,8 @@ export function putTransfer(roleKey, entry) {
     note: String(entry.note ?? ""),
     state: entry.state === "received" ? "received" : "pending",
     peerKey: String(entry.peerKey ?? ""),
+    appName: String(entry.appName ?? ""),
+    currency: String(entry.currency ?? ""),
     at: Number(entry.at) || Date.now(),
   });
 

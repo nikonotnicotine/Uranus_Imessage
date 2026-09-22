@@ -2184,14 +2184,27 @@ function RoleTransferFields({ role }) {
       </label>
 
       <Field
+        label="货币符号"
+        hint="金额前面那个符号，留空就是 ￥。一般填一个字符（￥ $ € £），「HK$」这种也行。写「金币」「点券」也随你"
+      >
+        <input
+          className={inputCls}
+          value={tr.currency ?? ""}
+          maxLength={4}
+          placeholder="￥"
+          onChange={(e) => updateRole(role.id, { transfer: { ...tr, currency: e.target.value } })}
+        />
+      </Field>
+
+      <Field
         label="卡片上那行小字"
-        hint="卡片底部显示的名字，随便填 —— 写「转账」也行，写某家银行的名字也行。留空就是「转账」"
+        hint="卡片底部显示的名字，随便填 —— 写「转账」也行，写某家银行的名字也行。留空就不显示那行（装了 Spectrum 的人那儿可能显示成它的名字，那是系统画的，我们管不着）"
       >
         <input
           className={inputCls}
           value={tr.appName ?? ""}
           maxLength={40}
-          placeholder="转账"
+          placeholder="留空就不显示"
           onChange={(e) => updateRole(role.id, { transfer: { ...tr, appName: e.target.value } })}
         />
       </Field>
