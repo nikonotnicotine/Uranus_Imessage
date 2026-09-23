@@ -341,12 +341,17 @@ function createRunner(projectRefId) {
     // 聊天背景变更：chatbg.js 那条独立 gRPC 订阅。只有角色开了
     // chatBackground.enabled 且是云端模式才起（见 startRunner）
     bgWatcher: null, // { stop() } | null
+    // 这两条附加订阅都是「先返回、连接在后台慢慢建」的，所以起的过程中要立个牌子：
+    // syncWatchers 会被反复调用（每次保存配置都调一次），光看 bgWatcher 是不是
+    // null 的话，第一次还在 await 里就会被起第二遍，留下一条收不到停止指令的野订阅
+    bgWatcherStarting: false,
     // peerKey -> 待认领的背景变更。用户换完背景不一定会马上说话，所以先存着，
     // 等这个人下一条消息进来时再塞进同一个合并槽里 —— 见 takeBgHint
     bgPending: new Map(),
     // 投票：poll.js 那条独立 gRPC 订阅。和 bgWatcher 同一个待遇 —— 只有角色开了
     // poll.enabled 且是云端模式才起（见 startPollWatcher）
     pollWatcher: null, // { stop() } | null
+    pollWatcherStarting: false,
     // spaceId -> { title, at }。发起投票时那行标题会作为一条**独立的普通文本
     // 消息**再进来一次，靠这张表把它压掉，免得模型看两遍。见 notePollTitle
     pollTitles: new Map(),
@@ -5382,9 +5387,11 @@ async function sendPollPart(runner, space, part, ctx) {
    * 「在**你发起的**投票里」。
    *
    * optionIdentifier 这会儿拿不到（space.send 只还回来一个 Message），先留空串。
-   * 对方一投票，poll.js 那条流会带着完整选项表回来，handlePollEvent 顺手覆盖掉。
-   * 也就是说角色投不了自己刚发起的那个投票（id 是空的，matchOption 返回的选项
-   * 会被 castVote 的入参判空挡掉）—— 自己发的投票自己投本来也不像话。
+   * 真 id 要等对方在这个投票上动一下：poll.js 收到事件会回源问一次 `polls.get`
+   * 拿完整选项表，handlePollEvent 顺手覆盖掉这一笔。
+   *
+   * 所以在那之前角色投不了自己刚发起的那个投票（id 是空的，matchOption 返回的
+   * 选项会被 castVote 的入参判空挡掉）—— 自己发的投票自己投本来也不像话。
    */
   const stored = putPoll(memoryKeyFor(role), {
     pollMessageGuid: String(message?.id ?? ""),
@@ -5831,14 +5838,20 @@ function failedKinds(tried, acted) {
  *
  * 起不起来都不影响主连接 —— 失败了只记一行日志，背景提示没有而已。
  */
-function startBgWatcher(getConfig, runner, project, scope) {
+function startBgWatcher(getConfig, runner, project) {
   if (runner.mode !== "cloud") {
-    if (roleWantsChatBg(getConfig, runner)) {
+    if (roleWantsChatBg(getConfig, runner) && !runner.bgLocalWarned) {
+      // 只说一次：这个函数现在每次保存配置都会走一遍（见 syncWatchers），
+      // 每次都喊一句的话本地模式的用户改一次设置就多一行重复警告
+      runner.bgLocalWarned = true;
       logWarn(scopeOf(runner, "背景"), "本地 Mac 模式拿不到聊天背景变更，这个开关先不起作用");
     }
     return;
   }
   if (!roleWantsChatBg(getConfig, runner)) return;
+  // 已经有了、或者正在建 —— 别起第二条
+  if (runner.bgWatcher || runner.bgWatcherStarting) return;
+  runner.bgWatcherStarting = true;
 
   watchChatBackground({
     projectId: project.projectId,
@@ -5856,17 +5869,44 @@ function startBgWatcher(getConfig, runner, project, scope) {
     },
   })
     .then((watcher) => {
-      // 订阅起得来的话 watchChatBackground 是立刻返回的，真正断线由它自己退避重连；
-      // 但万一在 await 期间这条连接被停掉了，别把野订阅留下
-      if (runner.stopped) {
+      runner.bgWatcherStarting = false;
+      /*
+       * 订阅起得来的话 watchChatBackground 是立刻返回的，真正断线由它自己退避重连；
+       * 但 await 期间这条连接可能被停掉、或者用户又把开关关回去了（现在开关是
+       * 热生效的，见 syncWatchers），这两种都得把刚建好的这条收掉，别留野订阅。
+       */
+      if (runner.stopped || !roleWantsChatBg(getConfig, runner)) {
         watcher.stop();
         return;
       }
       runner.bgWatcher = watcher;
     })
     .catch((e) => {
+      runner.bgWatcherStarting = false;
       logWarn(scopeOf(runner, "背景"), `聊天背景订阅没起来，这个功能本次连接不可用：${e?.message ?? e}`);
     });
+}
+
+/**
+ * 停掉「聊天背景变更」的订阅（开关被关掉、或者这条连接要下线了）。
+ *
+ * 正在建的那条没法在这里停（把手还没拿到），所以只翻牌子 —— 建完的那一刻
+ * `.then` 会重新问一次开关，发现关了就自己收掉。
+ */
+function stopBgWatcher(runner) {
+  if (runner.bgWatcher) {
+    try {
+      runner.bgWatcher.stop();
+    } catch {
+      /* ignore */
+    }
+    runner.bgWatcher = null;
+  }
+  /*
+   * 待认领的背景变更一起清掉：开关关了就不该再往模型嘴里塞这句提示。
+   * （连接下线走的也是这里，那种情况下清掉的理由见 stopRunner 那边的注释）
+   */
+  runner.bgPending.clear();
 }
 
 /** 当前角色要不要收聊天背景变更提示（角色是绑在项目上的，见 currentRole）。 */
@@ -5905,14 +5945,18 @@ function rolePollEnabled(getConfig, runner) {
  * 代价同样是多一条常驻连接，所以默认关、且只认云端模式。
  * 起不起来都不影响主连接。
  */
-function startPollWatcher(getConfig, runner, project, scope) {
+function startPollWatcher(getConfig, runner, project) {
   if (runner.mode !== "cloud") {
-    if (rolePollEnabled(getConfig, runner)) {
+    // 同 startBgWatcher：这句只说一次，别让每次保存配置都刷一行
+    if (rolePollEnabled(getConfig, runner) && !runner.pollLocalWarned) {
+      runner.pollLocalWarned = true;
       logWarn(scopeOf(runner, "投票"), "本地 Mac 模式拿不到投票事件，这个开关先不起作用");
     }
     return;
   }
   if (!rolePollEnabled(getConfig, runner)) return;
+  if (runner.pollWatcher || runner.pollWatcherStarting) return;
+  runner.pollWatcherStarting = true;
 
   watchPolls({
     projectId: project.projectId,
@@ -5930,16 +5974,63 @@ function startPollWatcher(getConfig, runner, project, scope) {
     },
   })
     .then((watcher) => {
-      // 同 startBgWatcher：await 期间这条连接被停掉了的话，别留野订阅
-      if (runner.stopped) {
+      runner.pollWatcherStarting = false;
+      // 同 startBgWatcher：await 期间这条连接被停掉、或者开关又被关回去了的话，
+      // 别留野订阅
+      if (runner.stopped || !rolePollEnabled(getConfig, runner)) {
         watcher.stop();
         return;
       }
       runner.pollWatcher = watcher;
     })
     .catch((e) => {
+      runner.pollWatcherStarting = false;
       logWarn(scopeOf(runner, "投票"), `投票订阅没起来，这个功能本次连接不可用：${e?.message ?? e}`);
     });
+}
+
+/**
+ * 停掉「投票」的订阅（开关被关掉、或者这条连接要下线了）。
+ *
+ * 正在建的那条同 stopBgWatcher —— 建完那一刻会自己重问开关。
+ */
+function stopPollWatcher(runner) {
+  if (runner.pollWatcher) {
+    try {
+      runner.pollWatcher.stop();
+    } catch {
+      /* ignore */
+    }
+    runner.pollWatcher = null;
+  }
+  // 待压的投票标题只在订阅活着的时候有意义（理由见 stopRunner 那边）
+  runner.pollTitles?.clear();
+}
+
+/**
+ * 让这条连接的两条附加订阅（背景 / 投票）对齐当前配置。
+ *
+ * **为什么要单独来这么一趟**：这两条订阅原来只在 startRunner 里起一次，而
+ * `poll.enabled` / `chatBackground.enabled` 都不在 fingerprintOf 里（它只管
+ * 「连不连得上」）—— 于是在界面上刚打开投票开关、保存配置时，syncBridges 判定
+ * 「保持」，订阅压根没起。发起投票那一侧是每轮现读配置的，照样发得出去，所以
+ * 表现成「角色能发投票，但用户投了它看不见、也收不到自己那份选项记录」。
+ * 关开关同理：关掉之后那条 gRPC 还挂在那儿收事件，要等到重启桥接才停。
+ *
+ * 只动该动的：开了没订阅就起，关了有订阅就停，其余原样留着 —— 这里绝不能
+ * 无脑先停再起，那样每次保存配置都会把两条常驻连接重建一遍。
+ */
+function syncWatchers(getConfig, runner) {
+  if (runner.stopped || runner.status !== "connected") return;
+
+  const project = (getConfig().projects ?? []).find((p) => p.id === runner.projectRefId);
+  if (!project) return;
+
+  if (roleWantsChatBg(getConfig, runner)) startBgWatcher(getConfig, runner, project);
+  else stopBgWatcher(runner);
+
+  if (rolePollEnabled(getConfig, runner)) startPollWatcher(getConfig, runner, project);
+  else stopPollWatcher(runner);
 }
 
 /**
@@ -6064,6 +6155,28 @@ async function handlePollEvent(getConfig, runner, ev) {
     putPoll(roleKey, { pollMessageGuid, chatGuid, peerKey, title, options });
     // 标题那条文本的压重登记要在「说话」之前做完 —— 它可能已经在队列里躺着了
     notePollTitle(runner, chatGuid, title);
+  } else if (options.length) {
+    /*
+     * voted / unvoted 也要存：poll.js 在这两种事件上回源补了一张完整的
+     * 「id → 文字」表，而**角色自己发起的**那些投票落盘时 optionIdentifier
+     * 全是空串（见 sendPollPart）—— 这是唯一能把真 id 填上的时机，不存的话
+     * 角色永远投不了自己发起的那个投票，也说不出对方投了哪个。
+     *
+     * `options.length` 那道判空是必须的：回源失败时 options 是空数组，而
+     * putPoll 的 `entry.options ?? prev.options` 拦不住空数组（它不是
+     * nullish），会把好好的那份洗成空的。
+     *
+     * mine / peerKey 那些字段由 putPoll 从上一笔继承，这里不用重复传。
+     * title 同理**只在拿到了的时候传** —— 空串不是 nullish，传进去会把存好的
+     * 标题洗成空的，那句「注释是：…」就没了。
+     */
+    putPoll(roleKey, {
+      pollMessageGuid,
+      chatGuid,
+      peerKey,
+      options,
+      ...(title ? { title } : {}),
+    });
   }
   /*
    * 拼提示要用的那份。刚存过就是权威的那份（带 mine），没存过（voted/unvoted
@@ -6208,8 +6321,8 @@ async function startRunner(getConfig, project, meta, retries = 0) {
         : "已连接，等消息中"
     );
 
-    startBgWatcher(getConfig, runner, project, scope);
-    startPollWatcher(getConfig, runner, project, scope);
+    startBgWatcher(getConfig, runner, project);
+    startPollWatcher(getConfig, runner, project);
 
     /*
      * 探一下这条线路的号码有没有真的注册成 iMessage。
@@ -7303,29 +7416,18 @@ async function stopRunner(runner) {
   }
   runner.nextRetryAt = null;
 
-  // 背景订阅是另一条 gRPC 连接，不跟着 instance.stop() 走 —— 不显式停掉的话
-  // 这条线路下线了，它还揣着 projectSecret 在那儿替它收事件
-  if (runner.bgWatcher) {
-    try {
-      runner.bgWatcher.stop();
-    } catch {
-      /* ignore */
-    }
-    runner.bgWatcher = null;
-  }
-  // 投票订阅同理，也是一条独立的 gRPC 连接（见 startPollWatcher）
-  if (runner.pollWatcher) {
-    try {
-      runner.pollWatcher.stop();
-    } catch {
-      /* ignore */
-    }
-    runner.pollWatcher = null;
-  }
-  // 待压的投票标题：只活在这一次连接里。留着的话重连后第一条恰好同名的
-  // 真消息会被莫名吞掉（磁盘上那份投票记录不受影响，照旧能投）
-  runner.pollTitles?.clear();
-  runner.bgPending.clear();
+  /*
+   * 背景订阅是另一条 gRPC 连接，不跟着 instance.stop() 走 —— 不显式停掉的话
+   * 这条线路下线了，它还揣着 projectSecret 在那儿替它收事件。投票那条同理。
+   *
+   * 这两个函数顺手把各自的待认领数据也清了（bgPending / pollTitles）：待压的
+   * 投票标题只活在这一次连接里，留着的话重连后第一条恰好同名的真消息会被莫名
+   * 吞掉（磁盘上那份投票记录不受影响，照旧能投）。
+   *
+   * `stopped` 已经在上面置过了，所以正在建的那两条订阅建完也会自己收掉。
+   */
+  stopBgWatcher(runner);
+  stopPollWatcher(runner);
   // 待认领的 tapback 同理：这条线路都停了，重连后再补报一句「刚才给你贴了个👍」
   // 只会莫名其妙
   runner.reactPending.clear();
@@ -7419,6 +7521,13 @@ export async function syncBridges(getConfig) {
 
     // 连接不用动，但显示信息（角色名、线路号）可能变了
     Object.assign(runner, meta);
+    /*
+     * 连接不用动 ≠ 什么都不用动：背景 / 投票那两条**附加订阅**是照开关起的，
+     * 而开关不在 fingerprintOf 里（它只管连不连得上）。不在这儿对齐一次的话，
+     * 刚在界面上打开投票开关、保存配置，走的就是这条「保持」分支 —— 订阅压根
+     * 没起，于是角色发得出投票、却收不到用户投的那一票（见 syncWatchers）。
+     */
+    syncWatchers(getConfig, runner);
     result.kept.push(id);
   }
 

@@ -281,6 +281,24 @@ export async function watchPolls({ projectId, projectSecret, label, onEvent }) {
               logDebug(scope, `忽略一条投票变化（一个选项都没读到）：${pollMessageGuid}`);
               continue;
             }
+          } else {
+            /*
+             * voted / unvoted 的 delta 里**只有** optionIdentifier，没有选项表 ——
+             * 所以这里也回源一次，把那张「id → 文字」的表带上。
+             *
+             * 这不是可选的优化：角色自己发起的投票，落盘那份 optionIdentifier
+             * 全是空串（`space.send` 只还回来一个 Message，见 imessage.js 的
+             * sendPollPart），唯一能补上 id 的时机就是这儿。不补的话对方在角色
+             * 发起的投票里投了什么，角色永远只知道「投了一票」。
+             *
+             * 代价是每个投票事件多一发 RPC（6 秒超时兜着）。拿不到就算了 ——
+             * 「他投了一票」这件事本身照样报，所以不 continue。
+             */
+            const fresh = await fetchPoll(client, pollMessageGuid, scope);
+            if (fresh) {
+              title = title || fresh.title;
+              if (fresh.options.length) options = fresh.options;
+            }
           }
 
           logDebug(

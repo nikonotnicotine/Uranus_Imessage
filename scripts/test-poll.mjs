@@ -490,16 +490,45 @@ await okAsync("optionAdded：带回全量选项（不是只有新加那个）", 
   await H.w.stop();
 });
 
-await okAsync("voted / unvoted：只带 optionIdentifier，不回源", async () => {
+/*
+ * voted / unvoted 的 delta 里**只有** optionIdentifier，没有选项表 —— 所以这
+ * 两种也要回源。
+ *
+ * 这不是省不省一次 RPC 的问题：角色**自己发起**的投票，落盘那份
+ * optionIdentifier 全是空串（`space.send` 只还回来一个 Message，见
+ * imessage.js:sendPollPart），唯一能把真 id 补上的时机就是这儿。不补的话对方
+ * 在角色发起的投票里投了什么，角色永远只知道「投了一票」。
+ */
+await okAsync("voted / unvoted：回源补上选项表（自己发起的投票靠这个对上 id）", async () => {
   const H = await watcherHarness();
+  photon.getResult = { title: "今晚吃什么", options: OPTS };
   H.stream.push(pollEv({ type: "voted", optionIdentifier: "o-2" }));
   H.stream.push(pollEv({ type: "unvoted", optionIdentifier: "o-2" }));
   await waitFor("两条都到", () => H.events.length === 2);
   assert.equal(H.events[0].kind, "voted");
   assert.equal(H.events[0].optionIdentifier, "o-2");
   assert.equal(H.events[1].kind, "unvoted");
-  // 这两种压根不回源（选项文字从落盘那份查）
-  assert.equal(photon.getCalls.length, 0);
+  // 两条各回源一次，选项表和标题都带上了
+  assert.equal(photon.getCalls.length, 2);
+  assert.deepEqual(H.events[0].options, OPTS);
+  assert.equal(H.events[0].title, "今晚吃什么");
+  photon.getResult = null;
+  await H.w.stop();
+});
+
+/*
+ * 回源失败**不能**把事件吞掉：「他投了一票」这件事本身就是信息，认不出是哪个
+ * 选项也照样要报（pollHintFor 那边有专门的退路措辞）。
+ */
+await okAsync("voted：回源失败也照样报（只是说不出投的哪个）", async () => {
+  const H = await watcherHarness();
+  photon.getThrows = true;
+  H.stream.push(pollEv({ type: "voted", optionIdentifier: "o-2" }));
+  await waitFor("收到 voted", () => H.events.length > 0);
+  assert.equal(H.events[0].kind, "voted");
+  assert.equal(H.events[0].optionIdentifier, "o-2");
+  assert.deepEqual(H.events[0].options, []);
+  photon.getThrows = false;
   await H.w.stop();
 });
 
@@ -1114,6 +1143,23 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
   });
 
   /*
+   * voted / unvoted 也要落盘：poll.js 在那两种事件上回源补了一张完整的
+   * 「id → 文字」表，而角色自己发起的投票落盘时那些 id 全是空串 —— 这是唯一
+   * 能填上真 id 的时机。
+   */
+  okWith("voted / unvoted 也落盘（补上自己发起那些投票的真 id）", () => {
+    const body = src.slice(at("async function handlePollEvent("), at("function pollHintFor("));
+    assert.equal((body.match(/putPoll\(/g) ?? []).length, 2, "voted / unvoted 那条没落盘");
+    /*
+     * 空的选项表不能存：回源失败时 options 是空数组，而 putPoll 的
+     * `entry.options ?? prev.options` 拦不住空数组（它不是 nullish），
+     * 会把好好的那份洗成空的。title 同理，空串也不能传进去。
+     */
+    assert.ok(body.includes("else if (options.length)"), "没挡住空选项表（会把落盘那份洗空）");
+    assert.ok(body.includes("...(title ? { title } : {})"), "空标题会把存好的标题洗掉");
+  });
+
+  /*
    * 发起投票时标题会作为一条**独立的普通文本消息**进来，压重必须拦在
    * noteInbound 之前 —— noteInbound 之后那条文本已经记进上下文了，再跳过也
    * 只是不回它，模型照样看两遍标题。
@@ -1131,9 +1177,45 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
 
   okWith("桥接停的时候把投票那条长连接收掉（不然 gRPC 一直挂着）", () => {
     const body = src.slice(at("function stopRunner("), at("function stopRunner(") + 3000);
-    assert.ok(body.includes("runner.pollWatcher"), "stopRunner 没收 pollWatcher");
-    assert.ok(body.includes("runner.pollTitles?.clear()"), "压标题那张表没清");
+    // 真正的收尾动作在 stopPollWatcher 里（开关热生效那条路也要用它，见下一条）
+    assert.ok(body.includes("stopPollWatcher(runner)"), "stopRunner 没收 pollWatcher");
+    const stopper = src.slice(at("function stopPollWatcher("), at("function syncWatchers("));
+    assert.ok(stopper.includes("runner.pollWatcher"), "stopPollWatcher 没收 pollWatcher");
+    assert.ok(stopper.includes("runner.pollTitles?.clear()"), "压标题那张表没清");
     assert.ok(src.includes("pollWatcher: null"), "createRunner 没初始化 pollWatcher");
+  });
+
+  /*
+   * 开关是**热生效**的：`poll.enabled` 不在 fingerprintOf 里（它只管连不连得
+   * 上），所以保存配置时 syncBridges 走的是「保持」分支 —— 不在那儿对齐一次
+   * 订阅的话，界面上刚打开投票开关根本不起订阅，表现成「角色发得出投票，但
+   * 用户投了它看不见」。这正是用户报上来的那个 bug。
+   */
+  okWith("保存配置时对齐投票订阅（开关不重启桥接也生效）", () => {
+    const sync = src.slice(at("export async function syncBridges("), src.length);
+    assert.ok(sync.includes("syncWatchers(getConfig, runner)"), "「保持」分支没对齐订阅");
+
+    const body = src.slice(at("function syncWatchers("), at("function syncWatchers(") + 1200);
+    assert.ok(body.includes("startPollWatcher"), "开了不起订阅");
+    assert.ok(body.includes("stopPollWatcher"), "关了不停订阅");
+    // 绝不能无脑先停再起：那样每次保存配置都把两条常驻 gRPC 重建一遍
+    assert.ok(
+      body.indexOf("rolePollEnabled") < body.indexOf("startPollWatcher"),
+      "起订阅之前没看开关"
+    );
+
+    // 起的那一侧要自己挡重复，否则连着保存两次配置就留下两条订阅
+    const starter = src.slice(at("function startPollWatcher("), at("function stopPollWatcher("));
+    assert.ok(
+      starter.includes("runner.pollWatcher || runner.pollWatcherStarting"),
+      "startPollWatcher 没挡重复起（会留野订阅）"
+    );
+    assert.ok(src.includes("pollWatcherStarting: false"), "createRunner 没初始化那个牌子");
+    // 建好那一刻要重问一次开关：await 期间用户可能又把它关回去了
+    assert.ok(
+      starter.includes("!rolePollEnabled(getConfig, runner)"),
+      "订阅建好时没重问开关"
+    );
   });
 
   okWith("本地 Mac 模式：开关开着也只 warn 一句，不起订阅", () => {
