@@ -2609,6 +2609,133 @@ function RoleTransferFields({ role }) {
 }
 
 /**
+ * 「看手写和 Digital Touch」那一段：只有一个开关。
+ *
+ * 这两种气泡**本来就认得出** —— 现在模型会收到「{{user}}发来了一条手写消息」，
+ * 只是读不到里面写的是什么。手写消息那几个字是对方真正说的话，这个亏最大，
+ * 所以界面上要先把「不开也不是瞎的、开了是多看见内容」说清楚，
+ * 不然用户会以为这是个「要不要认出来」的开关。
+ *
+ * 和投票那栏不同，这里没有 openGate —— 它不教模型发任何东西，预设里压根没有
+ * 对应的子条目。
+ */
+function RoleHandwritingFields({ role, onGoto }) {
+  const { updateRole } = useConfig();
+  const hw = role.handwriting ?? {};
+
+  return (
+    <div className="grid grid-cols-1 gap-6">
+      <label className="flex items-start justify-between gap-4">
+        <span className="min-w-0">
+          <span className="block text-ui text-ink">看手写消息和 Digital Touch 的内容</span>
+          <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+            对方用手指写的那种消息、还有心跳/火球/亲吻那些 Digital Touch，
+            现在模型只知道<b>有这么一条</b>
+            ，读不到里面是什么。开了之后会把那张图取回来送去识图，模型看到的是
+            <code className="mx-1 bg-sunken px-1">手写消息内容：今晚一起吃饭吗</code>
+            这样的一句话。
+            <br />
+            手写消息尤其值得开 —— 那几个字是对方真正说的话。
+            <br />
+            要<b>这个角色的识图也开着</b>
+            才有用（取回来的图得有人看，识图模型在上面「模型」那一栏里挑，模型本身在
+            <button
+              type="button"
+              className="mx-1 underline decoration-line underline-offset-2 hover:text-ink"
+              onClick={() => onGoto?.("models")}
+            >
+              连接 → 模型
+            </button>
+            里加）。而且每条这种消息都会多打一次识图模型，
+            <b>那是花钱的</b>，所以默认关。
+            <br />
+            取不回来、或者取回来不是一张图（Digital Touch 有可能），就退回现在那句
+            「发来了一条 Digital Touch」，不会变成什么都没有。只支持云端 Photon 模式。
+          </span>
+        </span>
+        <Switch
+          checked={Boolean(hw.enabled)}
+          onChange={(v) => updateRole(role.id, { handwriting: { ...hw, enabled: v } })}
+          label="启用看手写和 Digital Touch"
+        />
+      </label>
+    </div>
+  );
+}
+
+/**
+ * 「投票」那一段：只有一个开关，但它管三件事。
+ *
+ * 一个开关管到底是用户拍的口径 —— 这三件事在体验上是一件事，拆成三个开关
+ * 只会让人配出「能投票但收不到投票」这种没意义的组合：
+ *
+ *  1. **认出来**对方发起的投票，连全部选项一起进提示词（选项后加也会再说一次）；
+ *  2. 角色写 `[vote:A]` 去**投一票**；
+ *  3. 角色写 `[poll:注释|选项1|选项2]` 自己**发起**一个投票。
+ *
+ * 界面上必须交代三件反直觉的事：
+ *
+ *  - **一次只能投一个。** 这不是我们偷懒 —— 苹果的投票就是一人一票，Photon 那边
+ *    `vote` 的语义是「投或者改投」，所以没有多选这回事。
+ *  - **多一条常驻连接。** 和聊天背景同一条理由：provider 只把「有人投了票」这种
+ *    增量事件往下传，「有人发起了投票、选项是哪几个」压根到不了桥接这边，
+ *    所以后台会另开一条 Photon 的 gRPC 专门订阅（见服务端 poll.js）。
+ *  - **自己发起的那个投票，角色投不了。** 刚发出去的时候拿不到每个选项的内部
+ *    标识，要等对方先投一票才补齐。这事不影响主线，但用户会看见日志里那句
+ *    「对不上那个投票的任何选项」，得先说在这儿。
+ *
+ * 只支持云端模式（本地 Mac 那条通道 SDK 直接抛不支持），默认关。
+ */
+function RolePollFields({ role }) {
+  const { updateRole } = useConfig();
+  const openGate = usePresetGate(role);
+  const pl = role.poll ?? {};
+
+  return (
+    <div className="grid grid-cols-1 gap-6">
+      <label className="flex items-start justify-between gap-4">
+        <span className="min-w-0">
+          <span className="block text-ui text-ink">投票</span>
+          <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+            对方在 iMessage 里发起一个投票（「今晚吃什么」那种），角色这边会收到一句
+            <code className="mx-1 bg-sunken px-1">
+              {"[系统提示:{{user}}向你发起了一个投票…【A麻辣烫】【B炸鸡】【C海底捞】]"}
+            </code>
+            ，<b>全部选项</b>都列着；对方之后再加选项，会重新列一遍。
+            <br />
+            模型可以写
+            <code className="mx-1 bg-sunken px-1">[vote:A]</code>
+            去投那一票（也能写选项原文，比如
+            <code className="mx-1 bg-sunken px-1">[vote:麻辣烫]</code>
+            ），或者干脆不投、直接回话。
+            <b>一次只能投一个</b>
+            —— 苹果的投票就是一人一票，没有多选。
+            <br />
+            也可以让它自己发起：
+            <code className="mx-1 bg-sunken px-1">[poll:今晚吃什么|麻辣烫|炸鸡|海底捞]</code>
+            ，最少两个选项、最多十个。它自己发起的那个投票它投不了（选项的内部标识要等
+            对方先投一票才拿得到）。
+            <br />
+            后台为此会多起一条只订阅「投票」的连接（这条事件不在主连接上），所以默认关。
+            只支持云端 Photon 模式，本地 Mac 模式会退化成发一句文字。
+            <br />
+            预设里的那条子条目也要开着才会在提示词里教模型怎么写。
+          </span>
+        </span>
+        <Switch
+          checked={Boolean(pl.enabled)}
+          onChange={(v) => {
+            updateRole(role.id, { poll: { ...pl, enabled: v } });
+            if (v) openGate("poll");
+          }}
+          label="启用投票"
+        />
+      </label>
+    </div>
+  );
+}
+
+/**
  * 内置的 emoji 面板，按情绪分组。
  *
  * 苹果的 tapback 从 iOS 18 起可以贴**任意** emoji —— 全塞进提示词等于白烧几千
@@ -5044,6 +5171,8 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
   const mem = role.memories ?? {};
   const memOn = [mem.memory?.enabled, mem.memo?.enabled, mem.diary?.enabled].filter(Boolean).length;
   const bgOn = Boolean(role.chatBackground?.enabled);
+  const pollOn = Boolean(role.poll?.enabled);
+  const hwOn = Boolean(role.handwriting?.enabled);
   // 回应和特效都是白名单：开着但一个都没勾 = 模型其实用不了，得在折起来的时候
   // 就看出来，不然会以为配好了
   const rs = role.reactSend ?? {};
@@ -5469,9 +5598,11 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
         </Fold>
 
         {/*
-          七 ~ 十六：十个要预设配合的功能，各占一栏。
-          这几个开关打开时会顺手把「预设 → 消息格式与功能」里对应的子条目也打开
-          （见 usePresetGate），所以这儿不用再嘱咐用户去预设里补一刀。
+          七 ~ 二十一：十五栏 iMessage 玩法。其中十三个开关打开时会顺手把
+          「预设 → 消息格式与功能」里对应的子条目也打开（见 usePresetGate），
+          所以这儿不用再嘱咐用户去预设里补一刀 —— 只有「聊天背景」和
+          「手写和 Digital Touch」那两栏例外，它们纯粹是入站识别，
+          不教模型发任何东西，没有子条目可开。
           最后那一栏 Instagram 也走同一道闸，只是它排在最下面（理由见那儿）。
         */}
         <Fold
@@ -5558,6 +5689,18 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
           <RoleTransferFields role={role} />
         </Fold>
 
+        {/*
+          投票挨着转账卡片放：两栏都是「只有云端模式才有、本地会退化成一句文字」的
+          发送类功能，用户在本地 Mac 模式下一眼就能看完这两条限制。
+        */}
+        <Fold
+          title="投票"
+          desc="认出对方发起的投票和全部选项，能投 [vote:A]，也能自己发起 [poll:注释|选项1|选项2]"
+          badge={onOff(pollOn)}
+        >
+          <RolePollFields role={role} />
+        </Fold>
+
         <Fold
           title="消息回应"
           desc="长按对方的气泡贴一个 emoji；对方贴了什么也会告诉模型"
@@ -5582,7 +5725,19 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
           <RoleChatBackgroundFields role={role} />
         </Fold>
 
-        {/* 十七、记忆库：记忆 / 备忘录 / 日记三道闸 */}
+        {/*
+          手写 / Digital Touch 挨着聊天背景放：这两栏是这一页里唯二「纯入站识别」
+          的开关 —— 不教模型发任何东西，所以也都没有预设子条目要开。
+        */}
+        <Fold
+          title="手写和 Digital Touch"
+          desc="手写消息里写的是什么、Digital Touch 是哪一种，取回来送去识图让模型看见"
+          badge={onOff(hwOn)}
+        >
+          <RoleHandwritingFields role={role} onGoto={onGoto} />
+        </Fold>
+
+        {/* 二十二、记忆库：记忆 / 备忘录 / 日记三道闸 */}
         <Fold
           title="记忆库"
           desc="记忆 / 备忘录 / 日记三道闸，攒下来的内容在「记忆库」面板里看"
@@ -5592,7 +5747,7 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
         </Fold>
 
         {/*
-          十八、提示词协助模式。挨着记忆库放，因为它俩是这一页里唯二「往回看」的
+          二十三、提示词协助模式。挨着记忆库放，因为它俩是这一页里唯二「往回看」的
           功能 —— 上面那些栏都在决定角色下一句怎么说，这两栏在处理已经说过的话。
         */}
         <Fold

@@ -210,6 +210,17 @@ export const TRANSFERS_DIR = path.join(DATA_DIR, "transfers");
 export const TRANSFER_LOGO_DIR = path.join(DATA_DIR, "transfer-logos");
 
 /**
+ * 见过的投票，一个角色一份。
+ *
+ * 存的是「字母 → optionIdentifier」那张映射（见 pollstore.js 的文件头）——
+ * 没有它，模型写 `[vote:B]` 就没法翻成真正要投的那个选项 id。
+ *
+ * **不进 config.json**，和转账同一条理由：`PUT /api/config` 会重启所有桥接，
+ * 而这边是每个投票事件都写。
+ */
+export const POLLS_DIR = path.join(DATA_DIR, "polls");
+
+/**
  * 记忆库。三样东西各一个子文件夹，都按角色分文件。
  *
  * 子文件夹用中文名，是为了让用户翻 data/ 的时候一眼知道哪个是哪个 ——
@@ -375,6 +386,7 @@ export function ensureLayout() {
     OFFLINE_MEDIA_DIR,
     TRANSFERS_DIR,
     TRANSFER_LOGO_DIR,
+    POLLS_DIR,
   ]) {
     fs.mkdirSync(dir, { recursive: true });
   }

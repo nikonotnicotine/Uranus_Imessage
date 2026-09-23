@@ -167,6 +167,16 @@ const MEDIA_TAG = new RegExp(
     "[[［]\\s*(?:share_location|location|位置|定位|共享位置)\\s*[:：]\\s*(?<location>[^\\]］]{1,160}?)\\s*[\\]］]",
     "[[［]\\s*(?:reaction|react|tapback|回应|贴纸)\\s*[:：]\\s*(?<react>[^\\]］]{1,80}?)\\s*[\\]］]",
     "[[［]\\s*(?:transfer_money|transfer|转账|转钱)\\s*[:：]\\s*(?<transfer>\\d[^\\]］]{0,80}?)\\s*[\\]］]",
+    /*
+     * 投票两条，顺序要紧：`poll_vote` 排在 `poll` 前面，否则 `[poll_vote:A]`
+     * 会被后面那条当成「标题是 _vote:A 的投票」。
+     *
+     * **故意不认光秃秃的 `[A]`**（用户原话里的写法）：`[A]` 在正常文本里出现的
+     * 概率不低（模型写清单、写选项表时很爱用），而这套标记体系全是 `[标签:内容]`。
+     * 入站那句提示里教的也是 `[vote:A]`，两边对得上就不会有歧义。
+     */
+    "[[［]\\s*(?:poll_vote|vote|投票|投)\\s*[:：]\\s*(?<vote>[^\\]］]{1,60}?)\\s*[\\]］]",
+    "[[［]\\s*(?:create_poll|poll|发起投票|投票发起)\\s*[:：]\\s*(?<poll>[^\\]］]{1,400}?)\\s*[\\]］]",
   ].join("|"),
   /*
    * `i`：标签名不分大小写。
@@ -193,15 +203,17 @@ const MEDIA_TAG = new RegExp(
  *
  * @param {string} text 一条气泡的正文（调用方已经按分隔符切过）
  * @returns {{kind:"text"|"audio"|"sticker"|"image"|"undo"|"card"|"music"|"location"|"react"
- *            |"transfer",
+ *            |"transfer"|"vote"|"poll",
  *            text:string, ref?:string, n?:number, ll?:string, emoji?:string, spec?:string,
- *            note?:string}[]}
+ *            note?:string, options?:string[]}[]}
  *          text 段已经 trim 过，空段不产出；sticker 段的 text 是情绪标签；
  *          image 段的 ref 是参考图名（没有就是空串）；undo 段的 n 是倒数第几条；
  *          card 段的 text 是那条网址；music 段的 text 是「歌手-歌名」那串；
  *          location 段的 text 是地名、ll 是「纬度,经度」（没写就是空串）；
  *          react 段的 emoji 是要贴的 emoji、spec 是贴哪条（没写就是空串）；
- *          transfer 段的 text 是金额原文、note 是备注（没写就是空串）
+ *          transfer 段的 text 是金额原文、note 是备注（没写就是空串）；
+ *          vote 段的 text 是「投哪个」（字母/序号/选项原文）；
+ *          poll 段的 text 是投票标题、options 是选项文字（可能不足两个）
  */
 export function splitMedia(text) {
   const src = String(text ?? "");
@@ -277,6 +289,30 @@ export function splitMedia(text) {
       const amount = (at < 0 ? body : body.slice(0, at)).trim();
       const note = at < 0 ? "" : body.slice(at + 1).trim();
       if (amount) parts.push({ kind: "transfer", text: amount, note });
+    } else if (g.vote !== undefined) {
+      // 整段就是「投哪个」：一个字母、一个序号、或者选项原文。
+      // 真正翻成 optionIdentifier 的活儿在 poll.js:matchOption
+      const t = g.vote.trim();
+      if (t) parts.push({ kind: "vote", text: t });
+    } else if (g.poll !== undefined) {
+      /*
+       * `[poll:今晚吃什么|麻辣烫|炸鸡|海底捞]` —— 竖线分段，第一段是标题。
+       *
+       * 为什么用 `|` 而不是冒号：选项数量是不定的（苹果允许 2–10 个），而冒号
+       * 在标题和选项里都很常见（`[poll:明天几点走:早上|7点|8点]`）。竖线在中文
+       * 聊天里基本不会出现，拿它当分隔符最不容易撞。全角 `｜` 也认 —— 中文
+       * 输入法下顺手打出来的就是那个。
+       *
+       * 选项不足两个的**不丢**，照样产出这一段：下游 sendPollPart 会退化成一句
+       * 文字（`今晚吃什么：麻辣烫`）。在这里丢掉的话那句话就彻底没了。
+       */
+      const body = g.poll.trim();
+      const segs = body
+        .split(/[|｜]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const title = segs.shift() ?? "";
+      if (title) parts.push({ kind: "poll", text: title, options: segs });
     } else {
       const t = String(g.image ?? "").trim();
       if (t) parts.push({ kind: "image", text: t, ref: String(g.ref ?? "").trim() });
@@ -287,7 +323,7 @@ export function splitMedia(text) {
   return parts;
 }
 
-/** 这段文字里有没有语音 / 表情包 / 图片 / 撤回 / 卡片 / 点歌 / 位置 / 回应 / 转账标记。 */
+/** 这段文字里有没有语音 / 表情包 / 图片 / 撤回 / 卡片 / 点歌 / 位置 / 回应 / 转账 / 投票标记。 */
 export function hasMedia(text) {
   return splitMedia(text).some((p) => p.kind !== "text");
 }
@@ -305,10 +341,13 @@ export function hasMedia(text) {
  * 卡片发不出去的时候，这笔钱的意思还是得说出来 —— 和语音退成那句话同一个道理。
  * 说出来的形态和这个功能做出来之前用户手写的 `【转账：￥4000 零花钱】` 差不多，
  * 对方照样看得懂。
+ * **发起投票**退化成一句话（`[poll:今晚吃什么|麻辣烫|炸鸡]` →
+ * `今晚吃什么：麻辣烫 / 炸鸡`），同上 —— 对方照样能回一句「炸鸡」。
  * 图片和表情包直接**丢掉**：图片那段是给出图模型看的画面描述（「浅木桌，
  * 蓝莓芋泥蛋糕，白瓷盘」），表情包那段是个情绪标签（「紧张」），单独发给人看
  * 都莫名其妙。撤回也丢掉 —— 它本来就不产出内容。**回应同理**：功能关着的时候
- * 一个光秃秃的 emoji 单发一条也不像话，直接丢。
+ * 一个光秃秃的 emoji 单发一条也不像话，直接丢。**投票那段也丢**（`[vote:A]`）：
+ * 它改的是对方那个已经存在的投票气泡，退化成一个「A」发过去没人看得懂。
  *
  * 几段之间不加分隔符 —— 正常情况下模型会用气泡分隔符隔开，走到这儿的都是
  * 同一条气泡里的相邻内容。
@@ -317,11 +356,34 @@ export function stripMediaTags(text, currency) {
   return splitMedia(text)
     .filter(
       (p) =>
-        p.kind !== "image" && p.kind !== "sticker" && p.kind !== "undo" && p.kind !== "react"
+        p.kind !== "image" &&
+        p.kind !== "sticker" &&
+        p.kind !== "undo" &&
+        p.kind !== "react" &&
+        p.kind !== "vote"
     )
-    .map((p) => (p.kind === "transfer" ? transferAsText(p, currency) : p.text))
+    .map((p) => {
+      if (p.kind === "transfer") return transferAsText(p, currency);
+      if (p.kind === "poll") return pollAsText(p);
+      return p.text;
+    })
     .join("")
     .trim();
+}
+
+/**
+ * 一个投票段退化成能当普通文字发的一句话。
+ *
+ * `[poll:今晚吃什么|麻辣烫|炸鸡]` → `今晚吃什么：麻辣烫 / 炸鸡`。和转账退化成
+ * 「转账 ￥4000 零花钱」同一个道理：投票气泡发不出去（本地 Mac 模式、开关关着、
+ * 选项不够两个）的时候，这句话的意思还是得说出去 —— 对方照样能回一句「炸鸡」。
+ *
+ * 一个选项都没写的话就只剩标题，那本来就是句完整的话。
+ */
+function pollAsText(part) {
+  const title = String(part?.text ?? "").trim();
+  const options = (part?.options ?? []).map((s) => String(s).trim()).filter(Boolean);
+  return options.length ? `${title}：${options.join(" / ")}` : title;
 }
 
 /**

@@ -821,6 +821,7 @@ function StepFeatures({ role, defaults }) {
   const us = role?.undoSend ?? {};
   const rs = role?.reactSend ?? {};
   const es = role?.effectSend ?? {};
+  const pl = role?.poll ?? {};
 
   return (
     <div className="space-y-6">
@@ -872,6 +873,12 @@ function StepFeatures({ role, defaults }) {
             desc="发歌、发网页会带预览卡"
             checked={Boolean(cs.enabled)}
             onChange={(v) => toggle("cardSend", "card", v)}
+          />
+          <SwitchRow
+            label="投票"
+            desc="你发起的投票它看得见全部选项，能投一票，也能自己发起一个（只有云端模式有）"
+            checked={Boolean(pl.enabled)}
+            onChange={(v) => toggle("poll", "poll", v)}
           />
         </div>
       </div>

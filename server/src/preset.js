@@ -81,7 +81,7 @@ const ENTRY_ROLES = ["system", "user", "assistant"];
 export const REGEX_TARGETS = ["userInput", "aiOutput"];
 
 /**
- * 「消息格式与功能」的子条目，固定十七条、不能增删。
+ * 「消息格式与功能」的子条目，固定十八条、不能增删。
  *
  * 拆成子条目是为了能单独开关：生图链路接上了但语音还没接的时候，
  * 可以只开图片那条，不用手改一整段文字再改回来。
@@ -89,7 +89,7 @@ export const REGEX_TARGETS = ["userInput", "aiOutput"];
  * 查岗占**四条**（看屏幕 / 看手机里的东西 / 动手机 / 放歌），对着角色面板上
  * 那四摊开关，理由见 SPY_SCREEN_CHILD 上面那段。
  *
- * 十七条的执行链路**都是接上的**。除了 quote 之外，其余十六条都多压一道闸 ——
+ * 十八条的执行链路**都是接上的**。除了 quote 之外，其余十七条都多压一道闸 ——
  * 角色单独配置里那个开关关着时，这一条无论开没开都不注入（见 ROLE_GATED_CHILDREN 和
  * prompt.js:formatBlock）。voice / image / search 的理由是会往外发请求、要花钱；
  * leaveOnRead 不花钱，但它会让角色**干脆不回消息**；sticker 也不花钱，
@@ -97,6 +97,8 @@ export const REGEX_TARGETS = ["userInput", "aiOutput"];
  * card 会把一条外部网址推到对方手机上、由对方手机去抓预览；
  * transfer（转账卡片）发出去的是一张**看着像凭证**的气泡，默认关着 ——
  * 一个角色该不该跟用户之间有钱来钱往，只能由用户自己说；
+ * poll（投票）压的是**一条常驻 gRPC 连接** —— 开着就意味着这个角色为每条线路
+ * 多订阅一条 poll 事件流（见 poll.js），而且只有云端 Photon 模式能用；
  * instagram 会往 data/instagram/ 里落一条**公开可见**的帖子或快拍，
  * 而且大多数角色压根不该有这个账号（这道闸默认就是关的）；
  * 查岗那四条是这里面外溢最狠的 —— 会把用户**屏幕上的东西**抓下来打给视觉模型、
@@ -117,6 +119,7 @@ export const FORMAT_CHILD_KINDS = [
   "card",
   "location",
   "transfer",
+  "poll",
   "search",
   "leaveOnRead",
   "quote",
@@ -152,6 +155,7 @@ export const FORMAT_CHILD_TAGS = {
   card: "share_card",
   location: "share_location",
   transfer: "转账",
+  poll: "投票",
   search: "联网搜索",
   leaveOnRead: "leave_on_read",
   quote: "引用回复",
@@ -201,6 +205,7 @@ export const ROLE_GATED_CHILDREN = {
   card: "cardSend",
   location: "locationSend",
   transfer: "transfer",
+  poll: "poll",
   react: "reactSend",
   effect: "effectSend",
   instagram: "instagram",
@@ -423,7 +428,7 @@ export const LEGACY_FORMAT_INTRO = [
 ].join("\n");
 
 /**
- * 十一个子条目的默认内容。
+ * 每个子条目的默认内容（FORMAT_CHILD_KINDS 那十八条各一段）。
  *
  * voice / sticker / image / quote / undoSend 这几段是用户给的规范原文（含
  * `{{表情包变量}}`、`{{图生图变量}}` 两个变量）。外层的
@@ -520,6 +525,23 @@ export const DEFAULT_FORMAT_CHILDREN = {
       "卡片直接发在这个对话里。",
     "对方收下之后卡片右上角会变成「已收款」，你会收到系统提示，" +
       "那时候再顺着说一句就行；没收之前别催。",
+  ].join("\n"),
+  poll: [
+    "投票",
+    "说明：iMessage 里可以发起投票，也可以在对方发起的投票里投票。两件事两个写法：",
+    "一、给对方的投票投一票：写成 [vote:A]，方括号里是选项的字母。" +
+      "对方发起投票时你会收到一条系统提示，里面按顺序列着全部选项（【A…】【B…】【C…】），" +
+      "照那个字母写就行。" +
+      "**一次只能投一个选项** —— iMessage 的投票是一人一票，" +
+      "再投一次等于把上一票挪过去，所以别一条回复里写好几个 [vote:…]。" +
+      "你也可以不投票，直接回复文字；对方后来给投票加了新选项的话你会再收到一条提示。",
+    "示例：「我要吃这个{{sep}}[vote:B]」",
+    "二、自己发起一个投票：写成 [poll:注释|选项1|选项2|选项3]，" +
+      "第一段是投票的注释（问题本身），后面每段是一个选项，用 | 隔开。" +
+      "最少两个选项、最多十个。",
+    "示例：「周末去哪玩{{sep}}[poll:周末去哪|爬山|看电影|在家躺着]」",
+    "规则：投票标记要单独占一条气泡，可以在它前后用 {{sep}} 接一句自己的话；" +
+      "一轮里最多发起一个投票。发起投票之后等对方投，别自己去投自己发的那个。",
   ].join("\n"),
   search: [
     "需要实时信息、最新资讯或你不掌握的外部知识时（尤其是发现自己答不上来、",
@@ -744,7 +766,7 @@ export const LEGACY_FORMAT_PROMPT = [
 /**
  * 某个子条目缺 `enabled` 字段时默认开不开：**恒定为开**。
  *
- * 十七条的链路现在都接上了，其中十六条还各自压着第二道闸 —— 角色单独配置里那个开关
+ * 十八条的链路现在都接上了，其中十七条还各自压着第二道闸 —— 角色单独配置里那个开关
  * （ROLE_GATED_CHILDREN），默认全是关的，所以这里开着也不会凭空往提示词里
  * 加东西。反过来如果它们跟着 `enabled` 走，用户在角色里打开之后还得再翻进
  * 预设面板开一次，两个开关都要对才生效 —— 那是很难猜到的。
@@ -763,7 +785,7 @@ function defaultChildEnabled() {
 /**
  * 新建 format 条目时的子条目。
  *
- * 十七条默认全开着，但其中十六条压着角色那道闸（默认关），所以实际注入的只有
+ * 十八条默认全开着，但其中十七条压着角色那道闸（默认关），所以实际注入的只有
  * quote 一条 —— 用户在哪个角色上打开「发送表情包」，才会在那个角色的提示词里
  * 看到它。
  */
@@ -1059,7 +1081,7 @@ function normalizeParams(input) {
 }
 
 /**
- * 「消息格式与功能」的子条目：固定十七条、不能增删，只能开关和改内容。
+ * 「消息格式与功能」的子条目：固定十八条、不能增删，只能开关和改内容。
  *
  * 老配置里没有 children 字段，得从那一整段 content 迁过来 —— 缺 `enabled` 的
  * 一律补成开（见 defaultChildEnabled）。以前这里还分「用户改没改过引言」，

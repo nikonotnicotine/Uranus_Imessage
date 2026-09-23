@@ -563,12 +563,13 @@ export function PresetEntryEditor({ preset, entry, onGoto }) {
 
         <p className="border-l-2 border-line py-1.5 pl-3 text-meta leading-relaxed text-ink-faint">
           <span>
-            这十七条都是
+            这十八条都是
             <strong className="text-ink-soft">真能用的</strong>
             ，除引用回复之外都还压着角色那道开关：要在「角色 → 单独配置」里给那个角色
             单独打开才生效。语音 / 图片 / 联网搜索会往外发请求、要花钱，已读不回会让角色
             干脆不回你消息，表情包发出去的是你自己电脑上的图，撤回和回应会真的动到对方
-            手机上的消息，Instagram 发出去的帖子是公开的，转账卡片发出去的是一张长得像凭证的气泡
+            手机上的消息，Instagram 发出去的帖子是公开的，转账卡片发出去的是一张长得像凭证的气泡，
+            投票会为那条线路多挂一条常驻连接
             —— 所以都由「用哪个角色」说了算，不是所有角色共用。
             <br />
             表情包那条正文里的

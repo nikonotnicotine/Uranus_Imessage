@@ -1,6 +1,8 @@
 import { readBytes } from "./attachread.js";
 import {
   cardHintFor,
+  embeddedKindOf,
+  fetchEmbeddedMedia,
   formatAmount,
   isCardUrl,
   mapsUrlFor,
@@ -20,6 +22,8 @@ import {
 } from "./llm.js";
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import {
+  DEFAULT_DIGITAL_TOUCH_PROMPT,
+  DEFAULT_HANDWRITING_PROMPT,
   projectLabel,
   projectReady,
   resolveEndpoint,
@@ -54,6 +58,8 @@ import {
 } from "./media.js";
 import { resolveMusic } from "./music.js";
 import { clampInt } from "./normalize.js";
+import { castVote, letterFor, matchOption, renderOptions, watchPolls } from "./poll.js";
+import { findLatestPoll, findPoll, putPoll } from "./pollstore.js";
 import { presetLabel, resolvePreset } from "./preset.js";
 import {
   manualDiary,
@@ -338,6 +344,12 @@ function createRunner(projectRefId) {
     // peerKey -> 待认领的背景变更。用户换完背景不一定会马上说话，所以先存着，
     // 等这个人下一条消息进来时再塞进同一个合并槽里 —— 见 takeBgHint
     bgPending: new Map(),
+    // 投票：poll.js 那条独立 gRPC 订阅。和 bgWatcher 同一个待遇 —— 只有角色开了
+    // poll.enabled 且是云端模式才起（见 startPollWatcher）
+    pollWatcher: null, // { stop() } | null
+    // spaceId -> { title, at }。发起投票时那行标题会作为一条**独立的普通文本
+    // 消息**再进来一次，靠这张表把它压掉，免得模型看两遍。见 notePollTitle
+    pollTitles: new Map(),
     // peerKey -> 待认领的 tapback（对方给某条气泡贴的 emoji）。和 bgPending
     // 同一个路子，区别是**存数组** —— 一个人可以连着贴好几条，
     // 一条一条报给模型才说得清「哪句话被贴了什么」。见 takeReactHints
@@ -1288,13 +1300,25 @@ async function describeImages(endpoint, prompt, max, runner, images) {
    */
   const settled = await Promise.all(
     use.map(async (image, i) => {
-      const label = use.length > 1 ? `图片${i + 1}` : "图片";
+      /*
+       * 手写消息 / Digital Touch 那两路自带 label 和 prompt（见入站循环里
+       * embeddedKindOf 那一段）。它们跟普通图片挤在同一个数组里、占同一份
+       * maxImages 额度、走同一个并发 —— 唯一的区别就是这两行：
+       *
+       *  - label：「手写消息内容：今晚一起吃饭吗」比「图片1内容：…」有用得多；
+       *  - prompt：通用那句问的是「描述这张图片」，拿它去看手写消息，模型会答
+       *    「一张蓝色的手写字迹」而不是把字读出来。
+       *
+       * 普通图片这两个字段都是 undefined，行为和以前一个字不差。
+       */
+      const label = image?.label || (use.length > 1 ? `图片${i + 1}` : "图片");
+      const ask = image?.prompt || prompt;
       // 开始那行也要有：识图要打一次模型（VISION_TIMEOUT 是 180 秒），只有
       // 「完成」那行的话，这中间几十秒在控制台里看不出是在识别还是卡住了
       logInfo(scope, `开始识别${label}${use.length > 1 ? `（共 ${use.length} 张，并发）` : ""}…`);
       const startedAt = Date.now();
       try {
-        const desc = await describeImage(endpoint, prompt, image);
+        const desc = await describeImage(endpoint, ask, image);
         logInfo(
           scope,
           `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
@@ -5196,6 +5220,186 @@ async function sendLocationPart(runner, space, part, ctx) {
   return sendLinkCard(runner, space, url, ctx, scope);
 }
 
+/** 投票最多几个选项。苹果那边的上限，Spectrum 的 schema 也是 2–10。 */
+const MAX_POLL_OPTIONS = 10;
+
+/** 投票标题最多多少字。超了截断，不让整条发不出去。 */
+const MAX_POLL_TITLE = 300;
+
+/**
+ * 执行一个 `[vote:A]`：在对方那个投票里投一票。
+ *
+ * 四道闸：
+ *  1. **角色开关**（提示词里没注入不代表模型不会硬写）；
+ *  2. **只有云端模式**能投 —— 本地 Mac provider 压根收不到投票事件，也没这条 RPC；
+ *  3. 这条会话上得真有一个投票（pollstore 里最近活动的那个）；
+ *  4. 模型写的那个 X 得对得上某个选项（见 poll.js:matchOption）。
+ *
+ * 认不出的时候**什么都不做**，不瞎投一个 —— 投错票比不投票糟得多，对方手机上
+ * 会看到角色选了个它压根没提过的选项。
+ *
+ * 不写「投哪个投票」是故意的：提示词里也没让模型说。投的就是刚刚随着那句系统
+ * 提示送进去的那个（findLatestPoll，理由见 pollstore.js 那边的注释）。
+ *
+ * @returns {Promise<boolean>} 真投上了没有。**不计进「发了几条」**（它改的是
+ *   已有气泡，不新起消息），但算 `acted` —— 整条回复只有一个 `[vote:B]` 是
+ *   完全正常的一轮，见 sendBubbles 里那段分工。
+ */
+async function runVotePart(runner, part, ctx) {
+  const scope = scopeOf(runner, "投票");
+  const want = String(part?.text ?? "").trim();
+  const role = ctx?.role;
+
+  if (!role?.poll?.enabled) {
+    logInfo(scope, `这个角色没开「投票」，跳过这条：[vote:${want}]`);
+    return false;
+  }
+  if (!want) return false;
+  if (runner.mode !== "cloud") {
+    logWarn(scope, `本地 Mac 模式投不了票，[vote:${want}] 跳过`);
+    return false;
+  }
+
+  const chatGuid = String(ctx?.spaceId ?? "");
+  const hit = findLatestPoll(memoryKeyFor(role), chatGuid);
+  if (!hit) {
+    logWarn(scope, `[vote:${want}] 这条会话里没有记着的投票，投不了`);
+    return false;
+  }
+
+  const picked = matchOption(hit.options, want);
+  if (!picked) {
+    logWarn(
+      scope,
+      `[vote:${want}] 对不上那个投票的任何选项（${renderOptions(hit.options)}），不瞎投`
+    );
+    return false;
+  }
+
+  const ok = await castVote({
+    projectId: runner.projectId,
+    projectSecret: runner.projectSecret,
+    pollMessageGuid: hit.pollMessageGuid,
+    optionIdentifier: picked.optionIdentifier,
+    scope,
+  });
+  if (ok) logInfo(scope, `已在「${hit.title}」里投了【${picked.text}】`);
+  return ok;
+}
+
+/**
+ * 执行一个 `[poll:今晚吃什么|麻辣烫|炸鸡|海底捞]`：自己发起一个投票。
+ *
+ * 三道闸 + 一条退路，和转账卡片同一个结构：
+ *  1. **角色开关**；
+ *  2. **只有云端模式**能发 —— `@spectrum-ts/imessage-local` 的 poll 分支直接
+ *     `throw unsupportedLocalContent("poll")`，本地模式退化成一句文字；
+ *  3. 标题和选项过一遍校验（见下面那几行）。
+ *
+ * 发不出去就退化成一句人话（`今晚吃什么：麻辣烫 / 炸鸡 / 海底捞`），照转账那条
+ * 规矩 —— 这件事的意思得说出去，不能让整轮回复跟着一起没。
+ *
+ * **不能当引用回复发**：SDK 明确 `polls cannot be sent as replies`，所以这里
+ * 直接 `space.send`，忽略这条气泡上的引用目标。
+ *
+ * @returns {Promise<boolean>} 发出去了没有（退化成文字也算发出去了）
+ */
+async function sendPollPart(runner, space, part, ctx) {
+  const scope = scopeOf(runner, "投票");
+  const title = String(part?.text ?? "").trim();
+  const role = ctx?.role;
+
+  if (!role?.poll?.enabled) {
+    logInfo(scope, `这个角色没开「投票」，跳过这条：[poll:${title}]`);
+    return false;
+  }
+  if (!title) return false;
+
+  /*
+   * 选项：去重 + 掐掉空的。顺序保持模型写的那个 —— 它就是字母顺序，
+   * 而落盘那份也按这个顺序存（pollstore 的 options 注释）。
+   */
+  const seen = new Set();
+  const options = [];
+  for (const raw of part?.options ?? []) {
+    const t = String(raw ?? "").trim();
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    options.push(t);
+  }
+
+  const asText = `${title}${options.length ? `：${options.join(" / ")}` : ""}`;
+
+  // 苹果的投票最少两个选项。一个都没写/只写了一个 → 当句话发出去
+  if (options.length < 2) {
+    return sendPollText(runner, space, ctx, asText, scope, "投票至少要两个选项");
+  }
+  // 上限 10（Spectrum 的 schema 也是 2–10）。多写的截掉，别整条发不出去
+  if (options.length > MAX_POLL_OPTIONS) {
+    logWarn(scope, `这个投票写了 ${options.length} 个选项，超了，只取前 ${MAX_POLL_OPTIONS} 个`);
+    options.length = MAX_POLL_OPTIONS;
+  }
+  if (title.length > MAX_POLL_TITLE) {
+    logWarn(scope, `投票标题太长（${title.length} 字），截到 ${MAX_POLL_TITLE} 字`);
+  }
+  const askTitle = title.slice(0, MAX_POLL_TITLE);
+
+  if (runner.mode !== "cloud") {
+    return sendPollText(runner, space, ctx, asText, scope, "本地 Mac 模式发不了投票");
+  }
+
+  let message;
+  try {
+    const { poll } = await import("spectrum-ts");
+    message = noteSent(runner, ctx, await space.send(poll(askTitle, options)));
+  } catch (e) {
+    logWarn(scope, "这个投票没发出去", e);
+    return sendPollText(runner, space, ctx, asText, scope, "这个投票没发出去");
+  }
+
+  logInfo(scope, `发起了一个投票：${askTitle}（${options.length} 个选项）`);
+
+  /*
+   * 存下来。`message.id` **就是** pollMessageGuid（provider 的 outboundPoll 拿
+   * `poll.pollMessageGuid` 当 id），也就是对方投票时那个事件上的 guid ——
+   * 存了这一笔，后面才认得出「他投的是哪个选项」，以及那句提示里该说
+   * 「在**你发起的**投票里」。
+   *
+   * optionIdentifier 这会儿拿不到（space.send 只还回来一个 Message），先留空串。
+   * 对方一投票，poll.js 那条流会带着完整选项表回来，handlePollEvent 顺手覆盖掉。
+   * 也就是说角色投不了自己刚发起的那个投票（id 是空的，matchOption 返回的选项
+   * 会被 castVote 的入参判空挡掉）—— 自己发的投票自己投本来也不像话。
+   */
+  const stored = putPoll(memoryKeyFor(role), {
+    pollMessageGuid: String(message?.id ?? ""),
+    chatGuid: String(ctx?.spaceId ?? ""),
+    peerKey: peerKeyOf(ctx?.peer ?? ""),
+    title: askTitle,
+    options: options.map((text) => ({ text, optionIdentifier: "" })),
+    mine: true,
+  });
+  if (!stored) logWarn(scope, "这个投票没存下来，对方投票时认不出是哪个选项");
+
+  return true;
+}
+
+/**
+ * 投票发不成气泡时的退路：当普通文字发一句。照 sendTransferText 那条规矩。
+ *
+ * @param {string} why 日志里说清是哪一种（本地模式 / 选项不够 / 云端发失败）
+ * @returns {Promise<boolean>} 这句文字发出去了没有
+ */
+async function sendPollText(runner, space, ctx, text, scope, why) {
+  logWarn(scope, `${why}，改成发一句文字：${text}`);
+  try {
+    noteSent(runner, ctx, await space.send(text));
+    return true;
+  } catch (e) {
+    logError(scope, "这句投票文字也没能发出去", e);
+    return false;
+  }
+}
+
 /**
  * 执行一个 `[undosend:N]`：把自己倒数第 N 条已发出去的消息撤回。
  *
@@ -5345,9 +5549,11 @@ function effectAllowed(ctx, key, scope) {
  *
  * 每条气泡先摘掉 `[reply:…]`（那是**整条气泡**的属性，不是要发的内容），
  * 再过一遍 splitMedia，把 `[audio_message:…]` / `[send_emoji:…]` /
- * `[image:…]` / `[card:…]` / `[music:…]` / `[transfer:…]` / `[undosend:N]`
+ * `[image:…]` / `[card:…]` / `[music:…]` / `[transfer:…]` / `[vote:A]` /
+ * `[poll:注释|A|B]` / `[undosend:N]`
  * 从正文里切出来，各自走自己那条路（合成语音 / 挑一张表情包 / 出图 /
- * 发链接卡片 / 查歌再发卡片 / 发一张转账卡片 / 撤回刚发的那条），
+ * 发链接卡片 / 查歌再发卡片 / 发一张转账卡片 / 在对方那个投票里投一票 /
+ * 自己发起一个投票 / 撤回刚发的那条），
  * 剩下的照旧当文字发。
  * 一条气泡里混着文字和标记时按**原来的先后顺序**发，模型写
  * 「你看这个[image:…]好不好看」出来的就是三条消息，顺序不乱；
@@ -5399,8 +5605,8 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
    * `acted` 和 `sent` 不是一回事。
    *
    * `sent` 数的是**新起的消息**（前端「已回复」的计数、`slot.awaiting` 都按它
-   * 算）。但 `[react:❤️]` 和 `[undosend:1]` 不新起消息 —— 它们改的是已有气泡，
-   * 所以刻意不进 `sent`。
+   * 算）。但 `[react:❤️]`、`[undosend:1]` 和 `[vote:A]` 不新起消息 —— 它们改的是
+   * 已有气泡，所以刻意不进 `sent`。
    *
    * 于是「整条回复只有一个 [react:❤️]」这种完全正常的一轮（对方说「晚安 你别
    * 回我了」，角色贴一颗心就收尾）会走出 `sent === 0`，然后被调用方当成
@@ -5508,6 +5714,13 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
         if (await runReactPart(runner, space, part, ctx)) acted += 1;
         continue;
       }
+      // 投票同一档：改的是对方那个投票气泡，不新起消息，所以不计 sent、
+      // 也不用打 typing（它不像出图那样要花几十秒）
+      if (part.kind === "vote") {
+        tried.add("vote");
+        if (await runVotePart(runner, part, ctx)) acted += 1;
+        continue;
+      }
       /*
        * 媒体这一条要花好几十秒（出图 10–40s，合成 2–5s），中间对方那头的
        * 打字指示器会灭掉。每条之前补发一次 —— 让对方看到「还在打」，
@@ -5526,6 +5739,7 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
       else if (part.kind === "music") ok = await sendMusicPart(runner, space, part, ctx);
       else if (part.kind === "location") ok = await sendLocationPart(runner, space, part, ctx);
       else if (part.kind === "transfer") ok = await sendTransferPart(runner, space, part, ctx);
+      else if (part.kind === "poll") ok = await sendPollPart(runner, space, part, ctx);
       else ok = await sendImagePart(runner, space, part, ctx);
       // 语音退化成文字时也算发出去了一条（sendVoicePart 里已经发过）
       if (ok || part.kind === "audio") {
@@ -5562,6 +5776,8 @@ const KIND_NAMES = {
   transfer: "转账卡片",
   react: "emoji 回应",
   undo: "撤回",
+  vote: "投票",
+  poll: "发起投票",
 };
 
 /**
@@ -5642,6 +5858,275 @@ function roleWantsChatBg(getConfig, runner) {
   return Boolean(currentRole(getConfig, runner)?.chatBackground?.enabled);
 }
 
+/* ================= 投票 ================= */
+
+/**
+ * 「发起投票时那行标题」的压重窗口。
+ *
+ * 30 秒：投票气泡和那条标题文本是同一个动作产生的，正常间隔在毫秒级；
+ * 留这么宽只是为了覆盖推送乱序和慢网。过了就认了 —— 那条文本确实是
+ * iMessage 送来的真实消息，宁可让模型看两遍标题，也不能把一条真消息
+ * 无限期地吞掉（见 notePollTitle）。
+ */
+const POLL_TITLE_TTL_MS = 30_000;
+
+/** 一条会话最多攒几个待压的标题。同一个 30 秒窗口里发两个投票已经很离谱了。 */
+const POLL_TITLE_MAX = 3;
+
+/** 当前角色开了投票没有（三件事共用一个开关，见 config.js:normalizePoll）。 */
+function rolePollEnabled(getConfig, runner) {
+  return Boolean(currentRole(getConfig, runner)?.poll?.enabled);
+}
+
+/**
+ * 起「投票」的订阅（只有角色开了这个开关才起）。
+ *
+ * 和 startBgWatcher 一样是「Spectrum 没给就自己开一条 gRPC」：它的 provider
+ * 虽然订阅了 poll 流，但 `toPollDeltaMessages` 只把 voted / unvoted 转成消息，
+ * `created` / `optionAdded` 一律扔掉 —— 「对方发起了一个投票，选项有哪几个」
+ * 从设计上就到不了我们手上（整个来龙去脉见 poll.js 的文件头）。
+ *
+ * 代价同样是多一条常驻连接，所以默认关、且只认云端模式。
+ * 起不起来都不影响主连接。
+ */
+function startPollWatcher(getConfig, runner, project, scope) {
+  if (runner.mode !== "cloud") {
+    if (rolePollEnabled(getConfig, runner)) {
+      logWarn(scopeOf(runner, "投票"), "本地 Mac 模式拿不到投票事件，这个开关先不起作用");
+    }
+    return;
+  }
+  if (!rolePollEnabled(getConfig, runner)) return;
+
+  watchPolls({
+    projectId: project.projectId,
+    projectSecret: project.projectSecret,
+    label: scopeOf(runner, "投票"),
+    onEvent: (ev) => {
+      if (runner.stopped) return;
+      // 串进这条会话的处理链：要 await 一次 ensureSpace，不能和正在跑的那一轮抢
+      chain(
+        runner,
+        ev.chatGuid,
+        () => handlePollEvent(getConfig, runner, ev),
+        "处理投票事件出错"
+      );
+    },
+  })
+    .then((watcher) => {
+      // 同 startBgWatcher：await 期间这条连接被停掉了的话，别留野订阅
+      if (runner.stopped) {
+        watcher.stop();
+        return;
+      }
+      runner.pollWatcher = watcher;
+    })
+    .catch((e) => {
+      logWarn(scopeOf(runner, "投票"), `投票订阅没起来，这个功能本次连接不可用：${e?.message ?? e}`);
+    });
+}
+
+/**
+ * 这条会话的 space 对象，三步取。
+ *
+ * 投票事件是从**另一条** gRPC 流来的，手上只有一个 chatGuid，没有 Spectrum 的
+ * space —— 而 enqueue 要 space（这一轮回完话得从它发出去）。
+ *
+ * 1. 合并窗口里现成的那个（对方刚说过话，最常见）
+ * 2. 这个号最近一条入站消息的（同一条会话才算）
+ * 3. 现要一个（ensureSpace → platform.space.get，见那边的注释）
+ *
+ * 三步都不成返回 null，调用方记一句 warn 跳过这次事件。
+ */
+async function spaceForChat(runner, chatGuid) {
+  const inWindow = runner.pending.get(chatGuid)?.space;
+  if (inWindow) return inWindow;
+
+  const last = runner.lastSpace;
+  if (last?.space && last.spaceId === chatGuid) return last.space;
+
+  return ensureSpace(runner, { space: null }, chatGuid);
+}
+
+/**
+ * 记下「这个标题刚刚作为投票出现过」，顺手把已经在队列里的那条同名文本删掉。
+ *
+ * 治的是什么：手机上发起一个投票，iMessage 会**同时**送来两样东西 —— 一个
+ * 投票气泡（走 poll.js 那条流）和一条内容就是标题的普通文本消息（走主消息流，
+ * 用户日志里那句「收到一轮消息：今晚我要吃什么」就是它）。不管的话模型看到的是
+ *
+ *   今晚我要吃什么
+ *   [系统提示:{{user}}向你发起了一个投票，注释是："今晚我要吃什么"…]
+ *
+ * 同一句话两遍。两个方向都要覆盖，因为谁先到是不定的：
+ *  - 文本**晚到** → 记在 runner.pollTitles 里，等它进来时由 isPollTitleEcho 拦掉；
+ *  - 文本**早到** → 这会儿它还在合并窗口的 slot.texts 里（窗口默认几秒还没引爆），
+ *    直接从那个数组里摘掉。
+ *
+ * 窗口已经引爆过的那种（罕见）就认了，见 POLL_TITLE_TTL_MS 的注释。
+ */
+function notePollTitle(runner, chatGuid, title) {
+  const want = String(title ?? "").trim();
+  if (!want) return;
+
+  const list = runner.pollTitles.get(chatGuid) ?? [];
+  list.push({ title: want, at: Date.now() });
+  while (list.length > POLL_TITLE_MAX) list.shift();
+  runner.pollTitles.set(chatGuid, list);
+
+  const slot = runner.pending.get(chatGuid);
+  if (!slot?.texts?.length) return;
+  const kept = slot.texts.filter((t) => String(t ?? "").trim() !== want);
+  if (kept.length !== slot.texts.length) {
+    logDebug(scopeOf(runner, "投票"), `队列里那条和投票标题一样的文本已摘掉：${want}`);
+    slot.texts = kept;
+  }
+}
+
+/**
+ * 这条入站文本是不是刚才那个投票的标题回声。是就该跳过不进队列。
+ *
+ * 认出来就把记录**消掉**（一条标题只压一次）：对方过一会儿真的又打了一遍
+ * 同样的字，那是他自己说的话，该照常送给模型。
+ */
+function isPollTitleEcho(runner, chatGuid, text) {
+  if (!runner.pollTitles.size) return false;
+  const now = Date.now();
+  // 顺手清过期的。这张表只有发起投票时才写，平时是空的，扫一遍不花钱
+  for (const [key, list] of runner.pollTitles) {
+    const live = list.filter((it) => now - it.at <= POLL_TITLE_TTL_MS);
+    if (live.length) runner.pollTitles.set(key, live);
+    else runner.pollTitles.delete(key);
+  }
+
+  const list = runner.pollTitles.get(chatGuid);
+  if (!list?.length) return false;
+  const want = String(text ?? "").trim();
+  if (!want) return false;
+
+  const idx = list.findIndex((it) => it.title === want);
+  if (idx < 0) return false;
+  list.splice(idx, 1);
+  if (list.length) runner.pollTitles.set(chatGuid, list);
+  else runner.pollTitles.delete(chatGuid);
+  return true;
+}
+
+/**
+ * 一个投票事件落地：存盘 + 拼一句系统提示 + 直接进队列。
+ *
+ * ── 为什么不像背景变更那样攒着 ──
+ *
+ * 背景变更和 tapback 都是「存下来等这个人下一条消息」，因为那两件事太轻、
+ * 而且对方多半马上就会说话。投票**不能**这么办：对方在投票里点一下之后
+ * iMessage 压根不会再发文本消息，攒着就等于永远等不到 —— 角色问了「今晚吃
+ * 什么」，就该听见回答。
+ *
+ * 发起投票那次倒是有一条文本（标题）几乎同时到，但那条恰恰是要被压掉的
+ * （见 notePollTitle），更不能指望它来引爆。
+ *
+ * 连点改主意产生的好几条事件由合并窗口自己收敛成一段，不用额外去抖。
+ */
+async function handlePollEvent(getConfig, runner, ev) {
+  const scope = scopeOf(runner, "投票");
+  const config = getConfig();
+  const role = currentRole(config, runner);
+  // 一路走到这儿才发现开关被关了（改配置不重启桥接的那条路）：静静收手
+  if (!role?.poll?.enabled) return;
+
+  const roleKey = memoryKeyFor(role);
+  const { kind, chatGuid, peerKey, pollMessageGuid, title, options } = ev;
+
+  /*
+   * 先落盘，再说话。
+   *
+   * 字母 → optionIdentifier 那张表是角色之后投票的唯一凭据，而「说话」这一步
+   * 会去打模型、可能几十秒，中间进程完全可能被重启掉。顺序反了的话就会出现
+   * 「模型收到了投票、也回了 [vote:B]，但没人知道 B 是哪个 id」。
+   */
+  if (kind === "created" || kind === "optionAdded") {
+    putPoll(roleKey, { pollMessageGuid, chatGuid, peerKey, title, options });
+    // 标题那条文本的压重登记要在「说话」之前做完 —— 它可能已经在队列里躺着了
+    notePollTitle(runner, chatGuid, title);
+  }
+  /*
+   * 拼提示要用的那份。刚存过就是权威的那份（带 mine），没存过（voted/unvoted
+   * 而记录被 MAX_ENTRIES 挤掉了）就退到「这条会话最近那个投票」—— 认不出具体
+   * 是哪个也还能说出「他投了一票」。
+   */
+  const known = findPoll(roleKey, pollMessageGuid) ?? findLatestPoll(roleKey, chatGuid);
+
+  const hint = pollHintFor(kind, ev, known);
+  if (!hint) {
+    logDebug(scope, `这条投票事件（${kind}）没什么可告诉模型的，跳过`);
+    return;
+  }
+
+  const space = await spaceForChat(runner, chatGuid);
+  if (!space) {
+    logWarn(scope, `${chatGuid}：拿不到会话，这条投票提示这次送不进去`);
+    return;
+  }
+  if (runner.stopped) return;
+
+  /*
+   * peer 是「对方的地址」，enqueue 拿它当会话槽的 peer。最近一条入站消息上
+   * 那个是原样的（大小写、格式和 SDK 一致），对得上就优先用；对不上就拿
+   * chatGuid 归一出来的那个当地址 —— 它本身就是个手机号或邮箱。
+   */
+  const last = runner.lastSpace;
+  const peer = last?.peer && peerKeyOf(last.peer) === peerKey ? last.peer : peerKey;
+
+  logInfo(scope, `${hint.replace(/\s+/g, " ")}`);
+  enqueue(getConfig, runner, space, chatGuid, { text: hint }, peer);
+}
+
+/**
+ * 一个投票事件说给模型听是哪一句。
+ *
+ * 格式是用户定的样板（`[vote:A]` 那个写法和 preset.js 的 poll 子条目、
+ * media.js 的 MEDIA_TAG 三处必须一致）。`{{user}}` 留字面量，由
+ * prompt.js:applyVars 在拼提示词时替换 —— 和 takeBgHint 一个规矩。
+ *
+ * 返回空串 = 这条不值得说（认不出选项、或者本来就没上下文）。
+ */
+function pollHintFor(kind, ev, known) {
+  const options = known?.options?.length ? known.options : (ev.options ?? []);
+
+  if (kind === "created") {
+    const title = String(ev.title ?? known?.title ?? "").trim();
+    if (!options.length) return "";
+    return (
+      `[系统提示:{{user}}向你发起了一个投票，注释是："${title}"，选项有${renderOptions(options)}。\n` +
+      `你可以选择投票，格式：[vote:A]。一次只能投一个选项。\n` +
+      `你也可以不投票，直接回复文字即可]`
+    );
+  }
+
+  if (kind === "optionAdded") {
+    if (!options.length) return "";
+    return (
+      `[系统提示:{{user}}给刚才那个投票加了个新选项，现在选项有${renderOptions(options)}。\n` +
+      `你可以选择投票，格式：[vote:A]，也可以不投票]`
+    );
+  }
+
+  // voted / unvoted：delta 里只有 optionIdentifier，选项文字得从存下来的那份查
+  const idx = options.findIndex((o) => o.optionIdentifier === ev.optionIdentifier);
+  const picked = idx >= 0 ? `【${letterFor(idx)}${options[idx].text}】` : "";
+  const where = known?.mine ? "在你发起的投票里" : "在那个投票里";
+
+  if (kind === "voted") {
+    // 认不出是哪个选项也照样报一句 —— 「他投了票」这件事本身就是信息
+    return picked
+      ? `[系统提示:{{user}}${where}投了${picked}]`
+      : `[系统提示:{{user}}${where}投了一票]`;
+  }
+  return picked
+    ? `[系统提示:{{user}}把${where}投的${picked}撤回了]`
+    : `[系统提示:{{user}}把${where}投的票撤回了]`;
+}
+
 async function startRunner(getConfig, project, meta, retries = 0) {
   const runner = createRunner(project.id);
   Object.assign(runner, meta);
@@ -5708,6 +6193,7 @@ async function startRunner(getConfig, project, meta, retries = 0) {
     );
 
     startBgWatcher(getConfig, runner, project, scope);
+    startPollWatcher(getConfig, runner, project, scope);
 
     /*
      * 探一下这条线路的号码有没有真的注册成 iMessage。
@@ -5977,6 +6463,31 @@ async function startRunner(getConfig, project, meta, retries = 0) {
               logDebug(scope, `忽略一条 ${message.content?.type ?? "未知"} 类型的消息`);
               continue;
             }
+
+            /*
+             * 发起投票时那行标题会作为一条**独立的普通文本消息**再来一次，
+             * 在这儿把它吞掉（整个来龙去脉见 notePollTitle）。
+             *
+             * 位置在去重之后、noteInbound 之前：这条消息对模型来说压根不存在，
+             * 也就不该进 `[reply:N]` 那个环形缓冲去占一格。但 noteSeen 照打 ——
+             * 同一条消息要是被推送重投一次，别又跑一遍这套判断。
+             *
+             * 只认纯文本（带附件的不算）：投票标题不会带附件，而一张图配的
+             * 文字恰好和标题一样时，那张图绝不能跟着被吞掉。
+             */
+            if (
+              userText &&
+              !imageParts.length &&
+              !audioParts.length &&
+              !videoParts.length &&
+              !docParts.length &&
+              isPollTitleEcho(runner, spaceId, userText)
+            ) {
+              if (message.id) noteSeen(runner, message.id);
+              logDebug(scope, "这条文本就是刚才那个投票的标题，不重复送给模型");
+              continue;
+            }
+
             if (message.id) noteSeen(runner, message.id);
 
             // 存进环形缓冲：后面 [reply:N] / [reply:原文] 要靠它找回这条
@@ -6208,6 +6719,95 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                   },
                   peer
                 );
+              }
+            }
+
+            /*
+             * 手写消息 / Digital Touch：把那条气泡的内容取回来，当一张图去识别。
+             *
+             * 上面 cardHint 那一段已经认出这是什么了，模型也已经收到
+             * `[系统提示:{{user}}发来了一条手写消息]`。缺的是**内容** ——
+             * 手写消息里那几个字是对方真正说的话，只说「有这么一条」等于把话丢了。
+             *
+             * 这些气泡**既没有正文也没有附件**（所以走不到上面那个 imageParts
+             * 循环），字节压在一个私有 payload 里，只有 Photon 的
+             * getEmbeddedMedia 取得到（见 card.js:fetchEmbeddedMedia）。
+             *
+             * 三道闸，缺一个就一个字节都不取：
+             *  - 角色开着 handwriting（默认关，每条这种消息要多打一次识图模型）
+             *  - 云端模式（本地 Mac 没这条 RPC）
+             *  - 识图模型开着 —— 取回来没人看就是纯浪费。和视频那条路同一个规矩
+             *    （见下面 videoOn 那段），现读现判，用户随时可能改配置。
+             *
+             * **取不到、或者取回来不是图片就什么都不做**，上面那句系统提示照常
+             * 生效。Digital Touch 回的到底是静态图还是别的东西我没有实物验过，
+             * 这条退路必须留着 —— 别为了多一句描述把已经能用的那句话弄丢。
+             */
+            const embedKind = embeddedKindOf(message?.balloonBundleId);
+            if (embedKind && message.id) {
+              const who = currentRole(getConfig(), runner);
+              const embedWhat = embedKind === "handwriting" ? "手写消息" : "Digital Touch";
+              if (!who?.handwriting?.enabled) {
+                logDebug(scope, `收到一条${embedWhat}，但这个角色没开「看手写和 Digital Touch」，不取内容`);
+              } else if (runner.mode !== "cloud") {
+                logDebug(scope, `收到一条${embedWhat}，本地 Mac 模式取不到它的内容`);
+              } else if (!resolveRoleEndpoints(getConfig(), who).vision) {
+                logInfo(scope, `收到一条${embedWhat}，但这个角色没启用识图，不取内容`);
+              } else {
+                const media = await fetchEmbeddedMedia({
+                  projectId: project.projectId,
+                  projectSecret: project.projectSecret,
+                  chatGuid: spaceId,
+                  messageGuid: String(message.id),
+                  scope,
+                });
+                const mime = media?.mimeType ?? "";
+                if (!media) {
+                  logDebug(scope, `这条${embedWhat}的内容没取回来，只给那句系统提示`);
+                } else if (!mime.startsWith("image/")) {
+                  logInfo(
+                    scope,
+                    `这条${embedWhat}的内容不是图片（${mime || "没报类型"}），看不了，只给那句系统提示`
+                  );
+                } else if (media.buffer.length > MAX_IMAGE_BYTES) {
+                  logWarn(
+                    scope,
+                    `这条${embedWhat}的内容有 ${(media.buffer.length / 1024 / 1024).toFixed(1)}MB，超过上限，不识别`
+                  );
+                } else {
+                  // 压小再识别，和 readImage 走的是同一条（压不动时原样退回）
+                  const small = await shrinkForVision(media.buffer, {
+                    mimeType: mime,
+                    name: embedWhat,
+                    scope,
+                  });
+                  logInfo(scope, `取到这条${embedWhat}的内容，进队列等识别`);
+                  enqueue(
+                    getConfig,
+                    runner,
+                    space,
+                    spaceId,
+                    {
+                      image: {
+                        base64: small.buffer.toString("base64"),
+                        mimeType: small.mimeType,
+                        name: embedWhat,
+                        // 必须用专用提示词：通用那句问的是「描述这张图片」，
+                        // 拿它去看手写消息，模型会答「一张蓝色的手写字迹」而不是
+                        // 把字读出来（见 config.js 那两个常量）
+                        prompt:
+                          embedKind === "handwriting"
+                            ? DEFAULT_HANDWRITING_PROMPT
+                            : DEFAULT_DIGITAL_TOUCH_PROMPT,
+                        // 于是模型看到的是「手写消息内容：今晚一起吃饭吗」
+                        label: embedWhat,
+                      },
+                      message,
+                    },
+                    peer
+                  );
+                  imagesSent += 1;
+                }
               }
             }
 
@@ -6697,6 +7297,18 @@ async function stopRunner(runner) {
     }
     runner.bgWatcher = null;
   }
+  // 投票订阅同理，也是一条独立的 gRPC 连接（见 startPollWatcher）
+  if (runner.pollWatcher) {
+    try {
+      runner.pollWatcher.stop();
+    } catch {
+      /* ignore */
+    }
+    runner.pollWatcher = null;
+  }
+  // 待压的投票标题：只活在这一次连接里。留着的话重连后第一条恰好同名的
+  // 真消息会被莫名吞掉（磁盘上那份投票记录不受影响，照旧能投）
+  runner.pollTitles?.clear();
   runner.bgPending.clear();
   // 待认领的 tapback 同理：这条线路都停了，重连后再补报一句「刚才给你贴了个👍」
   // 只会莫名其妙

@@ -166,6 +166,87 @@ export function parseBalloon(balloonBundleId) {
 }
 
 /**
+ * 这两种气泡的内容是**能取回来的**，别的都不行。
+ *
+ * Photon 的 `messages.getEmbeddedMedia` 文档原话是 "Fetch embedded media bytes
+ * for a supported Digital Touch or handwritten message" —— 只这两种。别的气泡
+ * （Apple Cash、第三方卡片）拿它去问只会白打一次 RPC。
+ */
+const EMBEDDED_KINDS = {
+  "com.apple.Handwriting.HandwritingProvider": "handwriting",
+  "com.apple.DigitalTouchBalloonProvider": "digitalTouch",
+};
+
+/**
+ * 这条气泡的内容取不取得回来，取得回来的是哪一种。
+ *
+ * 全等匹配、不做前缀：这两个 id 是苹果自家钉死的常量，前缀匹配只会让
+ * 别人家某个恰好同前缀的扩展被误当成手写消息，然后拿手写那句提示词去问一张
+ * 不是手写的图。
+ *
+ * @param {string} bundleId 消息的 balloonBundleId
+ * @returns {"handwriting" | "digitalTouch" | ""} 空串 = 这条取不回来
+ */
+export function embeddedKindOf(bundleId) {
+  const raw = String(bundleId ?? "").trim();
+  if (!raw) return "";
+  return Object.hasOwn(EMBEDDED_KINDS, raw) ? EMBEDDED_KINDS[raw] : "";
+}
+
+/**
+ * 去底层 gRPC 把手写 / Digital Touch 那条气泡的字节取回来。
+ *
+ * 逐条照 fetchCardDetail：临时开客户端、专线模式挨个线路试、第一条取到就收工、
+ * `finally` 里关掉、失败一律 logDebug 返回 null。理由也一样 —— 这种消息不常见，
+ * 不值得为它留一条长连接；取不到不是错，上一级还有那句「发来了一条手写消息」
+ * 兜着。
+ *
+ * @param {object} opts
+ * @param {string} opts.projectId
+ * @param {string} opts.projectSecret
+ * @param {string} opts.chatGuid 这条消息所在的会话（Spectrum 的 spaceId 就是它）
+ * @param {string} opts.messageGuid
+ * @param {string} [opts.scope] 日志前缀
+ * @returns {Promise<null | {buffer: Buffer, mimeType: string}>}
+ */
+export async function fetchEmbeddedMedia({
+  projectId,
+  projectSecret,
+  chatGuid,
+  messageGuid,
+  scope = "卡片",
+}) {
+  if (!projectId || !projectSecret || !chatGuid || !messageGuid) return null;
+  let opened = [];
+  try {
+    opened = await createLineClients(projectId, projectSecret, { timeout: DETAIL_TIMEOUT_MS });
+    for (const { client, instanceId } of opened) {
+      try {
+        const media = await client.messages.getEmbeddedMedia(chatGuid, messageGuid);
+        // data 是 Uint8Array（见 SDK 的 mapEmbeddedMedia），Buffer.from 不拷贝底层
+        const bytes = media?.data;
+        if (!bytes?.length) {
+          logDebug(scope, `线路 ${instanceId} 上这条气泡的内容是空的`);
+          continue;
+        }
+        return {
+          buffer: Buffer.from(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength ?? bytes.length),
+          mimeType: String(media.mimeType ?? "").trim(),
+        };
+      } catch (e) {
+        logDebug(scope, `线路 ${instanceId} 上取不到这条气泡的内容：${String(e?.message ?? e)}`);
+      }
+    }
+    return null;
+  } catch (e) {
+    logDebug(scope, `取气泡内容失败：${String(e?.message ?? e)}`);
+    return null;
+  } finally {
+    await closeClients(opened);
+  }
+}
+
+/**
  * bundleId → app 名。
  *
  * 扩展的 bundleId 一般是「主 app 的 id + 一截后缀」（网易云那个是

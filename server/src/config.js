@@ -87,6 +87,36 @@ export const DEFAULT_VIDEO_PROMPT =
   "只写你确实看到和听到的内容，看不清就直说看不清，禁止凭空推测或补全。";
 
 /**
+ * 看**手写消息**的提示词。
+ *
+ * 为什么不能拿 DEFAULT_VISION_PROMPT 凑：那句要的是「描述这张图片」，
+ * 拿它去看手写消息，模型会老老实实答「一张深色背景上的蓝色手写字迹」——
+ * 而手写消息里那几个字**就是对方说的话**，描述笔迹等于把话丢了。
+ *
+ * 所以这句只要一件事：把字读出来。结尾那句「读不出来就直说」和听音、
+ * 看视频那几段同一个理由 —— 字迹潦草时模型会顺着笔画编一句通顺的话。
+ */
+export const DEFAULT_HANDWRITING_PROMPT =
+  "这是一条 iMessage 手写消息的图片。请逐字读出上面写的内容，只输出文字本身。\n" +
+  "不要描述笔迹、颜色或背景，不要加任何开场白或解释。\n" +
+  "如果有几行，按行输出；如果某处实在认不出来，那几个字写【看不清】，禁止猜测或补全。";
+
+/**
+ * 看 **Digital Touch** 的提示词。
+ *
+ * Digital Touch 是一组固定的手势动画（心跳、火球、亲吻、心碎、涂鸦…），
+ * 所以这句话给的是**选项**而不是「随便描述」—— 模型拿着清单去认，比自由
+ * 描述准得多，也让下游那句话短到能直接进上下文。
+ *
+ * 颜色单独要一句：Digital Touch 的颜色是发的人挑的，「红色的心跳」和
+ * 「灰色的心跳」在对话里不是一回事。
+ */
+export const DEFAULT_DIGITAL_TOUCH_PROMPT =
+  "这是一条 iMessage Digital Touch 消息的图片。用一句中文说清两件事：" +
+  "这是哪一种（心跳、火球、亲吻、心碎、点触、涂鸦，认不出就写涂鸦），以及主要的颜色。\n" +
+  "只输出那一句，不要加开场白，控制在 30 字以内。看不清就直说看不清，禁止猜测。";
+
+/**
  * 主动消息的默认提示词（以系统身份直接发给模型的那条 user 消息）。
  * 留空 = 还原成这句，和记忆库那几段一个规矩（见 normalizeProactive）。
  */
@@ -1134,6 +1164,11 @@ function normalizeRole(input, id, legacy) {
     // 聊天背景变更提示：对方换了 iMessage 背景就在下一条消息里带一句系统提示，
     // 见下面那个函数（也见 chatbg.js）
     chatBackground: normalizeChatBackground(input?.chatBackground),
+    // 投票：认出对方发起的投票、能投票、也能自己发起。一个开关管这三件事，
+    // 见下面那个函数（也见 poll.js）
+    poll: normalizePoll(input?.poll),
+    // 手写消息 / Digital Touch 看内容：取那条气泡的字节送去识图，见下面那个函数
+    handwriting: normalizeHandwriting(input?.handwriting),
     // 记忆库：三个开关 + 日记注入几天。设置全在全局的 config.memories
     memories: normalizeRoleMemories(input?.memories),
     // 主动消息：隔一阵子自己开口。默认关，见下面那个函数
@@ -1641,6 +1676,56 @@ function normalizeTransfer(input) {
  * 和 handleUserUnsend 里那句撤回提示一个规矩。
  */
 function normalizeChatBackground(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+  };
+}
+
+/**
+ * 投票：一个开关管三件事 —— 认出对方发起的投票（含全部选项）、角色能投票
+ * （`[vote:A]`）、角色能自己发起投票（`[poll:注释|A|B|C]`）。
+ *
+ * **默认关**，理由和 chatBackground 逐字相同：开着就意味着这个角色会为每条线路
+ * **常驻一个 gRPC 连接**去订阅 poll 事件。Spectrum 的 provider 虽然订阅了 poll 流，
+ * 但它只把投票/撤票转成消息，「对方发起了一个投票、选项有哪几个」从设计上就
+ * 拿不到（见 poll.js 的文件头）。不该由一份全局设置替所有角色决定要不要付这个代价。
+ *
+ * **只支持云端 Photon 模式**：入站要裸 gRPC（本地 Mac 没有铸币流程），出站
+ * `@spectrum-ts/imessage-local` 的 poll 分支直接抛 unsupportedLocalContent。
+ * 本地模式下开着这个开关只会在日志里得到一句提醒，发起投票退化成一句文字。
+ *
+ * 为什么三件事不拆成三个开关：对用户来说这就是「这个角色会不会用投票」一件事，
+ * 而三件事共用同一条连接和同一份落盘（data/polls/），拆开只会让人多勾两次。
+ *
+ * **一次只能投一个选项**，这是苹果那边的规矩不是我们的选择：Photon 的 `vote`
+ * 文档原话是 "casts or changes the local account's vote"，`unvote` 连选项 id 都
+ * 不用传 —— 一个账号一票。所以提示词里只教单选（见 preset.js 的 poll 子条目）。
+ */
+function normalizePoll(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+  };
+}
+
+/**
+ * 手写消息 / Digital Touch 看内容。
+ *
+ * 这两种气泡**本来就认得出**（card.js:APPLE_BALLOONS），现在给的是
+ * `[系统提示:{{user}}发来了一条手写消息]` —— 模型知道有这么一条，但一个字
+ * 都读不到。手写消息里那几个字是对方真正说的话，这个亏最大。
+ *
+ * 开了之后：去底层 gRPC 取那条气泡的 embedded media 字节
+ * （`messages.getEmbeddedMedia`），是图片就走现成的识图链路，配一句**专用**
+ * 提示词（DEFAULT_HANDWRITING_PROMPT / DEFAULT_DIGITAL_TOUCH_PROMPT）。
+ * 拿不到字节、或者取回来不是图片，就退回现在那句系统提示 —— 那条退路必须留着。
+ *
+ * **默认关**，理由和识图一样：每条这种消息都要多打一次识图模型，那是花钱的。
+ * 关着的时候压根不取字节。
+ *
+ * 只支持云端模式（本地 Mac 没有这条 RPC），而且要角色的识图模型也开着 ——
+ * 没有识图模型的话取回来的字节没人看，所以那种情况下同样不取。
+ */
+function normalizeHandwriting(input) {
   return {
     enabled: Boolean(input?.enabled),
   };

@@ -37,17 +37,23 @@ const RETRY_MAX_MS = 10 * 60_000;
 /**
  * 把 `any;-;+18005550100` / `iMessage;-;a@b.com` 归一成手机号或邮箱。
  *
- * 事件里带的 chatGuid 是这个形状（见 SDK 的 dmChatGuid）。群聊（`chat;+1...`
- * 或者 `;iMessage;chat123`）不是一对一，换背景这事也只对得上一个人，所以这里
- * 只认单聊，认不出就返回空串 —— 空串的键配上「一对一」的判断，群聊自然被排除。
+ * 事件里带的 chatGuid 是这个形状（见 SDK 的 dmChatGuid）。群聊不是一对一，
+ * 换背景、投票这些事也只对得上一个人，所以这里只认单聊，认不出就返回空串
+ * —— 空串的键配上「一对一」的判断，群聊自然被排除。
+ *
+ * **按分隔符判单聊/群聊，不靠末段猜。** SDK 自己就是这么分的
+ * （`chatTypeFromGuid = (guid) => guid.includes(";+;") ? "group" : "dm"`）。
+ * 光看末段会栽在群聊上：`iMessage;+;chat123456` 的末段滤掉非数字剩
+ * `123456`，六位，正好够长 —— 于是一个群被当成了某个人的号码，这一屋子人
+ * 的投票和背景变更全记到那个不存在的「人」头上去。
  */
 export function peerKeyFromChatGuid(guid) {
   const raw = String(guid ?? "");
   if (!raw) return "";
-  const parts = raw.split(";");
-  // 单聊是 `服务;-;地址`；群聊第三段是 chat 的标识而不是地址
-  if (parts.length < 3) return "";
-  const peer = parts[parts.length - 1].trim();
+  if (raw.includes(";+;")) return "";
+  const at = raw.indexOf(";-;");
+  if (at < 0) return "";
+  const peer = raw.slice(at + 3).trim();
   if (!peer) return "";
   if (peer.includes("@")) return peer.toLowerCase();
   const digits = peer.replace(/[^\d+]/g, "");
