@@ -121,6 +121,10 @@ const photon = {
   /** getEmbeddedMedia 还什么 */
   embedded: null,
   embeddedThrows: false,
+  /** getEmbeddedMedia 被叫了几次（验重试） */
+  embeddedCalls: 0,
+  /** 前几次调用抛错（验「第一次失败会再试一次」） */
+  embeddedThrowTimes: 0,
   /** createGrpcClient 收到的 opts，验超时有没有传下去 */
   clientOpts: [],
 };
@@ -162,7 +166,11 @@ mock.module("@photon-ai/advanced-imessage/grpc", {
         },
         messages: {
           getEmbeddedMedia: async (chatGuid, messageGuid) => {
-            if (photon.embeddedThrows) throw new Error("取不到");
+            photon.embeddedCalls += 1;
+            // 只让前 N 次抛（N = throwTimes）—— 用来验「第一次超时会再试一次」
+            if (photon.embeddedThrows || photon.embeddedCalls <= photon.embeddedThrowTimes) {
+              throw new Error("取不到");
+            }
             photon.embedded = { ...(photon.embedded ?? {}), asked: { chatGuid, messageGuid } };
             return photon.embedded?.reply ?? null;
           },
@@ -1086,6 +1094,64 @@ await okAsync("取字节：取不到 / 空字节 / 抛错都返回 null（不是
   photon.embeddedThrows = false;
 });
 
+/*
+ * 第一次失败要**再试一次**。
+ *
+ * 共享线路模式下只有一条线路，于是「一次超时」等于「彻底放弃」—— 而这是间歇性
+ * 的：用户连发两条 Digital Touch，第一条 7 秒取回来了，第二条直接
+ * `The operation was aborted due to timeout`，角色就只收到「发来了一条
+ * Digital Touch」，回一句「这是什么/看不出来」。
+ */
+await okAsync("取字节：第一次失败会再试一次（一条线路不能一次就放弃）", async () => {
+  photon.embeddedCalls = 0;
+  photon.embeddedThrowTimes = 1; // 第一次抛，第二次成功
+  photon.embedded = { reply: { data: new Uint8Array([7, 8]), mimeType: "image/png" } };
+  const got = await CARD.fetchEmbeddedMedia({
+    projectId: "p",
+    projectSecret: "s",
+    chatGuid: CHAT,
+    messageGuid: "M-1",
+  });
+  photon.embeddedThrowTimes = 0;
+  assert.ok(got, "第一次失败就放弃了，没重试");
+  assert.deepEqual([...got.buffer], [7, 8]);
+  assert.equal(photon.embeddedCalls, 2, "重试次数不对");
+});
+
+/* 但只重一次 —— 这条路在收消息那一轮里同步等着，不能没完没了。 */
+await okAsync("取字节：只重一次，不无限重", async () => {
+  photon.embeddedCalls = 0;
+  photon.embeddedThrows = true;
+  const got = await CARD.fetchEmbeddedMedia({
+    projectId: "p",
+    projectSecret: "s",
+    chatGuid: CHAT,
+    messageGuid: "M-1",
+  });
+  photon.embeddedThrows = false;
+  assert.equal(got, null);
+  assert.equal(photon.embeddedCalls, 2, "重试次数不对（该是 2 次：一次原始 + 一次重试）");
+});
+
+/*
+ * 「内容是空的」不重试：那是服务端明确说了没有，再问一遍还是没有。
+ * 不挡的话每条这种消息都要白等一整轮超时。
+ */
+await okAsync("取字节：内容是空的不重试（服务端说了没有，再问也没有）", async () => {
+  photon.embeddedCalls = 0;
+  photon.embedded = { reply: { data: new Uint8Array([]), mimeType: "image/png" } };
+  assert.equal(
+    await CARD.fetchEmbeddedMedia({
+      projectId: "p",
+      projectSecret: "s",
+      chatGuid: CHAT,
+      messageGuid: "M-1",
+    }),
+    null
+  );
+  assert.equal(photon.embeddedCalls, 1, "空内容不该重试");
+});
+
 await okAsync("取字节：用完就关客户端", async () => {
   photon.embedded = { reply: { data: new Uint8Array([1]), mimeType: "image/png" } };
   const before = photon.closedClients;
@@ -1109,11 +1175,27 @@ okWith("手写那句提示词是「读出内容」，不是「描述图片」", 
   assert.ok(!hw.includes("描述这张图片"));
 });
 
-okWith("Digital Touch 那句提示词问的是「哪一种 + 什么颜色」", () => {
+okWith("Digital Touch 那句提示词问的是「哪一种 + 什么颜色 + 涂鸦画了什么」", () => {
   const dt = C.DEFAULT_DIGITAL_TOUCH_PROMPT;
   // 心跳/火球/亲吻/心碎那几种得列出来，不列模型答不出专有名词
   assert.ok(/心跳/.test(dt) && /火球/.test(dt) && /亲吻/.test(dt) && /心碎/.test(dt));
   assert.ok(/颜色/.test(dt));
+  /*
+   * **涂鸦必须问内容。** 原来这句话只要「是哪一种 + 什么颜色」，于是用户手画了
+   * 一个爱心、一个猪头，模型两次都只回「这是一个红色的涂鸦」—— 答得没错，画的
+   * 是什么却压根没被要求说，角色只能回「画的什么烂玩意」。
+   *
+   * 涂鸦是这几种里唯一内容不固定的：心跳就是心跳，涂鸦可能是任何东西。
+   */
+  /*
+   * 钉的是那条**要求**，不是随便一处「画的是什么」—— 末尾那句「实在认不出画的
+   * 是什么就描述线条形状」里也有这五个字，只查它的话把要求删掉这条照样绿。
+   */
+  assert.ok(/必须说出画的是什么/.test(dt), "没让它说出涂鸦画的是什么");
+  assert.ok(/别只说/.test(dt), "没挡住「一个涂鸦」这种答法");
+  // 要塞下「画了什么」就得给位置，30 字不够
+  const limit = Number(dt.match(/控制在\s*(\d+)\s*字/)?.[1] ?? 0);
+  assert.ok(limit >= 60, `字数上限 ${limit} 太紧，塞不下「画了什么」`);
 });
 
 okWith("两个开关都归一成 {enabled:boolean}，默认关", () => {

@@ -232,22 +232,45 @@ export async function fetchEmbeddedMedia({
   let opened = [];
   try {
     opened = await createLineClients(projectId, projectSecret, { timeout: EMBEDDED_TIMEOUT_MS });
-    for (const { client, instanceId } of opened) {
-      try {
-        const media = await client.messages.getEmbeddedMedia(chatGuid, messageGuid);
-        // data 是 Uint8Array（见 SDK 的 mapEmbeddedMedia），Buffer.from 不拷贝底层
-        const bytes = media?.data;
-        if (!bytes?.length) {
-          logDebug(scope, `线路 ${instanceId} 上这条气泡的内容是空的`);
-          continue;
+    /*
+     * 整轮重试一次。
+     *
+     * 每条线路只试一次是不够的：共享线路模式下 `opened` 里**只有一条**，于是
+     * 「一次超时」等于「彻底放弃」。而实测这是间歇性的 —— 同一个人连发两条
+     * Digital Touch，第一条 7 秒就取回来了，第二条直接超时。
+     *
+     * 只重一次，而且不退避等待：这条路在**收消息**那一轮里同步等着，等太久
+     * 对方会觉得没人理。最坏情况是 2 × EMBEDDED_TIMEOUT_MS。
+     *
+     * 「内容是空的」不算失败，不重试 —— 那是服务端明确说了没有，再问一遍
+     * 还是没有。
+     */
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      let retriable = false;
+      for (const { client, instanceId } of opened) {
+        try {
+          const media = await client.messages.getEmbeddedMedia(chatGuid, messageGuid);
+          // data 是 Uint8Array（见 SDK 的 mapEmbeddedMedia），Buffer.from 不拷贝底层
+          const bytes = media?.data;
+          if (!bytes?.length) {
+            logDebug(scope, `线路 ${instanceId} 上这条气泡的内容是空的`);
+            continue;
+          }
+          return {
+            buffer: Buffer.from(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength ?? bytes.length),
+            mimeType: String(media.mimeType ?? "").trim(),
+          };
+        } catch (e) {
+          retriable = true;
+          logDebug(
+            scope,
+            `线路 ${instanceId} 上取不到这条气泡的内容（第 ${attempt} 次）：${String(e?.message ?? e)}`
+          );
         }
-        return {
-          buffer: Buffer.from(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength ?? bytes.length),
-          mimeType: String(media.mimeType ?? "").trim(),
-        };
-      } catch (e) {
-        logDebug(scope, `线路 ${instanceId} 上取不到这条气泡的内容：${String(e?.message ?? e)}`);
       }
+      // 一条都没报错（全是「内容是空的」）就别白试第二遍
+      if (!retriable) break;
+      if (attempt === 1) logDebug(scope, "再试一次取这条气泡的内容");
     }
     return null;
   } catch (e) {
