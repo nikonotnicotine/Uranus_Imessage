@@ -2565,6 +2565,45 @@ function RoleTransferFields({ role }) {
           />
         </label>
       )}
+
+      {/*
+        一直没收款就提醒一次。同样只在「贴表情算收款」开着时才出现 ——
+        关了那个开关，卡片就永远停在「待收款」，「一直没收」也就不成立了。
+      */}
+      {tr.confirmOnReact !== false && (
+        <label className="flex items-start justify-between gap-4">
+          <span className="min-w-0">
+            <span className="block text-ui text-ink">一直没收款就提醒角色</span>
+            <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+              转出去那笔过了下面这么久还没被收，就给角色<b>提醒一次</b>
+              （「你转的钱还没被领」那种），它自己决定要不要问一句。
+              <br />
+              <b>只提醒一次</b>，不会隔一阵催一遍 —— 关心和讨债差的就是第二遍。
+              这个「提醒过了」是记在硬盘上的，中间重启多少次也还是只有那一次。
+              <br />
+              收了款、或者你中途把这个开关关了，那笔就不提醒了。默认关着。
+            </span>
+          </span>
+          <Switch
+            checked={Boolean(tr.remindOnPending)}
+            onChange={(v) => updateRole(role.id, { transfer: { ...tr, remindOnPending: v } })}
+            label="一直没收款就提醒"
+          />
+        </label>
+      )}
+
+      {tr.confirmOnReact !== false && tr.remindOnPending && (
+        <NumberField
+          label="等多久才提醒"
+          value={tr.remindMinutes ?? 120}
+          min={1}
+          max={1440}
+          step={10}
+          suffix="分钟"
+          hint="从卡片发出去那一刻算起。默认 120 分钟；最多 1440（一整天）—— 再久那笔转账早翻出上下文了，提起来角色自己也接不上"
+          onChange={(v) => updateRole(role.id, { transfer: { ...tr, remindMinutes: v } })}
+        />
+      )}
     </div>
   );
 }

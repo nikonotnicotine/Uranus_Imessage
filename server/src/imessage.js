@@ -53,6 +53,7 @@ import {
   toMp3ForStt,
 } from "./media.js";
 import { resolveMusic } from "./music.js";
+import { clampInt } from "./normalize.js";
 import { presetLabel, resolvePreset } from "./preset.js";
 import {
   manualDiary,
@@ -104,7 +105,7 @@ import {
   stripSpyTags,
 } from "./spy.js";
 import { renderLogo } from "./transferlogo.js";
-import { findTransfer, putTransfer } from "./transferstore.js";
+import { findTransfer, putTransfer, readTransfers } from "./transferstore.js";
 import { parseSearchQueries, runSearch, stripSearchTags } from "./websearch.js";
 
 /**
@@ -341,6 +342,11 @@ function createRunner(projectRefId) {
     // 同一个路子，区别是**存数组** —— 一个人可以连着贴好几条，
     // 一条一条报给模型才说得清「哪句话被贴了什么」。见 takeReactHints
     reactPending: new Map(),
+    // 「转出去一直没人收」的提醒定时器，按 `角色key::卡片guid` 索引。
+    // 这张表**只是内存里的排期**，「提醒过了没有」那个事实记在磁盘上
+    // （transferstore 的 reminded）—— 只提醒一次这件事不能靠定时器保证，
+    // 定时器活不过重启。见 armTransferRemind
+    transferRemind: new Map(),
     stopped: false, // stopBridge 之后消息循环要认得出自己已经过期
     retries: 0, // 连续失败了几次，决定下次等多久（见 RETRY_DELAYS）
     retryTimer: null, // 待触发的自动重连
@@ -3440,6 +3446,8 @@ async function handleTurn(
       spaceId,
       // 投递检测要拿它去查「这条到底送到没有」，以及探这个地址支不支持 iMessage
       peer,
+      // 转账那条路要它：排「一直没收款就提醒一次」的定时器，到点得能重读配置
+      getConfig,
     });
 
     /*
@@ -3632,6 +3640,8 @@ async function commitIgTurn(getConfig, runner, role, outcome) {
             // 引用和撤回要按 spaceId 去查两个环形缓冲（见 sendBubbles 的注释）
             spaceId,
             peer,
+            // 转账那条路排「一直没收款就提醒一次」要它（见 sendTransferPart）
+            getConfig,
           }
         );
         // 判 acted 不判 sent：只贴了个 [react:] 的那轮也算做了事（见 sendBubbles）
@@ -4323,6 +4333,8 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
       // 引用和撤回要按 spaceId 去查两个环形缓冲（见 sendBubbles 的注释）
       spaceId,
       peer,
+      // 转账那条路排「一直没收款就提醒一次」要它（见 sendTransferPart）
+      getConfig,
     });
     if (!acted) {
       logWarn(scope, `这条主动消息一件事都没做成（${failed || "没有内容"}）`);
@@ -4663,6 +4675,227 @@ async function sendTransferText(runner, space, ctx, amount, note, scope, why) {
   }
 }
 
+/* ================= 转出去一直没人收：提醒一次 ================= */
+
+/**
+ * 那张内存表的键。一个角色可以同时挂着好几笔没收的，所以角色 key 还不够，
+ * 得连卡片的 guid 一起。
+ */
+function remindKey(roleKey, guid) {
+  return `${roleKey}::${guid}`;
+}
+
+/** 撤掉某一笔的提醒排期（收款了、或者线路停了）。只动内存。 */
+function disarmTransferRemind(runner, roleKey, guid) {
+  const key = remindKey(roleKey, guid);
+  const timer = runner.transferRemind?.get(key);
+  if (timer) clearTimeout(timer);
+  runner.transferRemind?.delete(key);
+}
+
+/**
+ * 排一笔「到点还没收款就提醒角色一次」。
+ *
+ * ── 为什么不能只靠这个定时器保证「只提醒一次」──
+ *
+ * 定时器活不过重启，而这个功能的等待窗口默认是两小时 —— 那两小时里进程重启一次
+ * 是很正常的事。所以重启后必须把它捞回来接着数（rehydrateTransferReminders），
+ * 而一旦有了「捞回来」这一步，「提醒过了」就不能只是「定时器已经不在了」——
+ * 那两件事在重启之后长得一模一样。判据只能在磁盘上：那笔转账的 `reminded`。
+ *
+ * 所以这里排的定时器只负责**什么时候去看一眼**，去不去说话由
+ * remindTransferPending 现读磁盘决定。
+ *
+ * @param {number} [delayMs] 指定还等多久；不给就按配置算整段（重启接着数时要传）
+ */
+function armTransferRemind(getConfig, runner, roleKey, guid, delayMs) {
+  if (runner.stopped) return;
+  /*
+   * 拿不到 getConfig 就不排。
+   *
+   * 到点那一下**必须**重读配置（这中间过了两小时，开关可能已经关了），所以没有
+   * 它就没有能安全执行的提醒。排一个注定要崩的定时器不如干脆不排 ——
+   * sendBubbles 的 ctx 是各条调用路径自己拼的，漏一处这里就得兜住。
+   */
+  if (typeof getConfig !== "function" || !roleKey || !guid) return;
+  const wait = Number.isFinite(delayMs) ? Math.max(delayMs, 0) : null;
+
+  disarmTransferRemind(runner, roleKey, guid);
+  const key = remindKey(roleKey, guid);
+  const timer = setTimeout(() => {
+    runner.transferRemind?.delete(key);
+    void remindTransferPending(getConfig, runner, roleKey, guid);
+  }, wait ?? 0);
+  // 和主动消息那张表同一个理由：不该由它决定进程能不能退出
+  timer.unref?.();
+  runner.transferRemind?.set(key, timer);
+}
+
+/**
+ * 到点了：这笔还没收款的话，提醒角色一次。
+ *
+ * 每一道判都是**此刻**重新读的，因为这中间过了两个小时：用户可能已经把开关关了、
+ * 把角色换了、或者早就收了款。
+ *
+ * ── 为什么先落 reminded 再说话 ──
+ *
+ * 落盘写在 enqueue **之前**：那一句进了队列就等于这次提醒已经发生了，先说话
+ * 再落盘的话，中间崩一次就会重启后再提醒一遍。反过来「落了盘但那句没送出去」
+ * 最多是这笔转账没被提醒 —— 一个不该发生两次的提醒，宁可零次。
+ *
+ * ── 勿扰 / 协助 / 线下怎么办 ──
+ *
+ * 和 fireProactive 那三道闸一样是**推迟**而不是取消（推迟就是重排一个定时器，
+ * reminded 还没落，所以这一次提醒还在账上）。区别只在勿扰：那边推到时段结束，
+ * 这边也一样 —— 半夜把角色叫起来说「钱还没收」和主动消息一个性质。
+ */
+async function remindTransferPending(getConfig, runner, roleKey, guid) {
+  if (runner.stopped) return;
+  const scope = scopeOf(runner, "转账");
+  const config = getConfig();
+  const role = currentRole(config, runner);
+
+  // 角色被解绑/换人了：这笔的账跟着作废（磁盘上那条留着，它还要能收款）
+  if (!role || memoryKeyFor(role) !== roleKey) return;
+
+  const tr = role.transfer;
+  // 开关中途关了、或者整个转账功能关了 —— 不提醒，也不落 reminded：
+  // 用户再打开的话这笔已经错过窗口了，但至少不留一个「提醒过了」的假记录
+  if (!tr?.enabled || !tr.remindOnPending) return;
+
+  const hit = findTransfer(roleKey, guid);
+  if (!hit) return; // 记录被挤掉了（MAX_ENTRIES），没法说清是哪笔
+  if (hit.state === "received") return; // 已经收了，这就是这个功能最常见的结局
+  if (hit.reminded) {
+    // 正常走不到：排期那会儿就滤过一遍了。留着是因为「只提醒一次」这件事
+    // 值得在真正开口前再问一遍磁盘
+    logDebug(scope, "这笔转账早就提醒过了，不提醒第二遍");
+    return;
+  }
+
+  /*
+   * 往哪条会话说。
+   *
+   * 优先用那笔存下来的 peerKey —— 转账是发给具体某个人的，提醒当然要回到
+   * 同一条会话里去。（这也是 peerKey 这个字段第一个真正的读者：以前只存不读。）
+   * 拿不到就退到「这个号最近一条入站消息所在的会话」，那是 runner 上唯一一个
+   * 随时可用的 space。
+   */
+  const last = runner.lastSpace;
+  const wantPeer = String(hit.peerKey ?? "");
+  const peer = wantPeer || String(last?.peer ?? "");
+  const sameSession = !wantPeer || !last?.peer || peerKeyOf(last.peer) === wantPeer;
+
+  let space = sameSession ? last?.space : null;
+  let spaceId = sameSession ? last?.spaceId : "";
+
+  /*
+   * 内存里没有能用的 space（进程重启后一直没人说话，正是这个功能最常见的场景）：
+   * 拿卡片自己的 chatGuid 现要一个 —— 那就是这条会话的 ID。
+   *
+   * ensureSpace 要一个「主动消息形状」的槽，所以现造一个临时的给它填。
+   */
+  if (!space) {
+    spaceId = String(hit.chatGuid ?? "");
+    if (!spaceId) return;
+    const tmp = { space: null };
+    space = await ensureSpace(runner, tmp, spaceId);
+    /*
+     * 要不到（号码这会儿没连上）：隔一段再试，**不落 reminded** ——
+     * 这一次提醒还没发生过。和 fireProactive 拿不到 space 时同一个处理。
+     */
+    if (!space) {
+      armTransferRemind(getConfig, runner, roleKey, guid, RETRY_SPACE_MS);
+      return;
+    }
+  }
+  if (runner.stopped) return;
+
+  // 协助模式：提示词工程师正在排查人设，角色让位了，别插一句催款进去
+  if (isAssistOn(runner.projectRefId, spaceId)) {
+    logDebug(scope, `协助模式开着，这笔转账的提醒推迟到 ${humanizeWait(ASSIST_HOLD_MS)}后`);
+    armTransferRemind(getConfig, runner, roleKey, guid, ASSIST_HOLD_MS);
+    return;
+  }
+  // 线下模式：两个人正坐着演剧情，手机上不该冒出一句「钱怎么还没收」
+  if (isOfflineOn(roleKey)) {
+    logDebug(scope, `线下模式开着，这笔转账的提醒推迟到 ${humanizeWait(ASSIST_HOLD_MS)}后`);
+    armTransferRemind(getConfig, runner, roleKey, guid, ASSIST_HOLD_MS);
+    return;
+  }
+  // 勿扰时段：推到时段结束。半夜提醒和主动消息半夜开口是同一件事
+  const hold = msUntilFocusEnd(role.proactive?.focus);
+  if (hold > 0) {
+    logDebug(scope, `现在是勿扰时段，这笔转账的提醒推迟到 ${humanizeWait(hold)}后`);
+    armTransferRemind(getConfig, runner, roleKey, guid, hold);
+    return;
+  }
+
+  /*
+   * 先把「提醒过了」钉在磁盘上，再说话（理由见函数头）。
+   *
+   * 写不进去就干脆不提醒 —— 写不进去意味着下次重启还会再提醒一遍，
+   * 而这个功能的全部承诺就是「只提醒一次」。
+   */
+  if (!putTransfer(roleKey, { ...hit, reminded: true })) {
+    logWarn(scope, "这笔转账的「提醒过了」没能落盘，这次就不提醒了（免得重启后又提醒一遍）");
+    return;
+  }
+
+  const money = formatAmount(hit.amount, hit.currency);
+  const memo = hit.note ? `（${hit.note}）` : "";
+  const mins = clampInt(tr.remindMinutes, 120, 1, 1440);
+  const hint =
+    `[系统提示:你转给{{user}}的 ${money}${memo}已经 ${humanizeWait(mins * 60_000)}没被领取了，` +
+    `{{user}}一直没点收款。这件事只会提醒你这一次]`;
+  logInfo(scope, `这笔转账挂了 ${humanizeWait(mins * 60_000)}还没人收，提醒角色一次：${money}`);
+  // 走 enqueue 不走 noteReaction：那条路的提示有 10 分钟保质期
+  // （BG_HINT_TTL_MS），而这句话本身就是「等了两小时」才有的，攒着等于必然丢掉
+  enqueue(getConfig, runner, space, spaceId, { text: hint }, peer);
+}
+
+/**
+ * 连上之后，把硬盘上那些还没收、也还没提醒过的转账接着数。
+ *
+ * 这是「只提醒一次」能跨重启成立的另一半：内存表空了，但磁盘上记着
+ * `state: "pending"` 且 `reminded` 还是假的那几笔 —— 那才是真的还欠一次提醒。
+ * 已经提醒过的（`reminded` 为真）在这儿被滤掉，所以重启多少次都只有那一次。
+ *
+ * 关机期间已经到点的不立刻开口：挪到 SETTLE_MS 之后，和 rehydrateProactive
+ * 同一个理由 —— 一开机十几笔同时往外发不像话。
+ */
+function rehydrateTransferReminders(getConfig, runner) {
+  const scope = scopeOf(runner, "转账");
+  const role = currentRole(getConfig(), runner);
+  const tr = role?.transfer;
+  if (!tr?.enabled || !tr.remindOnPending) return;
+
+  const roleKey = memoryKeyFor(role);
+  if (!roleKey) return;
+  const mins = clampInt(tr.remindMinutes, 120, 1, 1440);
+  const waitMs = mins * 60_000;
+
+  let armed = 0;
+  let overdue = 0;
+  for (const it of readTransfers(roleKey).items) {
+    if (it?.state === "received" || it?.reminded) continue;
+    const guid = String(it?.messageGuid ?? "");
+    if (!guid) continue;
+    const left = (Number(it.at) || Date.now()) + waitMs - Date.now();
+    if (left <= 0) overdue += 1;
+    armTransferRemind(getConfig, runner, roleKey, guid, Math.max(left, SETTLE_MS));
+    armed += 1;
+  }
+
+  if (armed) {
+    logInfo(
+      scope,
+      `还有 ${armed} 笔转账没收、也没提醒过，接着数` +
+        `${overdue ? `（其中 ${overdue} 笔关机期间已经到点，${humanizeWait(SETTLE_MS)}后补上）` : ""}`
+    );
+  }
+}
+
 /**
  * 执行一个 `[transfer:4000:零花钱]`：发一张转账卡片，并把句柄存下来。
  *
@@ -4764,6 +4997,24 @@ async function sendTransferPart(runner, space, part, ctx) {
   });
   if (!ok) logWarn(scope, "这笔转账的句柄没存下来，之后改不了「已收款」");
 
+  /*
+   * 排一次「到点还没收就提醒一下」。默认关，开了默认 120 分钟。
+   *
+   * 句柄没存下来就不排（`ok` 为假）：那笔查不回来，到点既认不出金额、也没法
+   * 把 `reminded` 钉上去 —— 而钉不上就等于下次重启还会再提醒一遍。
+   */
+  if (ok && role.transfer.remindOnPending) {
+    const mins = clampInt(role.transfer.remindMinutes, 120, 1, 1440);
+    armTransferRemind(
+      ctx?.getConfig,
+      runner,
+      memoryKeyFor(role),
+      String(session.messageGuid ?? ""),
+      mins * 60_000
+    );
+    logDebug(scope, `这笔要是 ${humanizeWait(mins * 60_000)}还没人收，就提醒角色一次`);
+  }
+
   logInfo(
     scope,
     `发了一张转账卡片：${formatAmount(amount, role.transfer.currency)}${note ? `（${note}）` : ""}`
@@ -4851,6 +5102,16 @@ async function claimTransferOnReact(runner, role, message, scope) {
   if (!ok) return null;
 
   putTransfer(roleKey, { ...hit, state: "received" });
+  /*
+   * 收款了，那笔的「一直没人收」提醒就不该再发了。
+   *
+   * 撤的是**内存里的排期**，磁盘上那条不动 —— 它已经是 `state: "received"` 了，
+   * 重启后 rehydrateTransferReminders 压根不会把它捞回来（见那边的过滤）。
+   *
+   * 撤的时候用**那笔自己的** messageGuid，不是被贴的那个 guid：排期是按前者
+   * 索引的，而 findTransfer 两个 guid 都能命中（见 transferstore.js）。
+   */
+  disarmTransferRemind(runner, roleKey, String(hit.messageGuid ?? ""));
   logInfo(
     scope,
     `对方收了这笔转账：${formatAmount(hit.amount, hit.currency)}${hit.note ? `（${hit.note}）` : ""}`
@@ -5467,6 +5728,14 @@ async function startRunner(getConfig, project, meta, retries = 0) {
 
     // 重启前排着的主动消息接着数 —— 这一步就是「关机不清计时器」
     rehydrateProactive(getConfig, runner);
+
+    /*
+     * 还没人收、也还没提醒过的转账同理接着数。
+     *
+     * 这是「只提醒一次」跨重启成立的另一半：`reminded` 为真的那几笔在这儿被滤掉，
+     * 所以重启多少次都只有那一次（见 rehydrateTransferReminders）。
+     */
+    rehydrateTransferReminders(getConfig, runner);
 
     (async () => {
       try {
@@ -6432,6 +6701,17 @@ async function stopRunner(runner) {
   // 待认领的 tapback 同理：这条线路都停了，重连后再补报一句「刚才给你贴了个👍」
   // 只会莫名其妙
   runner.reactPending.clear();
+
+  /*
+   * 「一直没人收」的提醒排期：和主动消息那张表同一个处理 —— **只清内存**。
+   *
+   * 磁盘上那几笔原样留着（`state` 还是 pending、`reminded` 还是假），下次这条线路
+   * 连上，rehydrateTransferReminders 会把它们捞回来接着数。这里要是顺手把
+   * `reminded` 钉上，那就成了「停一次连接等于取消一次提醒」——而改配置
+   * （syncBridges）就会停所有连接。
+   */
+  for (const timer of runner.transferRemind?.values() ?? []) clearTimeout(timer);
+  runner.transferRemind?.clear();
 
   if (runner.instance) {
     try {

@@ -119,6 +119,9 @@ export function readTransfers(roleKey) {
  * @param {string} [entry.logo] 发的时候那张缩略图的**文件名**（空串 = 不带图）
  * @param {string} [entry.logoBg] 发的时候那张图的留白底色
  * @param {string} [entry.logoStyle] 发的时候那张图用哪档画布（`banner` / `icon`）
+ * @param {boolean} [entry.reminded] 「一直没收款」那句提醒已经报过了。**这个标记
+ *   必须落盘**：提醒只许发生一次，而定时器活不过重启（见 imessage.js 的
+ *   rehydrateTransferReminders）
  * @returns {boolean} 写进去了没有
  */
 export function putTransfer(roleKey, entry) {
@@ -157,6 +160,14 @@ export function putTransfer(roleKey, entry) {
     logoBg: String(entry.logoBg ?? ""),
     logoStyle: String(entry.logoStyle ?? ""),
     at: Number(entry.at) || Date.now(),
+    /*
+     * 「一直没收款」那句提醒报过了没有。
+     *
+     * 这不是展示字段，是**幂等判据**：那句提醒一笔转账只许发一次。定时器活不过
+     * 重启，所以「发过了」只能记在这儿 —— 否则每次重启都会重新排一遍那个定时器，
+     * 于是同一笔钱被催第二遍、第三遍。见 imessage.js:remindTransferPending。
+     */
+    reminded: Boolean(entry.reminded),
   });
 
   // 超了从最旧的开始丢。丢掉的只是「还能不能原地改」，气泡本身不受影响

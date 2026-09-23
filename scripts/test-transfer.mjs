@@ -967,6 +967,32 @@ okWith("没给 appName / currency / logo 时存成空串，不是 undefined", ()
 });
 
 /*
+ * `reminded` 走的还是那张白名单，所以同一个 bug 能第三次来 —— 漏了它，
+ * 「一直没收款」那句提醒就会**每次重启都再发一遍**，而这个功能的全部承诺
+ * 就是只发一次。所以这条不 grep 源码，真存真读。
+ */
+okWith("reminded 跟着落盘（「只提醒一次」的判据就靠它跨重启）", () => {
+  TS.putTransfer(ROLE, {
+    ...session,
+    messageGuid: "G-remind",
+    amount: "4000",
+    state: "pending",
+    peerKey: "p1",
+  });
+  // 刚发出去那笔：没提醒过
+  assert.equal(TS.findTransfer(ROLE, "G-remind")?.reminded, false);
+
+  // 提醒过一次之后：这个标记必须真的躺在硬盘上
+  TS.putTransfer(ROLE, { ...TS.findTransfer(ROLE, "G-remind"), reminded: true });
+  assert.equal(TS.findTransfer(ROLE, "G-remind")?.reminded, true);
+  const disk = JSON.parse(fs.readFileSync(path.join(tmp, "transfers", "role_a.json"), "utf-8"));
+  assert.equal(disk.items.find((it) => it.messageGuid === "G-remind")?.reminded, true);
+
+  // 认布尔：老记录里压根没这个字段，读回来得是 false 而不是 undefined
+  assert.equal(TS.findTransfer(ROLE, "G-money")?.reminded, false);
+});
+
+/*
  * 对方贴的是**气泡**，而 SDK 把 messageGuid 和 targetMessageGuid 说成两件事。
  * 只比一个的话另一种情况下会查不到，收款直接哑掉。
  */
@@ -1096,6 +1122,42 @@ okWith("notifyOnClaim 默认关，认布尔（老配置里没这个字段）", (
   assert.equal(on(true), true);
   for (const junk of [undefined, null, false, "", 0]) {
     assert.equal(on(junk), false, `${junk} 不该把它打开`);
+  }
+});
+
+/*
+ * 「一直没收款就提醒一次」默认关，开了是 120 分钟。
+ *
+ * 值那一路走 clampInt，所以老配置里没这个字段、或者被填了垃圾时都该是 120 ——
+ * 不能变成 0（那等于卡片一发出去立刻催一句）也不能变成 NaN。
+ */
+okWith("remindOnPending 默认关，remindMinutes 默认 120", () => {
+  const role = C.normalizeConfig({ roles: [{ id: "r0", name: "x" }] }).roles[0];
+  assert.equal(role.transfer.remindOnPending, false);
+  assert.equal(role.transfer.remindMinutes, 120);
+});
+
+okWith("remindMinutes 夹在 1–1440，读不出数字才回落 120", () => {
+  const mins = (v) =>
+    C.normalizeConfig({ roles: [{ id: "r0", name: "x", transfer: { remindMinutes: v } }] }).roles[0]
+      .transfer.remindMinutes;
+  assert.equal(mins(5), 5);
+  assert.equal(mins(1440), 1440);
+  // 0 和负数会变成「发出去就催」，必须被夹住
+  assert.equal(mins(0), 1);
+  assert.equal(mins(-30), 1);
+  assert.equal(mins(99999), 1440);
+  /*
+   * `null` 和空串在 `Number()` 那儿是 **0**（不是 NaN），所以它们被**夹**成 1，
+   * 不走回落。这是 clampInt 一贯的脾气，整个项目的数字字段都这样
+   * （normalizeProactive 的 minWaitMinutes 一模一样）—— 这里不给转账单独开个例外，
+   * 否则下次读 normalizeTransfer 的人会以为这一行有什么特别的。
+   */
+  assert.equal(mins(null), 1);
+  assert.equal(mins(""), 1);
+  // 真读不出数字的才回落
+  for (const junk of [undefined, "两小时", NaN, {}]) {
+    assert.equal(mins(junk), 120, `${String(junk)} 该回落成 120`);
   }
 });
 
@@ -1282,7 +1344,7 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
 
   okWith("句柄存不下来只 warn，不报成「这笔没发出去」", () => {
     const at = src.indexOf("async function sendTransferPart(");
-    const body = src.slice(at, at + 2600);
+    const body = src.slice(at, at + 3600);
     const putAt = body.indexOf("putTransfer(");
     assert.ok(putAt > 0);
     assert.ok(body.slice(putAt).includes("return true"), "存句柄失败之后还是该 return true");
@@ -1348,6 +1410,118 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
     assert.ok(body.includes("noteReaction(runner, peerKeyOf(peer)"), "默认那路该攒进 reactPending");
     // 两句提示得是同一份 —— 分叉只决定什么时候送，不该送出两种说法
     assert.equal(body.match(/收下了你转的/g)?.length, 1, "提示文案该只拼一次");
+  });
+
+  /* ── 「一直没收款就提醒一次」的接线 ── */
+
+  okWith("发出去之后排一次提醒，句柄没存下来就不排", () => {
+    const at = src.indexOf("async function sendTransferPart(");
+    const body = src.slice(at, src.indexOf("async function claimTransferOnReact("));
+    assert.ok(
+      body.includes("if (ok && role.transfer.remindOnPending)"),
+      "排期得压在「句柄存下来了」和「开关开着」两个条件上"
+    );
+    assert.ok(body.includes("armTransferRemind("), "找不到排期那一下");
+  });
+
+  /*
+   * **这个功能唯一的承诺是「只提醒一次」**，而那个承诺不能由定时器来保证 ——
+   * 定时器活不过重启，而默认窗口是两小时。所以判据必须落在磁盘上，
+   * 而且要先落盘再说话。这一条盯的就是这个顺序。
+   */
+  okWith("只提醒一次：先把 reminded 钉到磁盘上，再开口", () => {
+    const at = src.indexOf("async function remindTransferPending(");
+    assert.ok(at > 0, "找不到 remindTransferPending");
+    const body = src.slice(at, src.indexOf("function rehydrateTransferReminders("));
+
+    const putAt = body.indexOf("reminded: true");
+    const sayAt = body.indexOf("enqueue(getConfig, runner, space, spaceId");
+    assert.ok(putAt > 0, "找不到落 reminded 那一下");
+    assert.ok(sayAt > 0, "提醒该走 enqueue（noteReaction 那条路有 10 分钟保质期）");
+    assert.ok(putAt < sayAt, "落盘必须排在开口之前，否则中间崩一次就会再提醒一遍");
+
+    // 落盘失败就干脆不提醒：钉不上就意味着重启后还会再来一遍
+    assert.ok(
+      body.includes("if (!putTransfer(roleKey, { ...hit, reminded: true })) {"),
+      "落盘失败该直接放弃这次提醒"
+    );
+    // 开口前再问一遍磁盘
+    assert.ok(body.includes("if (hit.reminded) {"), "开口前该再确认一遍没提醒过");
+    assert.ok(body.includes('if (hit.state === "received") return;'), "收了款就不提醒");
+  });
+
+  /*
+   * 重启之后接着数，但**已经提醒过的要滤掉** —— 这是「只提醒一次」的另一半。
+   * 漏掉这个过滤，每次重启都会把所有老转账重新排一遍提醒。
+   */
+  okWith("重启接着数，但已经提醒过 / 已收款的都滤掉", () => {
+    const at = src.indexOf("function rehydrateTransferReminders(");
+    assert.ok(at > 0, "找不到 rehydrateTransferReminders");
+    const body = src.slice(at, at + 1600);
+    assert.ok(
+      body.includes('if (it?.state === "received" || it?.reminded) continue;'),
+      "这一行就是「只提醒一次」跨重启的过滤，不能少"
+    );
+    // 关机期间已经到点的不许一开机全喷出来
+    assert.ok(body.includes("Math.max(left, SETTLE_MS)"), "过期的该挪到 SETTLE_MS 之后");
+    // 连上之后真的被调到
+    assert.ok(
+      src.includes("rehydrateTransferReminders(getConfig, runner);"),
+      "startRunner 里没接上这一步"
+    );
+  });
+
+  okWith("收款时撤掉那笔的提醒排期（只清内存，磁盘那条不动）", () => {
+    const at = src.indexOf("async function claimTransferOnReact(");
+    const body = src.slice(at, at + 3400);
+    assert.ok(
+      body.includes("disarmTransferRemind(runner, roleKey, String(hit.messageGuid ?? \"\"))"),
+      "收款后该撤掉排期，而且用那笔自己的 messageGuid"
+    );
+  });
+
+  /*
+   * 停连接**只清内存**，和主动消息那张表同一个规矩。要是顺手把 reminded 钉上，
+   * 「停一次连接」就等于「取消一次提醒」—— 而改一次配置（syncBridges）就会把
+   * 所有线路停掉重连一遍。
+   */
+  okWith("停连接只清内存里的排期，不动磁盘上的 reminded", () => {
+    const at = src.indexOf("async function stopRunner(");
+    const body = src.slice(at, at + 2600);
+    assert.ok(body.includes("runner.transferRemind?.clear()"), "停连接该清掉内存里的排期");
+    // 判的是「有没有落盘那一下」而不是「有没有出现 reminded 这个词」——
+    // 后者会被解释这条规矩的注释本身绊倒
+    const code = body.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+    assert.ok(!code.includes("putTransfer"), "停连接不许往磁盘上写东西");
+  });
+
+  okWith("提醒那个定时器 unref 掉（不拖着进程不退出）", () => {
+    const at = src.indexOf("function armTransferRemind(");
+    const body = src.slice(at, at + 1400);
+    assert.ok(body.includes("timer.unref?.()"), "和主动消息那张表同一个规矩");
+    // 到点得能重读配置；拿不到 getConfig 就别排一个注定要崩的定时器
+    assert.ok(body.includes('typeof getConfig !== "function"'), "没有 getConfig 该直接不排");
+  });
+
+  okWith("协助 / 线下 / 勿扰都是推迟，不是取消（那一次提醒还在账上）", () => {
+    const at = src.indexOf("async function remindTransferPending(");
+    const body = src.slice(at, src.indexOf("function rehydrateTransferReminders("));
+    for (const [gate, what] of [
+      ["isAssistOn(runner.projectRefId, spaceId)", "协助模式"],
+      ["isOfflineOn(roleKey)", "线下模式"],
+      ["msUntilFocusEnd(role.proactive?.focus)", "勿扰时段"],
+    ]) {
+      assert.ok(body.includes(gate), `找不到${what}那道闸`);
+    }
+    /*
+     * 三道闸 + 拿不到 space 那条，一共四处重排。每一处都在 `reminded` 落盘
+     * **之前** —— 推迟的意思就是这一次提醒还没发生过。
+     */
+    const putAt = body.indexOf("reminded: true");
+    for (const m of body.matchAll(/armTransferRemind\(/g)) {
+      assert.ok(m.index < putAt, "重排都该排在落盘之前，否则推迟一次就把提醒吃掉了");
+    }
+    assert.equal(body.match(/armTransferRemind\(/g)?.length, 4, "该有四处推迟（三道闸 + 要不到会话）");
   });
 
   okWith("已经收过的不重复处理（重复贴表情不该让卡片闪一下）", () => {
