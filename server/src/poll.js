@@ -214,6 +214,20 @@ export async function watchPolls({ projectId, projectSecret, label, onEvent }) {
     }
     streams.push(stream);
 
+    /*
+     * 「订阅起来了」这句报在**建流成功**这一刻，不是收到第一个事件的时候。
+     *
+     * 原来报在事件循环里，于是「这个功能到底有没有生效」在没人投票之前完全看不
+     * 出来 —— 开关被读成关着、订阅压根没起，和「起好了正等着」在控制台上长得
+     * 一模一样（都是一行都没有）。这正是 1.2.9 那个漏括号的 bug 难查的原因。
+     *
+     * 一条线路只说一次：专线模式下一个项目挂着好几条线路，每条都喊一遍太吵。
+     */
+    if (!seenLines.has(instanceId)) {
+      seenLines.add(instanceId);
+      logInfo(scope, `已连上，开始盯着投票（${instanceId}）`);
+    }
+
     (async () => {
       try {
         for await (const ev of stream) {
@@ -251,12 +265,6 @@ export async function watchPolls({ projectId, projectSecret, label, onEvent }) {
           if (!pollMessageGuid) {
             logDebug(scope, "忽略一条投票变化（没有 pollMessageGuid）");
             continue;
-          }
-
-          if (!seenLines.has(instanceId)) {
-            seenLines.add(instanceId);
-            // 只说一次「这条流是通的」—— 否则每次投票都在控制台刷一行
-            logInfo(scope, `已连上，开始盯着投票（${instanceId}）`);
           }
 
           let title = String(delta.title ?? "").trim();

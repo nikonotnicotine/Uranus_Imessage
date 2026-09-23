@@ -168,6 +168,16 @@ mock.module("@photon-ai/advanced-imessage/grpc", {
 
 const M = await import("../server/src/media.js");
 const POLL = await import("../server/src/poll.js");
+
+/*
+ * 把后端写的日志收起来，用来验「该报的那句报了没有」。
+ *
+ * 订阅真正的 logs.js（不 mock）：那是个纯内存环形缓冲 + 订阅者集合，不碰网络也不
+ * 碰磁盘，装出一份假的反而要跟着它的形状走。
+ */
+const LOGS = [];
+const LOGMOD = await import("../server/src/logs.js");
+LOGMOD.subscribe((e) => LOGS.push(e));
 const PS = await import("../server/src/pollstore.js");
 const CARD = await import("../server/src/card.js");
 const C = await import("../server/src/config.js");
@@ -411,6 +421,23 @@ const pollEv = (delta, over = {}) => ({
   isFromMe: false,
   delta,
   ...over,
+});
+
+/*
+ * 「已连上」要报在**建流成功**那一刻，不是收到第一个事件的时候。
+ *
+ * 原来报在事件循环里，于是「这个功能到底生效了没有」在没人投票之前完全看不出来 ——
+ * 开关被读成关着、订阅压根没起，和「起好了正等着」在控制台上长得一模一样（都是
+ * 一行都没有）。这正是那个漏括号的 bug 难查的原因，所以钉一下。
+ */
+await okAsync("订阅一建起来就报「已连上」（不等第一个事件）", async () => {
+  const H = await watcherHarness();
+  await waitFor(
+    "报了已连上",
+    () => LOGS.some((l) => l.level === "info" && l.message.includes("开始盯着投票"))
+  );
+  assert.equal(H.events.length, 0, "一个事件都还没来就该报了");
+  await H.w.stop();
 });
 
 await okAsync("created：标题和全部选项一起吐出来，chatGuid 归一成 peerKey", async () => {
@@ -1223,6 +1250,24 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
     assert.ok(body.includes('runner.mode !== "cloud"'));
     assert.ok(body.includes("logWarn"));
     assert.ok(body.includes("runner.stopped"), "订阅建好时没判 stopped（会留野订阅）");
+  });
+
+  /*
+   * `currentRole` 收的是**配置对象**，不是 getConfig 函数。而 roleForProject 里做的
+   * 是 `config?.roles ?? []` —— 把函数本身传进去不报错，只会永远拿不到角色，于是
+   * 开关恒为假、订阅一次都起不来（1.2.8 就是这么漏的：用户打开投票开关，角色发得
+   * 出投票，但一个投票事件都收不到，控制台连一行 `[投票]` 都没有）。
+   *
+   * 这种漏括号源码读起来几乎看不出来，所以两个开关函数都钉一下。
+   */
+  okWith("读开关时 getConfig 要调（漏了括号开关恒为假，订阅永远起不来）", () => {
+    for (const fn of ["rolePollEnabled", "roleWantsChatBg"]) {
+      const body = src.slice(at(`function ${fn}(`), at(`function ${fn}(`) + 260);
+      assert.ok(
+        body.includes("currentRole(getConfig(), runner)"),
+        `${fn} 把 getConfig 函数本身传给了 currentRole —— 开关会永远读成关着`
+      );
+    }
   });
 
   /*

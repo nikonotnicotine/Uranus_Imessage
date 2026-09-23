@@ -5909,9 +5909,15 @@ function stopBgWatcher(runner) {
   runner.bgPending.clear();
 }
 
-/** 当前角色要不要收聊天背景变更提示（角色是绑在项目上的，见 currentRole）。 */
+/**
+ * 当前角色要不要收聊天背景变更提示（角色是绑在项目上的，见 currentRole）。
+ *
+ * `getConfig()` 要**调**。currentRole 收的是配置对象，而 roleForProject 里做的是
+ * `config?.roles ?? []` —— 把函数本身传进去不会报错，只会永远拿不到角色，于是
+ * 这个开关恒为假、订阅一次都起不来。1.2.8 就是这么漏的。
+ */
 function roleWantsChatBg(getConfig, runner) {
-  return Boolean(currentRole(getConfig, runner)?.chatBackground?.enabled);
+  return Boolean(currentRole(getConfig(), runner)?.chatBackground?.enabled);
 }
 
 /* ================= 投票 ================= */
@@ -5929,9 +5935,13 @@ const POLL_TITLE_TTL_MS = 30_000;
 /** 一条会话最多攒几个待压的标题。同一个 30 秒窗口里发两个投票已经很离谱了。 */
 const POLL_TITLE_MAX = 3;
 
-/** 当前角色开了投票没有（三件事共用一个开关，见 config.js:normalizePoll）。 */
+/**
+ * 当前角色开了投票没有（三件事共用一个开关，见 config.js:normalizePoll）。
+ *
+ * `getConfig()` 要**调** —— 同 roleWantsChatBg，漏了括号这个开关就恒为假。
+ */
 function rolePollEnabled(getConfig, runner) {
-  return Boolean(currentRole(getConfig, runner)?.poll?.enabled);
+  return Boolean(currentRole(getConfig(), runner)?.poll?.enabled);
 }
 
 /**
