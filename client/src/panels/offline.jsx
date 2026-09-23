@@ -21,6 +21,15 @@
  *
  * 生成失败时后端回的是 200 + `ok:false` + state。用户那句话**已经落盘了**，
  * 界面上必须立刻看见它，这样点一下「重 roll」就能重来，不用重打一遍。
+ *
+ * ── 一个字都没回来时要自己去问一次 ──
+ *
+ * 上面那条的前提是「后端回了话」。请求整条超时被掐的时候（`/close` 最容易 ——
+ * 它要等后端出两份总结，分钟级，而反代一般 60 秒就断），屏幕上这份 state 和
+ * 后端的已经不是一回事了。所以 `run()` 的 catch 里一律 `resync()` 一次，
+ * 顺带重画侧栏那列 —— 这一页**不轮询**（不能每隔几秒把几十万字的剧情拉一遍），
+ * 那次补拉就是唯一的纠偏机会。不补的话头上会一直挂着「线下开着」，
+ * 而后端那边早关了，用户怎么点都不变。
  */
 
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -1150,11 +1159,20 @@ function CloseDialog({ roleName, busy, inject, onInject, onClose, onConfirm }) {
       }
     >
       <div className="grid grid-cols-1 gap-4">
+        {/*
+          顺序就是后端真正的执行顺序（server/src/offline.js:endOffline）。
+          「关掉线下」在第一步不是排版好看 —— 后面那两步要打模型、可能花上几分钟，
+          让开关等着它们就等于「点完还在线下模式里待几分钟」。
+        */}
         <ol className="grid grid-cols-1 gap-2 border-l-2 border-line py-1.5 pl-3 text-meta leading-relaxed text-ink-soft">
-          <li>1. 先补一次大总结（把还没被总结覆盖的那几轮收进去）</li>
-          <li>2. 把这条剧情的小/大总结写进记忆库的「待总结」</li>
-          <li>3. 关掉线下 —— 主动消息、消息格式与功能那一摞恢复正常</li>
+          <li>1. 先关掉线下 —— 主动消息、消息格式与功能那一摞立刻恢复正常</li>
+          <li>2. 补一次大总结（把还没被总结覆盖的那几轮收进去）</li>
+          <li>3. 把这条剧情的小/大总结写进记忆库的「待总结」</li>
         </ol>
+        <p className="text-meta leading-relaxed text-ink-faint">
+          第 2、3 步要打模型，可能要等上几分钟。
+          <strong className="text-ink-soft">不用守着</strong> —— 线下在第一步就已经关了。
+        </p>
 
         <label className="flex items-start justify-between gap-4">
           <span className="min-w-0">
@@ -1541,21 +1559,38 @@ export function OfflinePanel({ onGoto }) {
    * 回的形状对齐 `/turn` 失败时那份（`ok:false` + 整份 state），调用方两条路共用
    * 一套判断。拉不动（还是断网）就回 `null`：调用方会当「什么都没发生」处理，
    * 也就是把字还回去 —— 宁可多还一次，也别让你重打一遍。
+   *
+   * **每一条写操作失败都要拉一次**，不只是会生成的那两条。`/close` 最需要它：
+   * 它要等后端出两份总结（分钟级），反代一般 60 秒就把请求掐了 —— 那时候后端
+   * 那边线下其实已经关掉了，而这一页收不到那份新 state。不拉的话屏幕上就一直
+   * 挂着「线下开着」，怎么点都不变，用户以为关不掉。
    */
-  const resync = useCallback(
-    async (when) => {
-      if (!when || !itemId) return null;
-      try {
-        const fresh = await api(`/api/offline/${encodeURIComponent(itemId)}`);
-        if (!fresh?.roleKey) return null;
-        setState(fresh);
-        return { ok: false, ...fresh };
-      } catch {
-        return null;
-      }
-    },
-    [itemId]
-  );
+  const resync = useCallback(async () => {
+    if (!itemId) return null;
+    try {
+      const fresh = await api(`/api/offline/${encodeURIComponent(itemId)}`);
+      if (!fresh?.roleKey) return null;
+      setState(fresh);
+      // `stale` = 这份不是那次操作回的，是事后补拉的。调用方要靠它分清
+      // 「后端回了一句失败」和「后端压根没回话」—— 两者该说的话不一样
+      return { ok: false, stale: true, ...fresh };
+    } catch {
+      return null;
+    }
+  }, [itemId]);
+
+  /**
+   * 右上角那个「刷新」。
+   *
+   * 侧栏那列和这一页的正文是**两个接口**（`/api/offline` 和 `/api/offline/:roleKey`），
+   * 两份都要拉。只拉列表的话：在手机上发了 `/关闭线下`，回网页来按这个按钮，
+   * 侧栏那行确实变了，而这一页头上还挂着「线下开着」—— 那份 state 谁都没动过。
+   * 用户会以为没关掉，然后再关一遍 —— 而第二遍会白等一次总结（那两份要打模型，
+   * 分钟级，写待总结那边有去重，所以换回来的是一份没用的东西）。
+   */
+  const refreshAll = useCallback(async () => {
+    await Promise.all([refreshRows(), resync()]);
+  }, [refreshRows, resync]);
 
   /**
    * 所有写操作的唯一入口。
@@ -1622,7 +1657,7 @@ export function OfflinePanel({ onGoto }) {
         // 正式 state 没来，不能默默把那半截留在屏幕上当结果
         if (wantStream && !r) {
           setError("生成中断了 —— 连接断在半路");
-          r = await resync(generating);
+          r = await resync();
         }
         refreshRows();
         return r;
@@ -1634,8 +1669,16 @@ export function OfflinePanel({ onGoto }) {
          * 出去了但读流读断了 —— 后端早把它落盘了。**从这个异常本身分不出是哪种**，
          * 所以去问一次后端。拉回来的那份就是判据：`send()` 靠它决定要不要
          * 把字还回输入框，不然就会出现「存档里有一句，输入框里还有一句」。
+         *
+         * 同一个道理适用于所有写操作，不只是会生成的那两条：请求超时（`/close`
+         * 要等两份总结，反代 60 秒就掐）之后，后端的状态和屏幕上这份已经不一样了。
+         *
+         * 侧栏那列也要跟着重画 —— 它读的是另一条接口（`/api/offline`），
+         * 不刷的话主区说「没开」而左边那列还标着轮数。
          */
-        return await resync(generating);
+        const fresh = await resync();
+        refreshRows();
+        return fresh;
       } finally {
         /*
          * 三个一起归位。`setState(r)` 在上面同一段同步代码里跑过了，React 把这一批
@@ -1979,10 +2022,30 @@ export function OfflinePanel({ onGoto }) {
     [run, q]
   );
 
+  /**
+   * 结束线下。
+   *
+   * **后端是先按开关再出总结**（server/src/offline.js:endOffline），所以这条请求
+   * 一进门线下就已经关了 —— 后面那几分钟花在两份总结上。于是这里有三种收尾：
+   *
+   *   - 正常回来了（`r.ok`）：总结也出完了，报一句写了几份进记忆库。
+   *   - 回来了但带 `error`：开关按掉了，那份大总结没生成出来。
+   *   - 一个字没回来（`r` 是 `resync` 拉的那份，或者 `null`）：请求超时被掐了。
+   *     **不能说「关不掉」** —— 后端早关了。屏幕上这份状态由 `run()` 的
+   *     catch 里那次 `resync` 负责摆正，这儿只需要把话说清楚。
+   */
   async function endOffline() {
     const r = await run("/close", { method: "POST", body: { inject } });
     setClosing(false);
-    if (!r) return;
+    // `stale` 是 `resync` 补拉的那份，`null` 是连拉都没拉动 —— 两种都意味着
+    // 「这次请求没能回话」。后端回的 `ok:false` 走下面那条，它带着原话
+    if (!r || r.stale) {
+      setError(
+        "收尾那份总结等太久，连接先断了。线下已经关掉了（状态以这一页现在显示的为准）," +
+          "总结可能还在后台生成，过一会儿回来看「总结」。"
+      );
+      return;
+    }
     if (r.error) {
       setError(`线下已经关掉了，但收尾没全做完：${r.error}`);
       return;
@@ -2034,7 +2097,7 @@ export function OfflinePanel({ onGoto }) {
       <Card
         title="线下模式"
         actions={
-          <Button variant="outline" onClick={refreshRows}>
+          <Button variant="outline" onClick={refreshAll}>
             <RefreshCw size={14} /> 刷新
           </Button>
         }

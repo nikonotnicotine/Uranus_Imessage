@@ -55,6 +55,7 @@ import {
   currentStory,
   dropLastAssistant,
   endStory,
+  isOfflineOn,
   readIndex,
   readStory,
   setCurrent,
@@ -465,6 +466,31 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
     onRestart = undefined,
   } = opts ?? {};
 
+  /*
+   * 开着才演。
+   *
+   * 「有在演的剧情」和「线下开着」**不是一件事** —— `closeOffline` 故意留着
+   * `currentId`（关了再开要接着演同一条）。所以光判有没有剧情的话，关掉之后
+   * 照样能生成。
+   *
+   * 这道闸真正挡的是**排在队列里的那几轮**：iMessage 那头连发三条，
+   * `chain(runner, spaceId, …)` 一条一条来，用户在网页上按了「结束线下」
+   * 之后，剩下那两条的入口早就过了（消息循环那道闸在入队之前）。不在这儿
+   * 再问一次，它们会接着按线下预设生成、接着发四条选项 —— 用户看到的就是
+   * 「明明关了还在线下」。
+   *
+   * 放在这儿而不是各调用方各判一次：两处（`imessage.js` 的 `runOfflineTurnHere`、
+   * `index.js` 的 `/turn` `/reroll`）判出分歧的话，又多一个「一边说开着一边说
+   * 关着」的来源，而这正是文件头说的那件事 —— 状态只有一处。
+   */
+  if (!isOfflineOn(roleKey)) {
+    const e = new Error("线下模式已经关了（这句没进剧情）。要接着演就再开一次线下。");
+    // 调用方要分得出这不是「生成失败」。iMessage 那头靠它换一句话说 ——
+    // 报「这轮没回上来」会让用户以为是模型挂了，然后一直重试
+    e.offlineClosed = true;
+    throw e;
+  }
+
   if (storyId && readIndex(roleKey).currentId !== storyId) setCurrent(roleKey, storyId);
   let story = currentStory(roleKey);
   if (!story) throw new Error("这个角色现在没有在演的剧情（先在「线下模式」里开一条）");
@@ -790,6 +816,22 @@ export async function summarizeNow(config, role, storyId, kind = "small") {
  *    和角色自己说过的话分得开，而 `memorystore.js` 一个字节都不用改。
  *  - **总结失败照样结束**。生成失败就没有那一份，已经有的照旧注入 ——
  *    卡在这儿不放人才是最糟的结果（用户会被困在线下模式里）。
+ *  - **开关一进门就按掉，不等总结**。见下面那段。
+ *
+ * ── 为什么开关必须第一步按掉 ──
+ *
+ * 收尾要打两次模型（补一份小总结 + 出一份大总结），而这条链的超时是
+ * `SUMMARY_TIMEOUT`（10 分钟）、被拒还重试 `SUMMARY_REFUSAL_RETRIES` 次。
+ * 开关要是放在最后按，这几分钟里磁盘上的 `open` 还是 `true`，而「线下开着吗」
+ * 全靠它：聊天框那道闸（`imessage.js` 的消息循环）继续把话当剧情、主动消息
+ * 继续被压着、`/api/offline` 也照样回「开着」。用户点完「结束线下」之后还在
+ * 线下模式里待好几分钟 —— 中间发的话全进了剧情，而他以为已经回线上了。
+ *
+ * 网页那条更难看：反代一般 60 秒就把这条请求掐了，前端拿不到那份新 state，
+ * 页面上就一直挂着「线下开着」，怎么刷都不变（因为后端也确实还开着）。
+ *
+ * 按掉之后再去出总结：总结是「这段剧情记点什么」，和「现在还在不在线下」
+ * 是两件事，没有理由让后者等前者。
  *
  * @param {{inject?: boolean}} [opts] `inject: false` = 结束但不写记忆库
  * @returns {Promise<{ok: boolean, injected: number, summary: object|null,
@@ -801,8 +843,10 @@ export async function endOffline(config, role, opts = {}) {
   const idx = readIndex(roleKey);
   const storyId = idx.currentId;
 
+  // 第一件事。后面那几步全都可能花上几分钟，一步都不能让开关等着
+  closeOffline(roleKey);
+
   if (!storyId) {
-    closeOffline(roleKey);
     return { ok: true, injected: 0, summary: null, story: null, error: "" };
   }
 
@@ -848,6 +892,11 @@ export async function endOffline(config, role, opts = {}) {
   }
 
   endStory(roleKey, storyId);
-  closeOffline(roleKey);
+  /*
+   * 这儿**不再按一次开关**。开头那一次就是生效的那次，而收尾这几分钟里用户
+   * 完全可能又开了一次（手机上发 `/开启线下`，或者网页那条请求被反代掐了之后
+   * 点「接着演」）—— 那是他更晚的、更明确的意思，收尾跑完了再把人踢出来
+   * 就又变成「状态和我刚点的那下对不上」，跟这次要修的是同一个毛病。
+   */
   return { ok: true, injected, summary, story: readStory(storyId), error };
 }

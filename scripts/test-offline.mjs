@@ -523,6 +523,48 @@ console.log("\n=== 7. 总结与结束线下 ===");
   check("也关掉了", S.isOfflineOn(KEY), false);
   S.writeIndex(KEY, idxNow);
   void s2;
+
+  /*
+   * **开关要在收尾之前就按掉**（用户报的那个 bug）。
+   *
+   * 收尾要打两次模型（补一份小总结 + 出一份大总结），超时 10 分钟、被拒还重试
+   * 三次。开关要是放在最后按，这几分钟里聊天框那道闸、主动消息、`/api/offline`
+   * 全都还当线下开着 —— 而用户已经点过「结束线下」了，中间发的话全进剧情。
+   *
+   * 验法：**不 await**，趁 endOffline 还在里头打模型的时候就去问一次索引。
+   * 单独起一条剧情，免得动到上面那几条对「重复注入」的断言。
+   */
+  const lateSid = S.newStory(KEY, { roleId: role.id, presetRef: "ps-offline", name: "关得够快吗" }).id;
+  S.appendTurn(KEY, { role: "user", content: "最后一句。" });
+  S.openOffline(KEY, { roleId: role.id, presetRef: "ps-offline" });
+  check("先确认开着", S.isOfflineOn(KEY), true);
+  const closing = O.endOffline(config, role, { inject: false });
+  check("收尾还没跑完，开关就已经是关的", S.isOfflineOn(KEY), false);
+  await closing;
+  check("收尾跑完还是关的", S.isOfflineOn(KEY), false);
+
+  /*
+   * 关掉之后不许再生成。
+   *
+   * `closeOffline` 故意留着 `currentId`（关了再开要接着演同一条），所以
+   * runOfflineTurn 光判「有没有在演的剧情」是不够的 —— iMessage 那头排在
+   * `chain` 里的那几轮会绕过入口那道闸，照样按线下预设生成、照样发四条选项。
+   *
+   * 这里不打网络也能验：这道闸在挑 endpoint 之前，抛的是它自己那句。
+   */
+  let closedErr = null;
+  try {
+    await O.runOfflineTurn(config, role, user, { text: "关了之后还能演吗", storyId: lateSid });
+  } catch (e) {
+    closedErr = e;
+  }
+  checkThat("关掉之后这一轮直接被挡下", Boolean(closedErr?.offlineClosed), String(closedErr?.message ?? closedErr));
+  // 挡下就不该落盘 —— 落了的话用户下次开线下会看到一句没人接的话
+  checkThat(
+    "那句话没进剧情",
+    !S.readStory(lateSid).turns.some((t) => t.content.includes("关了之后还能演吗")),
+    ""
+  );
 }
 
 console.log("\n=== 8. 总结的触发点 ===");

@@ -2447,6 +2447,22 @@ async function runOfflineTurnHere(getConfig, runner, space, spaceId, userText, p
       runner
     );
   } catch (e) {
+    /*
+     * 线下在这一轮排队期间被关掉了（人在网页上按了「结束线下」，而这条早就
+     * 进了 `chain`）。这不是故障，所以不报 error、也不说「没回上来」——
+     * 那句话会让用户以为模型挂了，然后一直重发。
+     */
+    if (e?.offlineClosed) {
+      logInfo(scope, "这一轮排队时线下已经被关掉了，不生成");
+      try {
+        await sendSystem(runner, space, `⚠️ ${String(e?.message ?? e)}`, {
+          what: "线下模式的提示",
+        });
+      } catch (sendErr) {
+        logWarn(scope, "连提示都发不出去", sendErr);
+      }
+      return;
+    }
     logError(scope, "线下这轮没回上来", e);
     try {
       await sendSystem(runner, space, `⚠️ 这轮没回上来：${String(e?.message ?? e)}`, {
