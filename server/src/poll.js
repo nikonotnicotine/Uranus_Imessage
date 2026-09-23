@@ -398,6 +398,64 @@ export async function castVote({
   }
 }
 
+/**
+ * 给一个已有的投票加一个选项。
+ *
+ * 和 castVote 同一个结构（临时客户端、挨条线路试、用完就关），理由见那边。
+ * 苹果的投票允许任何参与者加选项 —— 用户手机上那个「添加选项」按钮就是这个，
+ * Photon 的 `polls.addOption` 文档原话是 "appends a new choice"。
+ *
+ * 用**写**操作那档超时（VOTE_TIMEOUT_MS）：这也是要服务端真去改那条气泡。
+ *
+ * @param {object} opts
+ * @param {string} opts.projectId
+ * @param {string} opts.projectSecret
+ * @param {string} opts.pollMessageGuid 投票那条气泡的 guid
+ * @param {string} opts.text 新选项的文字
+ * @param {string} [opts.scope] 日志前缀
+ * @returns {Promise<null | {text: string, optionIdentifier: string}[]>}
+ *   加上了就返回**加完之后的完整选项表**（addOption 还回来一个 Poll），
+ *   失败返回 null。返回选项表而不是布尔：调用方要靠它把落盘那份更新掉，
+ *   否则角色紧接着写 `[vote:E]` 时那个字母还对不上东西。
+ */
+export async function addPollOption({
+  projectId,
+  projectSecret,
+  pollMessageGuid,
+  text,
+  scope = "投票",
+}) {
+  if (!projectId || !projectSecret || !pollMessageGuid || !text) return null;
+
+  let opened = [];
+  try {
+    opened = await createLineClients(projectId, projectSecret, { timeout: VOTE_TIMEOUT_MS });
+    let lastError = null;
+    for (const { client, instanceId } of opened) {
+      try {
+        const poll = await client.polls.addOption(pollMessageGuid, text);
+        logDebug(scope, `加选项成功（线路 ${instanceId}）：${pollMessageGuid}`);
+        /*
+         * 还回来的 Poll 里就带着加完之后的全部选项（含刚生成的那个 id）。
+         * 万一它是空的就返回空数组 —— 「加上了」和「拿到新表了」是两件事，
+         * 返回 null 会被调用方当成失败，而这一票其实已经加上去了。
+         */
+        return toOptions(poll?.options);
+      } catch (e) {
+        lastError = e;
+        logDebug(scope, `线路 ${instanceId} 上加不了这个选项：${String(e?.message ?? e)}`);
+      }
+    }
+    if (lastError) logWarn(scope, "这个选项没加上去", lastError);
+    return null;
+  } catch (e) {
+    logWarn(scope, "这个选项没加上去（开不了客户端）", e);
+    return null;
+  } finally {
+    await closeClients(opened);
+  }
+}
+
 /* ================= 字母 ↔ 选项 ================= */
 
 /**

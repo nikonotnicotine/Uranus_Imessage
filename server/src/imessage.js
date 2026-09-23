@@ -58,7 +58,14 @@ import {
 } from "./media.js";
 import { resolveMusic } from "./music.js";
 import { clampInt } from "./normalize.js";
-import { castVote, letterFor, matchOption, renderOptions, watchPolls } from "./poll.js";
+import {
+  addPollOption,
+  castVote,
+  letterFor,
+  matchOption,
+  renderOptions,
+  watchPolls,
+} from "./poll.js";
 import { findLatestPoll, findPoll, putPoll } from "./pollstore.js";
 import { presetLabel, resolvePreset } from "./preset.js";
 import {
@@ -5248,6 +5255,14 @@ const MAX_POLL_OPTIONS = 10;
 const MAX_POLL_TITLE = 300;
 
 /**
+ * 单个选项最多多少字。
+ *
+ * 比标题短得多：选项在对方手机上是并排的小按钮，写一段话进去谁也看不清，而且
+ * 那句系统提示里还要把全部选项列一遍（`【A…】【B…】`），个个几百字就没法读了。
+ */
+const MAX_POLL_OPTION_TEXT = 60;
+
+/**
  * 执行一个 `[vote:A]`：在对方那个投票里投一票。
  *
  * 四道闸：
@@ -5304,8 +5319,91 @@ async function runVotePart(runner, part, ctx) {
     optionIdentifier: picked.optionIdentifier,
     scope,
   });
-  if (ok) logInfo(scope, `已在「${hit.title}」里投了【${picked.text}】`);
+  // 标题可能是空的（Photon 那边的投票资源常常没 title，见 handlePollEvent 的注释）
+  if (ok) logInfo(scope, `已在「${hit.title || "那个投票"}」里投了【${picked.text}】`);
   return ok;
+}
+
+/**
+ * 执行一个 `[poll_add:炸鸡]`：给这条会话里最近那个投票加一个选项。
+ *
+ * 闸门和 runVotePart 一模一样（角色开关 / 只有云端 / 得真有个投票），外加一条：
+ * **选项不能和已有的重复** —— 苹果那边允许加重的，加出来两个「炸鸡」谁也分不清
+ * 该投哪个，而且后面 matchOption 按文字匹配时只会命中第一个。
+ *
+ * 加完把新的选项表落盘覆盖掉。这一步不是可选的：`addOption` 生成的新 id 只在
+ * 这次返回值里出现一次，不存的话角色紧接着写 `[vote:E]` 就对不上东西（自己发起
+ * 的投票那份本来 id 全是空串，见 sendPollPart）。
+ *
+ * @returns {Promise<boolean>} 加上了没有。同 runVotePart **不计进「发了几条」**
+ *   ——它改的是已有气泡，不新起消息 —— 但算 `acted`。
+ */
+async function runPollAddPart(runner, part, ctx) {
+  const scope = scopeOf(runner, "投票");
+  const want = String(part?.text ?? "").trim();
+  const role = ctx?.role;
+
+  if (!role?.poll?.enabled) {
+    logInfo(scope, `这个角色没开「投票」，跳过这条：[poll_add:${want}]`);
+    return false;
+  }
+  if (!want) return false;
+  if (runner.mode !== "cloud") {
+    logWarn(scope, `本地 Mac 模式加不了选项，[poll_add:${want}] 跳过`);
+    return false;
+  }
+  if (want.length > MAX_POLL_OPTION_TEXT) {
+    logWarn(scope, `这个选项太长（${want.length} 字），截到 ${MAX_POLL_OPTION_TEXT} 字`);
+  }
+  const text = want.slice(0, MAX_POLL_OPTION_TEXT);
+
+  const chatGuid = String(ctx?.spaceId ?? "");
+  const hit = findLatestPoll(memoryKeyFor(role), chatGuid);
+  if (!hit) {
+    logWarn(scope, `[poll_add:${text}] 这条会话里没有记着的投票，加不了`);
+    return false;
+  }
+
+  // 重了就不加：加出来两个一样的选项没人分得清，matchOption 也只会命中第一个
+  const dupe = (hit.options ?? []).some((o) => String(o?.text ?? "").trim() === text);
+  if (dupe) {
+    logWarn(scope, `[poll_add:${text}] 这个选项已经有了（${renderOptions(hit.options)}），不重复加`);
+    return false;
+  }
+  // 满了就不加：苹果那边上限 10，硬加只会白打一次 RPC
+  if ((hit.options ?? []).length >= MAX_POLL_OPTIONS) {
+    logWarn(scope, `[poll_add:${text}] 那个投票已经有 ${MAX_POLL_OPTIONS} 个选项了，加不下`);
+    return false;
+  }
+
+  const fresh = await addPollOption({
+    projectId: runner.projectId,
+    projectSecret: runner.projectSecret,
+    pollMessageGuid: hit.pollMessageGuid,
+    text,
+    scope,
+  });
+  if (!fresh) return false;
+
+  /*
+   * 把新表覆盖回去。`fresh.length` 那道判空同 handlePollEvent 那边：putPoll 的
+   * `entry.options ?? prev.options` 拦不住空数组，会把好好的那份洗成空的。
+   */
+  if (fresh.length) {
+    putPoll(memoryKeyFor(role), {
+      pollMessageGuid: hit.pollMessageGuid,
+      chatGuid: hit.chatGuid,
+      peerKey: hit.peerKey,
+      options: fresh,
+    });
+  }
+
+  logInfo(
+    scope,
+    `已给「${hit.title || "那个投票"}」加了选项【${text}】` +
+      (fresh.length ? `，现在是${renderOptions(fresh)}` : "")
+  );
+  return true;
 }
 
 /**
@@ -5744,6 +5842,12 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
         if (await runVotePart(runner, part, ctx)) acted += 1;
         continue;
       }
+      // 加选项同上一档：改的也是那个已有的投票气泡
+      if (part.kind === "poll_add") {
+        tried.add("poll_add");
+        if (await runPollAddPart(runner, part, ctx)) acted += 1;
+        continue;
+      }
       /*
        * 媒体这一条要花好几十秒（出图 10–40s，合成 2–5s），中间对方那头的
        * 打字指示器会灭掉。每条之前补发一次 —— 让对方看到「还在打」，
@@ -5800,6 +5904,7 @@ const KIND_NAMES = {
   react: "emoji 回应",
   undo: "撤回",
   vote: "投票",
+  poll_add: "给投票加选项",
   poll: "发起投票",
 };
 
@@ -5856,7 +5961,9 @@ function startBgWatcher(getConfig, runner, project) {
   watchChatBackground({
     projectId: project.projectId,
     projectSecret: project.projectSecret,
-    label: scopeOf(runner, "背景"),
+    // 角色名，不是拼好的前缀 —— watchChatBackground 会自己拼成「聊天背景·Nero」。
+    // 传 scopeOf(...) 会拼两遍，同 startPollWatcher 那边的注释
+    label: runner.label ?? "",
     onChanged: ({ kind, peerKey, chatGuid }) => {
       if (runner.stopped) return;
       // 归一不出来就只是不知道是谁换的 —— 记一笔日志，别硬塞给某个人
@@ -5936,7 +6043,7 @@ const POLL_TITLE_TTL_MS = 30_000;
 const POLL_TITLE_MAX = 3;
 
 /**
- * 当前角色开了投票没有（三件事共用一个开关，见 config.js:normalizePoll）。
+ * 当前角色开了投票没有（四件事共用一个开关，见 config.js:normalizePoll）。
  *
  * `getConfig()` 要**调** —— 同 roleWantsChatBg，漏了括号这个开关就恒为假。
  */
@@ -5971,7 +6078,12 @@ function startPollWatcher(getConfig, runner, project) {
   watchPolls({
     projectId: project.projectId,
     projectSecret: project.projectSecret,
-    label: scopeOf(runner, "投票"),
+    /*
+     * 这里给的是**角色名**，不是拼好的前缀 —— watchPolls 自己会拼成
+     * 「投票·Nero」。传 scopeOf(...) 进去会拼两遍，日志里出现
+     * `[投票·投票·Nero]`。背景那条（startBgWatcher）是同一个毛病。
+     */
+    label: runner.label ?? "",
     onEvent: (ev) => {
       if (runner.stopped) return;
       // 串进这条会话的处理链：要 await 一次 ensureSpace，不能和正在跑的那一轮抢
@@ -6162,7 +6274,17 @@ async function handlePollEvent(getConfig, runner, ev) {
    * 「模型收到了投票、也回了 [vote:B]，但没人知道 B 是哪个 id」。
    */
   if (kind === "created" || kind === "optionAdded") {
-    putPoll(roleKey, { pollMessageGuid, chatGuid, peerKey, title, options });
+    /*
+     * title **只在拿到了的时候传**，同下面 voted/unvoted 那一支。
+     *
+     * 这不是对称性洁癖：Photon 那边投票资源的 title 本来就常常是空的（用户日志里
+     * Spectrum 那条 `failed to cache poll / path:["title"] / Too small` 说的就是
+     * 这件事，回源问 `polls.get` 拿到的也是空串）。而**角色自己发起的**那些投票，
+     * 标题是 sendPollPart 存进去的，只存在我们这份记录里。无条件传的话，对方一
+     * 「加选项」就把它洗成空串 —— 接着那句日志就成了「已在「」里投了【X】」，
+     * 而 pollHintFor 里那句「注释是：""」也跟着废了。
+     */
+    putPoll(roleKey, { pollMessageGuid, chatGuid, peerKey, options, ...(title ? { title } : {}) });
     // 标题那条文本的压重登记要在「说话」之前做完 —— 它可能已经在队列里躺着了
     notePollTitle(runner, chatGuid, title);
   } else if (options.length) {
@@ -6233,12 +6355,21 @@ function pollHintFor(kind, ev, known) {
   const options = known?.options?.length ? known.options : (ev.options ?? []);
 
   if (kind === "created") {
+    /*
+     * 标题**可能是空的**，那就整句不提注释。
+     *
+     * Photon 送来的 created delta 里 title 经常是空串（标题作为一条普通文本另
+     * 走一路进来，见 poll.js 头部），回源也未必补得上。硬拼的话模型会读到
+     * `注释是：""` —— 那比不提更糟，它会当成「对方发了个没标题的投票」去演。
+     */
     const title = String(ev.title ?? known?.title ?? "").trim();
     if (!options.length) return "";
     return (
-      `[系统提示:{{user}}向你发起了一个投票，注释是："${title}"，选项有${renderOptions(options)}。\n` +
+      `[系统提示:{{user}}向你发起了一个投票${title ? `，注释是："${title}"` : ""}，` +
+      `选项有${renderOptions(options)}。\n` +
       `你可以选择投票，格式：[vote:A]。一次只能投一个选项。\n` +
-      `你也可以不投票，直接回复文字即可]`
+      `你也可以给这个投票加一个新选项，格式：[poll_add:选项文字]。\n` +
+      `你也可以什么都不做，直接回复文字即可]`
     );
   }
 
@@ -6246,7 +6377,7 @@ function pollHintFor(kind, ev, known) {
     if (!options.length) return "";
     return (
       `[系统提示:{{user}}给刚才那个投票加了个新选项，现在选项有${renderOptions(options)}。\n` +
-      `你可以选择投票，格式：[vote:A]，也可以不投票]`
+      `你可以投票（[vote:A]）、也可以再加一个选项（[poll_add:选项文字]），也可以都不做]`
     );
   }
 

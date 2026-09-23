@@ -50,6 +50,18 @@ import { closeClients, createLineClients } from "./photongrpc.js";
 const DETAIL_TIMEOUT_MS = 6000;
 
 /**
+ * 取手写 / Digital Touch 那条气泡的**字节**最多等多久。
+ *
+ * 比读元数据宽（6s → 20s）：那两条路问的是几个字段，这条要把一张图整个传下来，
+ * 6 秒明显不够 —— 用户报过「数码点触还是不显示」，日志里就是
+ * `The operation was aborted due to timeout`，超时之后模型只收到一句
+ * 「{{user}}发来了一条 Digital Touch」，于是回「这是什么/看不出来」。
+ *
+ * 仍然要有个上限：这条路在**收消息**那一轮里同步等着，等太久对方会觉得没人理。
+ */
+const EMBEDDED_TIMEOUT_MS = 20_000;
+
+/**
  * 发 / 改一张转账卡片最多等多久。
  *
  * 比读详情那条宽一倍：这是一次真的发送（要落到对方手机上），而读详情只是
@@ -219,7 +231,7 @@ export async function fetchEmbeddedMedia({
   if (!projectId || !projectSecret || !chatGuid || !messageGuid) return null;
   let opened = [];
   try {
-    opened = await createLineClients(projectId, projectSecret, { timeout: DETAIL_TIMEOUT_MS });
+    opened = await createLineClients(projectId, projectSecret, { timeout: EMBEDDED_TIMEOUT_MS });
     for (const { client, instanceId } of opened) {
       try {
         const media = await client.messages.getEmbeddedMedia(chatGuid, messageGuid);

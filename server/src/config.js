@@ -1164,7 +1164,7 @@ function normalizeRole(input, id, legacy) {
     // 聊天背景变更提示：对方换了 iMessage 背景就在下一条消息里带一句系统提示，
     // 见下面那个函数（也见 chatbg.js）
     chatBackground: normalizeChatBackground(input?.chatBackground),
-    // 投票：认出对方发起的投票、能投票、也能自己发起。一个开关管这三件事，
+    // 投票：认出对方发起的投票、能投票、能自己发起、能加选项。一个开关管这四件事，
     // 见下面那个函数（也见 poll.js）
     poll: normalizePoll(input?.poll),
     // 手写消息 / Digital Touch 看内容：取那条气泡的字节送去识图，见下面那个函数
@@ -1682,8 +1682,10 @@ function normalizeChatBackground(input) {
 }
 
 /**
- * 投票：一个开关管三件事 —— 认出对方发起的投票（含全部选项）、角色能投票
- * （`[vote:A]`）、角色能自己发起投票（`[poll:注释|A|B|C]`）。
+ * 投票：一个开关管四件事 —— 认出对方发起的投票（含全部选项）、角色能投票
+ * （`[vote:A]`）、角色能自己发起投票（`[poll:注释|A|B|C]`）、角色能给已有的
+ * 投票加选项（`[poll_add:选项]`，苹果那边任何参与者都能加，用户手机上那个
+ * 「添加选项」按钮就是它）。
  *
  * **默认关**，理由和 chatBackground 逐字相同：开着就意味着这个角色会为每条线路
  * **常驻一个 gRPC 连接**去订阅 poll 事件。Spectrum 的 provider 虽然订阅了 poll 流，
@@ -1694,8 +1696,8 @@ function normalizeChatBackground(input) {
  * `@spectrum-ts/imessage-local` 的 poll 分支直接抛 unsupportedLocalContent。
  * 本地模式下开着这个开关只会在日志里得到一句提醒，发起投票退化成一句文字。
  *
- * 为什么三件事不拆成三个开关：对用户来说这就是「这个角色会不会用投票」一件事，
- * 而三件事共用同一条连接和同一份落盘（data/polls/），拆开只会让人多勾两次。
+ * 为什么四件事不拆成四个开关：对用户来说这就是「这个角色会不会用投票」一件事，
+ * 而四件事共用同一条连接和同一份落盘（data/polls/），拆开只会让人多勾三次。
  *
  * **一次只能投一个选项**，这是苹果那边的规矩不是我们的选择：Photon 的 `vote`
  * 文档原话是 "casts or changes the local account's vote"，`unvote` 连选项 id 都

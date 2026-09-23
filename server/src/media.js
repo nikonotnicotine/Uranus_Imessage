@@ -168,13 +168,15 @@ const MEDIA_TAG = new RegExp(
     "[[［]\\s*(?:reaction|react|tapback|回应|贴纸)\\s*[:：]\\s*(?<react>[^\\]］]{1,80}?)\\s*[\\]］]",
     "[[［]\\s*(?:transfer_money|transfer|转账|转钱)\\s*[:：]\\s*(?<transfer>\\d[^\\]］]{0,80}?)\\s*[\\]］]",
     /*
-     * 投票两条，顺序要紧：`poll_vote` 排在 `poll` 前面，否则 `[poll_vote:A]`
-     * 会被后面那条当成「标题是 _vote:A 的投票」。
+     * 投票三条，顺序要紧：`poll_add` / `poll_vote` 都得排在 `poll` 前面，否则
+     * `[poll_vote:A]` 会被后面那条当成「标题是 _vote:A 的投票」，`[poll_add:炸鸡]`
+     * 同理会变成「标题是 _add:炸鸡 的投票」。
      *
      * **故意不认光秃秃的 `[A]`**（用户原话里的写法）：`[A]` 在正常文本里出现的
      * 概率不低（模型写清单、写选项表时很爱用），而这套标记体系全是 `[标签:内容]`。
      * 入站那句提示里教的也是 `[vote:A]`，两边对得上就不会有歧义。
      */
+    "[[［]\\s*(?:poll_add|add_option|加选项|添加选项)\\s*[:：]\\s*(?<pollAdd>[^\\]］]{1,120}?)\\s*[\\]］]",
     "[[［]\\s*(?:poll_vote|vote|投票|投)\\s*[:：]\\s*(?<vote>[^\\]］]{1,60}?)\\s*[\\]］]",
     "[[［]\\s*(?:create_poll|poll|发起投票|投票发起)\\s*[:：]\\s*(?<poll>[^\\]］]{1,400}?)\\s*[\\]］]",
   ].join("|"),
@@ -203,7 +205,7 @@ const MEDIA_TAG = new RegExp(
  *
  * @param {string} text 一条气泡的正文（调用方已经按分隔符切过）
  * @returns {{kind:"text"|"audio"|"sticker"|"image"|"undo"|"card"|"music"|"location"|"react"
- *            |"transfer"|"vote"|"poll",
+ *            |"transfer"|"vote"|"poll_add"|"poll",
  *            text:string, ref?:string, n?:number, ll?:string, emoji?:string, spec?:string,
  *            note?:string, options?:string[]}[]}
  *          text 段已经 trim 过，空段不产出；sticker 段的 text 是情绪标签；
@@ -213,6 +215,7 @@ const MEDIA_TAG = new RegExp(
  *          react 段的 emoji 是要贴的 emoji、spec 是贴哪条（没写就是空串）；
  *          transfer 段的 text 是金额原文、note 是备注（没写就是空串）；
  *          vote 段的 text 是「投哪个」（字母/序号/选项原文）；
+ *          poll_add 段的 text 是要加的那个选项文字；
  *          poll 段的 text 是投票标题、options 是选项文字（可能不足两个）
  */
 export function splitMedia(text) {
@@ -289,6 +292,15 @@ export function splitMedia(text) {
       const amount = (at < 0 ? body : body.slice(0, at)).trim();
       const note = at < 0 ? "" : body.slice(at + 1).trim();
       if (amount) parts.push({ kind: "transfer", text: amount, note });
+    } else if (g.pollAdd !== undefined) {
+      /*
+       * `[poll_add:炸鸡]` —— 给已经存在的那个投票**加一个选项**。
+       *
+       * 整段就是选项文字，不切冒号：选项里出现冒号很自然（`[poll_add:七点:出发]`）。
+       * 加到哪个投票上不用写，和 `[vote:]` 一个规矩 —— 就是这条会话里最近那个。
+       */
+      const t = g.pollAdd.trim();
+      if (t) parts.push({ kind: "poll_add", text: t });
     } else if (g.vote !== undefined) {
       // 整段就是「投哪个」：一个字母、一个序号、或者选项原文。
       // 真正翻成 optionIdentifier 的活儿在 poll.js:matchOption
@@ -348,6 +360,8 @@ export function hasMedia(text) {
  * 都莫名其妙。撤回也丢掉 —— 它本来就不产出内容。**回应同理**：功能关着的时候
  * 一个光秃秃的 emoji 单发一条也不像话，直接丢。**投票那段也丢**（`[vote:A]`）：
  * 它改的是对方那个已经存在的投票气泡，退化成一个「A」发过去没人看得懂。
+ * **加选项同理**（`[poll_add:炸鸡]`）—— 它也是改已有那个气泡，单发一句「炸鸡」
+ * 对方只会莫名其妙。
  *
  * 几段之间不加分隔符 —— 正常情况下模型会用气泡分隔符隔开，走到这儿的都是
  * 同一条气泡里的相邻内容。
@@ -360,7 +374,8 @@ export function stripMediaTags(text, currency) {
         p.kind !== "sticker" &&
         p.kind !== "undo" &&
         p.kind !== "react" &&
-        p.kind !== "vote"
+        p.kind !== "vote" &&
+        p.kind !== "poll_add"
     )
     .map((p) => {
       if (p.kind === "transfer") return transferAsText(p, currency);

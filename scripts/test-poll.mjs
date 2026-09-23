@@ -114,6 +114,10 @@ const photon = {
   getThrows: false,
   voteCalls: [],
   voteThrows: false,
+  addCalls: [],
+  addThrows: false,
+  /** 下一次 polls.addOption 还什么（加完之后的整个 Poll） */
+  addResult: null,
   /** getEmbeddedMedia 还什么 */
   embedded: null,
   embeddedThrows: false,
@@ -149,6 +153,11 @@ mock.module("@photon-ai/advanced-imessage/grpc", {
             photon.voteCalls.push({ guid, optionIdentifier });
             if (photon.voteThrows) throw new Error("这条线路投不了");
             return {};
+          },
+          addOption: async (guid, text) => {
+            photon.addCalls.push({ guid, text });
+            if (photon.addThrows) throw new Error("这条线路加不了选项");
+            return photon.addResult;
           },
         },
         messages: {
@@ -218,6 +227,47 @@ okWith("[poll_vote:A] 是投票，不是「标题叫 _vote:A 的发起投票」"
 
 okWith("[vote:选项原文] 也切出来（翻成 id 的活儿在 matchOption）", () => {
   assert.deepEqual(M.splitMedia("[vote:麻辣烫]"), [{ kind: "vote", text: "麻辣烫" }]);
+});
+
+okWith("[poll_add:选项] 切成一段 poll_add", () => {
+  assert.deepEqual(M.splitMedia("这几个都不想吃[poll_add:烤鱼]"), [
+    { kind: "text", text: "这几个都不想吃" },
+    { kind: "poll_add", text: "烤鱼" },
+  ]);
+});
+
+okWith("加选项的几个别名都认，大小写不分", () => {
+  for (const tag of ["poll_add", "Poll_Add", "add_option", "加选项", "添加选项"]) {
+    assert.deepEqual(
+      M.splitMedia(`[${tag}:烤鱼]`),
+      [{ kind: "poll_add", text: "烤鱼" }],
+      `[${tag}:烤鱼] 没认出来`
+    );
+  }
+});
+
+/*
+ * 同 poll_vote 那条：`poll_add` 必须排在 `poll` 前面。顺序反了的话
+ * `[poll_add:烤鱼]` 会被「发起投票」那条吃掉，切出来是一个**标题叫
+ * `_add:烤鱼` 的投票** —— 角色想加个选项，结果给对方发了个新投票。
+ */
+okWith("[poll_add:烤鱼] 是加选项，不是「标题叫 _add:烤鱼 的发起投票」", () => {
+  assert.deepEqual(M.splitMedia("[poll_add:烤鱼]"), [{ kind: "poll_add", text: "烤鱼" }]);
+});
+
+/* 选项里带冒号不切 —— 整段都是选项文字（和 [location:] 那种要切的反着）。 */
+okWith("[poll_add:] 里的冒号不切，整段都是选项", () => {
+  assert.deepEqual(M.splitMedia("[poll_add:七点:出发]"), [
+    { kind: "poll_add", text: "七点:出发" },
+  ]);
+});
+
+/*
+ * 退化时**丢掉**，和 [vote:] 同一档：它改的是一条已有的投票气泡，功能关着的
+ * 时候退化成一句「烤鱼」发过去，对方只会莫名其妙。
+ */
+okWith("stripMediaTags 把 poll_add 丢掉（不退化成一句话）", () => {
+  assert.equal(M.stripMediaTags("这几个都不想吃[poll_add:烤鱼]加了个"), "这几个都不想吃加了个");
 });
 
 okWith("[poll:注释|选项…] 切成一段 poll，竖线分段", () => {
@@ -699,6 +749,91 @@ await okAsync("投票带超时（长连接那条不带，这条必须带）", as
   assert.ok(photon.clientOpts[0]?.timeout > 0, "投票那条没设一元超时");
 });
 
+section("加一个选项（poll.js:addPollOption）");
+
+await okAsync("加上去之后还回来加完的整张选项表", async () => {
+  photon.addCalls.length = 0;
+  photon.addResult = {
+    title: "今晚吃什么",
+    options: [
+      { text: "火锅", optionIdentifier: "o-1" },
+      { text: "烧烤", optionIdentifier: "o-2" },
+      { text: "烤鱼", optionIdentifier: "o-3" },
+    ],
+  };
+  const fresh = await POLL.addPollOption({
+    projectId: "p",
+    projectSecret: "s",
+    pollMessageGuid: "P-1",
+    text: "烤鱼",
+  });
+  assert.deepEqual(photon.addCalls, [{ guid: "P-1", text: "烤鱼" }]);
+  /*
+   * 返回**整张表**而不是布尔：新选项的 optionIdentifier 只在这次返回值里出现
+   * 一次，调用方要靠它覆盖落盘那份，否则角色紧接着写 [vote:C] 时那个字母对
+   * 不上任何东西（自己发起的投票那份 id 本来全是空串）。
+   */
+  assert.deepEqual(fresh, [
+    { text: "火锅", optionIdentifier: "o-1" },
+    { text: "烧烤", optionIdentifier: "o-2" },
+    { text: "烤鱼", optionIdentifier: "o-3" },
+  ]);
+});
+
+await okAsync("入参缺一个就不开客户端", async () => {
+  photon.addCalls.length = 0;
+  const base = { projectId: "p", projectSecret: "s", pollMessageGuid: "P-1", text: "烤鱼" };
+  for (const key of ["projectId", "projectSecret", "pollMessageGuid", "text"]) {
+    assert.equal(await POLL.addPollOption({ ...base, [key]: "" }), null, `${key} 空的时候不该加`);
+  }
+  assert.equal(photon.addCalls.length, 0);
+});
+
+await okAsync("加不上去返回 null（不抛，也不重试）", async () => {
+  photon.addCalls.length = 0;
+  photon.addThrows = true;
+  const fresh = await POLL.addPollOption({
+    projectId: "p",
+    projectSecret: "s",
+    pollMessageGuid: "P-1",
+    text: "烤鱼",
+  });
+  assert.equal(fresh, null);
+  // 试一次就收手 —— 重试会加出两个一样的选项
+  assert.equal(photon.addCalls.length, 1);
+  photon.addThrows = false;
+});
+
+/*
+ * 「加上了」和「拿到新表了」是两件事。服务端真把选项加上去了、只是回的 Poll 里
+ * 选项是空的 —— 这时候返回 null 会让调用方以为失败，接着模型可能再加一次，
+ * 于是那个投票里出现两个一样的选项。所以这种情况返回空数组。
+ */
+await okAsync("加上了但没还回选项表：返回空数组，不是 null", async () => {
+  photon.addResult = { title: "今晚吃什么", options: [] };
+  const fresh = await POLL.addPollOption({
+    projectId: "p",
+    projectSecret: "s",
+    pollMessageGuid: "P-1",
+    text: "烤鱼",
+  });
+  assert.deepEqual(fresh, [], "加上了就不该报失败");
+});
+
+await okAsync("加选项带超时、用完就关客户端", async () => {
+  photon.addResult = { title: "t", options: [{ text: "a", optionIdentifier: "o-1" }] };
+  photon.clientOpts.length = 0;
+  const before = photon.closedClients;
+  await POLL.addPollOption({
+    projectId: "p",
+    projectSecret: "s",
+    pollMessageGuid: "P-1",
+    text: "烤鱼",
+  });
+  assert.ok(photon.clientOpts[0]?.timeout > 0, "加选项那条没设一元超时");
+  assert.ok(photon.closedClients > before, "客户端没关");
+});
+
 /* ================= 5. 落盘（pollstore.js） ================= */
 
 section("落盘（pollstore.js）");
@@ -892,6 +1027,29 @@ await okAsync("取字节：入参缺一个就不打 RPC", async () => {
     assert.equal(await CARD.fetchEmbeddedMedia({ ...base, [key]: "" }), null);
   }
   assert.equal(photon.embedded, null, "居然打了 RPC");
+});
+
+/*
+ * 取字节那条的超时要比读元数据宽得多。
+ *
+ * 那两条（fetchCardDetail / 问原始消息）问的是几个字段，6 秒够了；这条要把一张
+ * 图整个传下来。用户报过「数码点触还是不显示」，日志里就是
+ * `The operation was aborted due to timeout` —— 超时之后模型只收到一句
+ * 「{{user}}发来了一条 Digital Touch」，于是回「这是什么/看不出来」。
+ *
+ * 仍然要有上限：这条路在**收消息**那一轮里同步等着。
+ */
+await okAsync("取字节的超时比读详情宽（6 秒传不完一张图）", async () => {
+  photon.clientOpts.length = 0;
+  photon.embedded = { reply: { data: new Uint8Array([1]), mimeType: "image/png" } };
+  await CARD.fetchEmbeddedMedia({
+    projectId: "p",
+    projectSecret: "s",
+    chatGuid: CHAT,
+    messageGuid: "M-1",
+  });
+  const t = photon.clientOpts[0]?.timeout;
+  assert.ok(t > 6000, `取字节的超时是 ${t}ms，传一张图不够`);
 });
 
 await okAsync("取字节：Uint8Array 转成 Buffer，mimeType 带回来", async () => {
@@ -1101,12 +1259,64 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
     return i;
   };
 
-  okWith("vote / poll 两个 kind 各有自己的分发分支", () => {
+  okWith("vote / poll_add / poll 三个 kind 各有自己的分发分支", () => {
     assert.ok(src.includes('part.kind === "vote"'));
+    assert.ok(src.includes('part.kind === "poll_add"'));
     assert.ok(src.includes('part.kind === "poll"'));
+    assert.ok(src.includes("runPollAddPart(runner, part, ctx)"));
     assert.ok(src.includes("sendPollPart(runner, space, part, ctx)"));
     assert.ok(src.includes('vote: "投票"'));
+    assert.ok(src.includes('poll_add: "给投票加选项"'));
     assert.ok(src.includes('poll: "发起投票"'));
+  });
+
+  /* 加选项和投票同一档：改的是已有气泡，不新起消息。理由同下面那条。 */
+  okWith("加选项走 react/undo 那一档：只算 acted，不算 sent", () => {
+    const branch = at('part.kind === "poll_add"');
+    const end = src.indexOf("continue;", branch);
+    assert.ok(end > branch, "poll_add 那个分支没有 continue？");
+    const body = src.slice(branch, end);
+    assert.ok(/acted \+= 1/.test(body), "没算 acted");
+    assert.ok(!/sent \+= 1/.test(body), "加选项不该算 sent（它不新起消息）");
+    assert.ok(!/typing/i.test(body), "加选项不该打 typing");
+  });
+
+  /*
+   * runPollAddPart 的几道闸和 runVotePart 一样，外加「不加重复的」和「满了不加」。
+   *
+   * 重复那道最要紧：苹果那边**允许**加重名选项，加出来两个「炸鸡」谁也分不清该
+   * 投哪个，而 matchOption 按文字匹配时只会命中第一个 —— 于是角色投了 E、对方
+   * 手机上亮的是 C。
+   */
+  okWith("runPollAddPart：开关 / 云端 / 有投票 / 不重复 / 没满，五道闸都在", () => {
+    const body = src.slice(
+      at("async function runPollAddPart("),
+      at("async function sendPollPart(")
+    );
+    assert.ok(body.includes("role?.poll?.enabled"), "没判角色开关");
+    assert.ok(body.includes('runner.mode !== "cloud"'), "没判云端模式");
+    assert.ok(body.includes("findLatestPoll("), "没去找这条会话最近那个投票");
+    assert.ok(/dupe/.test(body) && body.includes("不重复加"), "没挡重复选项");
+    assert.ok(body.includes("MAX_POLL_OPTIONS"), "没挡「已经十个了」");
+    assert.ok(body.includes("MAX_POLL_OPTION_TEXT"), "没截过长的选项文字");
+  });
+
+  /*
+   * 加完必须把新表**落盘覆盖**掉：addOption 生成的新 id 只在那次返回值里出现
+   * 一次。不存的话角色紧接着写 [vote:E] 对不上任何东西（自己发起的投票那份 id
+   * 本来全是空串，见 sendPollPart）。
+   *
+   * `fresh.length` 那道判空同 handlePollEvent：putPoll 的
+   * `entry.options ?? prev.options` 拦不住空数组，会把好好的那份洗成空的。
+   */
+  okWith("加完把新的选项表落盘（不然紧接着那个 [vote:X] 对不上 id）", () => {
+    const body = src.slice(
+      at("async function runPollAddPart("),
+      at("async function sendPollPart(")
+    );
+    assert.ok(body.includes("putPoll("), "加完没落盘");
+    assert.ok(body.includes("if (fresh.length)"), "空数组会把存好的选项洗掉");
+    assert.ok(body.includes("options: fresh"), "落盘的不是加完那张新表");
   });
 
   /*
@@ -1184,6 +1394,63 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
      */
     assert.ok(body.includes("else if (options.length)"), "没挡住空选项表（会把落盘那份洗空）");
     assert.ok(body.includes("...(title ? { title } : {})"), "空标题会把存好的标题洗掉");
+  });
+
+  /*
+   * created / optionAdded 那一支的 title 也得**只在拿到了的时候传**。
+   *
+   * Photon 那边投票资源的 title 本来就常常是空的（Spectrum 那条
+   * `failed to cache poll / path:["title"] / Too small` 说的就是这件事，回源问
+   * `polls.get` 拿到的也是空串）。而**角色自己发起的**那些投票，标题是
+   * sendPollPart 存进去的，只存在我们这份记录里 —— 无条件传的话对方一「加选项」
+   * 就把它洗成空串，于是日志变成「已在「」里投了【X】」（用户报过这一条），
+   * 那句系统提示里的「注释是：""」也跟着废了。
+   */
+  okWith("created / optionAdded 的空标题不能洗掉存好的那个", () => {
+    const body = src.slice(at("async function handlePollEvent("), at("function pollHintFor("));
+    const branch = body.slice(0, body.indexOf("else if (options.length)"));
+    assert.ok(
+      branch.includes("...(title ? { title } : {})"),
+      "created / optionAdded 无条件传 title —— 空串会把存好的标题洗掉"
+    );
+    /*
+     * 只看 putPoll 那一次调用的实参。整段去正则会撞上上面那行解构
+     * （`const { kind, chatGuid, peerKey, pollMessageGuid, title, options } = ev;`），
+     * 于是这条永远红。
+     */
+    const call = branch.slice(branch.indexOf("putPoll("));
+    const args = call.slice(0, call.indexOf("});"));
+    // 裸的 `title,` = 无条件当简写属性传进去了。三元里那个 `{ title }` 不算
+    assert.ok(!/\btitle,/.test(args), "还在无条件传 title");
+  });
+
+  /*
+   * 标题空的时候那句提示要**整句不提注释**，而不是拼出 `注释是：""` ——
+   * 后者更糟，模型会当成「对方发了个没标题的投票」去演。
+   */
+  okWith("标题空的时候不提注释（不拼出 注释是：\"\"）", () => {
+    const body = src.slice(at("function pollHintFor("), at("function pollHintFor(") + 2400);
+    assert.ok(body.includes('${title ? `，注释是："${title}"` : ""}'), "标题空的时候会拼出空注释");
+  });
+
+  /*
+   * 日志前缀只拼一遍。watchPolls / watchChatBackground 自己会把 label 拼成
+   * 「投票·Nero」，这边再传 scopeOf(...) 进去就拼成了 `[投票·投票·Nero]`
+   * ——用户日志里出现过这一行。
+   */
+  okWith("订阅的 label 传角色名，不是拼好的前缀（不然日志里前缀重两遍）", () => {
+    for (const [fn, next] of [
+      ["function startPollWatcher(", "watchPolls({"],
+      ["function startBgWatcher(", "watchChatBackground({"],
+    ]) {
+      const from = at(next);
+      const body = src.slice(from, from + 700);
+      assert.ok(body.includes("label: runner.label ?? \"\""), `${fn} 的 label 不是角色名`);
+      assert.ok(
+        !/label:\s*scopeOf\(/.test(body),
+        `${fn} 把拼好的前缀当 label 传了 —— 日志里会出现「投票·投票·Nero」这种`
+      );
+    }
   });
 
   /*
@@ -1281,12 +1548,22 @@ section("imessage.js 的接线（读源码，跑不起真桥接）");
   });
 
   okWith("注入的那句话和用户钉的样板一致", () => {
-    const body = src.slice(at("function pollHintFor("), at("function pollHintFor(") + 1800);
-    assert.ok(body.includes("向你发起了一个投票，注释是"));
+    const body = src.slice(at("function pollHintFor("), at("function pollHintFor(") + 2400);
+    assert.ok(body.includes("向你发起了一个投票"));
+    /*
+     * 「注释是」是**条件拼上去的**，不是死在那句话里的。
+     *
+     * Photon 送来的 created delta 里 title 常常是空串（poll.js 头部那条
+     * ZodError 说的就是这件事），硬拼的话模型会读到 `注释是：""` —— 比不提
+     * 更糟，它会当成「对方发了个没标题的投票」去演。所以这里钉的是那个
+     * 三元，不是连着的字面串。
+     */
+    assert.ok(body.includes('`，注释是："${title}"`'), "标题空的时候要整句不提注释");
     assert.ok(body.includes("renderOptions(options)"), "选项没按字母表渲");
     assert.ok(body.includes("[vote:A]"));
     assert.ok(body.includes("一次只能投一个选项"));
-    assert.ok(body.includes("你也可以不投票，直接回复文字即可"));
+    assert.ok(body.includes("[poll_add:选项文字]"), "没告诉模型能加选项");
+    assert.ok(body.includes("你也可以什么都不做，直接回复文字即可"));
   });
 
   okWith("手写 / DT：三道闸齐全，不是图片就保留原来那句提示", () => {
