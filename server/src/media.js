@@ -1614,6 +1614,11 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音") {
 
 /* ================= 生成图片 ================= */
 
+/** 上游回的是图片链接时，单次下载等多久。只是取一个几 MB 的文件，用不着 IMAGE_TIMEOUT。 */
+const IMAGE_FETCH_TIMEOUT = 60000;
+/** 取图片链接失败时隔多久再取。三次机会，见 readImageFrom。 */
+const IMAGE_FETCH_RETRY_DELAYS = [1000, 3000];
+
 /**
  * 响应里的图片可能是 base64，也可能是一条 URL。两种都认。
  *
@@ -1626,10 +1631,32 @@ async function readImageFrom(item, scope) {
   const url = item?.url;
   if (typeof url === "string" && /^https?:\/\//i.test(url)) {
     logDebug(scope, "上游返回的是图片链接，再取一次字节");
-    // 跟着「模型 API」那个勾走：这条链接是出图接口自己给的，域名通常和它同一家
-    const res = await fetch(url, { signal: AbortSignal.timeout(IMAGE_TIMEOUT) });
-    if (!res.ok) throw new Error(`取图片链接失败：HTTP ${res.status}`);
-    return Buffer.from(await res.arrayBuffer());
+    /*
+     * 走到这里图已经画好、钱已经扣了，所以这一步**值得多试几次**：只是下载，
+     * 重来不花钱也不重画。实测 5w5.wtf 给的链接在 open.kcai.asia，直连偶尔
+     * 握手超时（UND_ERR_CONNECT_TIMEOUT），一次不重就是一张白扣钱的图。
+     */
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT) });
+        if (res.ok) return Buffer.from(await res.arrayBuffer());
+        if (!(res.status === 429 || res.status >= 500) || attempt >= IMAGE_FETCH_RETRY_DELAYS.length) {
+          throw new Error(`图画好了，但取图片链接失败：HTTP ${res.status}`);
+        }
+        logWarn(scope, `取图片链接返回 ${res.status}，${IMAGE_FETCH_RETRY_DELAYS[attempt]}ms 后再取一次`);
+      } catch (e) {
+        if (String(e?.message).startsWith("图画好了")) throw e;
+        if (!worthRetry(e) || attempt >= IMAGE_FETCH_RETRY_DELAYS.length) {
+          throw new Error(`图画好了，但取图片链接失败：${whyFetch(e, IMAGE_FETCH_TIMEOUT)}`);
+        }
+        logWarn(
+          scope,
+          `取图片链接没连上（${whyFetch(e, IMAGE_FETCH_TIMEOUT)}），` +
+            `${IMAGE_FETCH_RETRY_DELAYS[attempt]}ms 后再取一次`
+        );
+      }
+      await wait(IMAGE_FETCH_RETRY_DELAYS[attempt]);
+    }
   }
   const b64 = item?.b64_json ?? item?.b64 ?? item?.image;
   // 有些中转站会带上 data:image/png;base64, 前缀
@@ -1693,9 +1720,8 @@ const MAX_FIELD_DROPS = 4;
  *
  * **只两次，而且刻意比聊天那条短。** 出图本来就要一分钟上下，而且是同步的
  * （对方在那头看着打字指示器等）。我们自己的请求超时压根不重试，见 worthImageRetry。
- * 但反过来，一次上游抖动就让这张图彻底发不出去也不对 —— 这正是
- * 「同一把密钥同一个模型，Cherry Studio 里能出、这边时不时不行」的由来：
- * 那边失败了你会手点一下重发，这边原来一次都不重。
+ * 但反过来，一次上游抖动就让这张图彻底发不出去也不对：Cherry Studio 那边
+ * 失败了你会手点一下重发，这边原来一次都不重。
  */
 const IMAGE_RETRY_DELAYS = [1200, 5000];
 
@@ -2022,11 +2048,18 @@ export async function generateImage(endpoint, req, scope = "生图") {
    * 再各自装进 JSON / multipart。这样上游嫌弃某个字段时，剥掉它只要改这一处
    * （dropUnknownField 会把 body 和 form 一起改），不用把两条路各写一遍。
    */
+  /*
+   * **不发 `response_format`**。以前固定要 `b64_json`，实测（5w5.wtf 的
+   * gpt-image-2.5，同一把密钥同一段提示词）：要 b64 的 9 次只成 2 次，其余全是
+   * 第 60 秒的 504 或者干脆挂满超时；不要的 15 次成 13 次，二三十秒就回来。
+   * 上游要把整张 PNG 编成 base64 塞进响应，多出来的这段正好顶上中转站 60 秒的线。
+   * Cherry Studio 能出、这边出不来，差的就是这一个字段。
+   * 不发的话上游回一条链接，readImageFrom 再去取字节；回 b64 也照样认。
+   */
   const body = {
     model,
     prompt,
     n: 1,
-    response_format: "b64_json",
     ...(negative ? { negative_prompt: negative } : {}),
     ...(ratio ? { size: ratio.size, aspect_ratio: ratio.key } : {}),
   };

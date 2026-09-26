@@ -1464,6 +1464,45 @@ console.log("\n[生图：文生图]");
     assert.equal(viaUrl.mimeType, "image/jpeg");
     ok("返回图片链接时再取一次字节，按魔数认出 jpeg");
 
+    /*
+     * 取链接那一下握手超时：图已经画好、钱已经扣了，只重新下载，不重新出图。
+     * 实测 open.kcai.asia 直连偶尔 UND_ERR_CONNECT_TIMEOUT。
+     */
+    let gens = 0;
+    let pulls = 0;
+    globalThis.fetch = async (url) => {
+      if (!String(url).startsWith("https://cdn.")) {
+        gens += 1;
+        return new Response(JSON.stringify({ data: [{ url: "https://cdn.example.com/a.jpg" }] }));
+      }
+      pulls += 1;
+      if (pulls < 3) {
+        const e = new TypeError("fetch failed");
+        e.cause = { code: "UND_ERR_CONNECT_TIMEOUT" };
+        throw e;
+      }
+      return new Response(Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+    };
+    await generateImage(ep, { prompt: "猫" }, "测试");
+    assert.equal(gens, 1);
+    assert.equal(pulls, 3);
+    ok("取图片链接连不上 → 只重新下载（最多三次），不重新出图");
+
+    gens = 0;
+    pulls = 0;
+    globalThis.fetch = async (url) => {
+      if (!String(url).startsWith("https://cdn.")) {
+        gens += 1;
+        return new Response(JSON.stringify({ data: [{ url: "https://cdn.example.com/a.jpg" }] }));
+      }
+      pulls += 1;
+      return new Response("gone", { status: 404 });
+    };
+    await assert.rejects(() => generateImage(ep, { prompt: "猫" }, "测试"), /图画好了.*404/);
+    assert.equal(gens, 1);
+    assert.equal(pulls, 1);
+    ok("图片链接 404 → 不重取，报「图画好了但取不到」");
+
     // 出错路径
     globalThis.fetch = async () => new Response("<html>502 Bad Gateway</html>", { status: 502 });
     await assert.rejects(() => generateImage(ep, { prompt: "猫" }, "测试"), /502/);
@@ -1485,7 +1524,7 @@ console.log("\n[生图：文生图]");
  * 上游不认某个可选字段就剥掉重发。
  *
  * 这一段对应用户报的「测试能出图、快捷指令和角色自己出图就 400」—— 其实和
- * 入口无关：官方 gpt-image 系列会因为 response_format 把整个请求 400 掉，
+ * 入口无关：官方 gpt-image 系列会因为不认识的字段把整个请求 400 掉，
  * 而一家中转站背后挂着好几条渠道，轮到严格的那条就 400、宽松的那条就出图，
  * 于是看起来像「一会儿行一会儿不行」。
  */
@@ -1515,18 +1554,26 @@ console.log("\n[生图：上游不认某个可选字段就剥掉重发]");
     );
 
   try {
-    // 一发就中：response_format 被嫌弃，去掉它第二发成功
+    // 一发就中：aspect_ratio 被嫌弃，去掉它第二发成功
     let bodies = [];
     globalThis.fetch = async (_url, init) => {
       bodies.push(JSON.parse(init.body));
-      return bodies.length === 1 ? unknownParam("response_format") : new Response(okBody);
+      return bodies.length === 1 ? unknownParam("aspect_ratio") : new Response(okBody);
     };
     let out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
     assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
     assert.equal(bodies.length, 2);
-    assert.equal(bodies[0].response_format, "b64_json");
-    assert.equal("response_format" in bodies[1], false);
-    ok("400 说不认 response_format → 去掉它重发，这一发出图成功");
+    assert.equal(bodies[0].aspect_ratio, "9:16");
+    assert.equal("aspect_ratio" in bodies[1], false);
+    ok("400 说不认 aspect_ratio → 去掉它重发，这一发出图成功");
+
+    /*
+     * response_format 压根不发。要 b64_json 的话上游得把整张 PNG 编进响应，
+     * 实测 5w5.wtf 的 gpt-image-2.5 九次只成两次、其余卡在中转站 60 秒那条线上 504，
+     * 不要就十五次成十三次 —— 「Cherry Studio 能出、这边不能」差的就是它。
+     */
+    assert.equal("response_format" in bodies[0], false);
+    ok("出图请求不带 response_format（让上游回链接，别逼它塞 base64）");
 
     // 剩下的字段一个都不许丢：少发 prompt 或 model 的话这次重发毫无意义
     assert.equal(bodies[1].prompt, "毛血旺");
@@ -1535,12 +1582,12 @@ console.log("\n[生图：上游不认某个可选字段就剥掉重发]");
     assert.equal(bodies[1].size, "768x1344");
     ok("只剥被点名的那一个，描述 / 模型 / 负面 / 尺寸照旧");
 
-    // 连着撞好几个：response_format → aspect_ratio → 成功
+    // 连着撞好几个：n → aspect_ratio → 成功
     bodies = [];
     globalThis.fetch = async (_url, init) => {
       const b = JSON.parse(init.body);
       bodies.push(b);
-      if ("response_format" in b) return unknownParam("response_format");
+      if ("n" in b) return unknownParam("n");
       if ("aspect_ratio" in b) return unknownParam("aspect_ratio");
       return new Response(okBody);
     };
@@ -1616,14 +1663,14 @@ console.log("\n[生图：上游不认某个可选字段就剥掉重发]");
     globalThis.fetch = async (_url, init) => {
       bodies.push(JSON.parse(init.body));
       if (bodies.length > 1) return new Response(okBody);
-      const r = unknownParam("response_format");
+      const r = unknownParam("aspect_ratio");
       return new Response(await r.text(), { status: 200 });
     };
     out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
     assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
     assert.equal(bodies.length, 2);
-    assert.equal("response_format" in bodies[1], false);
-    ok("200 但响应体是「不认 response_format」→ 一样剥掉重发");
+    assert.equal("aspect_ratio" in bodies[1], false);
+    ok("200 但响应体是「不认某个字段」→ 一样剥掉重发");
 
     hits = 0;
     globalThis.fetch = async () => {
@@ -1655,11 +1702,12 @@ console.log("\n[生图：上游不认某个可选字段就剥掉重发]");
     const forms = [];
     globalThis.fetch = async (_url, init) => {
       forms.push(init.body);
-      return forms.length === 1 ? unknownParam("response_format") : new Response(okBody);
+      return forms.length === 1 ? unknownParam("aspect_ratio") : new Response(okBody);
     };
     await generateImage(ep, { prompt: "让它躺下", refFile: resolveRefFile("小猫") }, "测试");
     assert.equal(forms.length, 2);
-    assert.equal(forms[1].get("response_format"), null);
+    assert.equal(forms[0].get("response_format"), null);
+    assert.equal(forms[1].get("aspect_ratio"), null);
     assert.equal(forms[1].get("prompt"), "让它躺下");
     // 参考图那个文件字段得还在，不然第二发等于降级成了文生图
     assert.equal(forms[1].get("image")?.name, "小猫.png");
@@ -1787,7 +1835,7 @@ console.log("\n[生图：上游抖动会重试]");
     /*
      * 剥字段和重试是两份预算。
      *
-     * 混在一个计数里的话，「剥掉 response_format 之后又赶上一次 504」会被当成
+     * 混在一个计数里的话，「剥掉 n 之后又赶上一次 504」会被当成
      * 第二次重试 —— 而这两件事一件是「把请求改对」、一件是「再碰一次运气」。
      */
     hits = 0;
@@ -1796,9 +1844,9 @@ console.log("\n[生图：上游抖动会重试]");
       hits += 1;
       const b = JSON.parse(init.body);
       seen.push(b);
-      if ("response_format" in b) {
+      if ("n" in b) {
         return new Response(
-          JSON.stringify({ error: { message: "Unknown parameter: 'response_format'.", param: "response_format" } }),
+          JSON.stringify({ error: { message: "Unknown parameter: 'n'.", param: "n" } }),
           { status: 400 }
         );
       }
@@ -1808,7 +1856,7 @@ console.log("\n[生图：上游抖动会重试]");
     assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
     // 1 剥字段 + 2 撞 504 + 3 成功
     assert.equal(hits, 3);
-    assert.equal("response_format" in seen[2], false);
+    assert.equal("n" in seen[2], false);
     ok("剥字段不占重试预算（剥完又撞 504 照样能重试成功）");
   } finally {
     globalThis.fetch = realFetch;
