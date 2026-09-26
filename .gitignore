@@ -90,6 +90,16 @@ uranus-worldbook-*.json
 uranus-memorybank-*.json
 uranus-regexrules-*.json
 
+# ---------- 自己攒的知识库 / 人设稿 ----------
+# uranus-kb/ 是手写的部署笔记和人设稿，跟代码没关系。**必须挡住** ——
+# 里面那份 `Uranus人设-瘦身版.yaml` 是不外传的（同「神本无相」那类：
+# 别人写的正文，作者不许二传），一次 `git add .` 就会把它送上 GitHub。
+# 整个目录一起挡，省得以后往里添文件时又漏一个。
+uranus-kb/
+# 兜底：这份稿子挪到哪都不传
+*人设*.yaml
+*人设*.yml
+
 # ---------- 一键更新留下的东西（更新.bat / scripts/update.mjs） ----------
 # 替换前的旧版文件。留最近三份，新版起不来能照原样盖回去，确认没问题就能删
 .update-backup/

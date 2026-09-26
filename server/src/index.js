@@ -3767,9 +3767,17 @@ if (IG_PORT) {
   });
 }
 
-// 进程收到退出信号时把连接收干净，别在 Photon 那边留着挂起的会话
+/*
+ * 进程收到退出信号时把连接收干净，别在 Photon 那边留着挂起的会话。
+ *
+ * 8 秒兜底是 spectrum-ts 12.10 之后才要的：那以前 SDK 自己也挂了一份 SIGINT /
+ * SIGTERM 处理器，收尾超过 3 秒就替我们 process.exit(1)。12.10 把它拿掉了，
+ * 现在只剩这一个 —— stopAllBridges 本身不限时，哪条连接关不掉，Ctrl+C 和
+ * systemctl stop 就一直卡着不退。SDK 内部关流最多等 5 秒，8 秒留足余量。
+ */
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
+    setTimeout(() => process.exit(1), 8000).unref();
     await stopAllBridges().catch(() => {});
     process.exit(0);
   });

@@ -368,7 +368,15 @@ const src = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf-8");
     ["server/src/igimage.js", 2], // Cloudinary 上传 + 删除
     ["server/src/igreal.js", 1], // 把远端图片拉回本地
     ["server/src/cloud/net.js", 1], // 两家云的所有请求都从这一个 call() 出去
-    ["server/src/media.js", 5], // TTS ×2（SoVITS 是本机，不挂）+ 生图 ×3
+    /*
+     * TTS ×2（SoVITS 是本机，那处故意用裸 fetch）+ 生图 ×2。
+     *
+     * 生图原来是 3 处（文生图、图生图、取图片链接）。前两处现在合成了一处 ——
+     * 两条路发的是同一份字段，只是载体不同（JSON / multipart），摊平成一个 body
+     * 之后就只剩 `init` 里一个三元分支了。合并本身是为了「上游嫌弃某个字段就剥掉
+     * 重发」那件事：字段只构造一次，剥的时候不用两条路各改一遍。
+     */
+    ["server/src/media.js", 4],
     /*
      * linkmeta.js 的九处：抓网页的 GET + 跟重定向的 HEAD ×2 + B 站 API +
      * 抖音（收 cookie 那趟 + 带 ttwid 重抓那趟）+ 小红书 + 把图拉回本地 +

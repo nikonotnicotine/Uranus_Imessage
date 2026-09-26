@@ -1481,6 +1481,340 @@ console.log("\n[生图：文生图]");
   }
 }
 
+/*
+ * 上游不认某个可选字段就剥掉重发。
+ *
+ * 这一段对应用户报的「测试能出图、快捷指令和角色自己出图就 400」—— 其实和
+ * 入口无关：官方 gpt-image 系列会因为 response_format 把整个请求 400 掉，
+ * 而一家中转站背后挂着好几条渠道，轮到严格的那条就 400、宽松的那条就出图，
+ * 于是看起来像「一会儿行一会儿不行」。
+ */
+console.log("\n[生图：上游不认某个可选字段就剥掉重发]");
+{
+  const realFetch = globalThis.fetch;
+  const ep = {
+    url: "https://a.example.com/v1",
+    key: "K1",
+    model: "gpt-image-2.5",
+    label: "dzz · gpt-image-2.5",
+    negativePrompt: "lowres",
+    ratio: { key: "9:16", size: "768x1344" },
+  };
+  const okBody = JSON.stringify({ data: [{ b64_json: PNG_MAGIC.toString("base64") }] });
+  const unknownParam = (name) =>
+    new Response(
+      JSON.stringify({
+        error: {
+          message: `Unknown parameter: '${name}'.`,
+          type: "invalid_request_error",
+          param: name,
+          code: "unknown_parameter",
+        },
+      }),
+      { status: 400 }
+    );
+
+  try {
+    // 一发就中：response_format 被嫌弃，去掉它第二发成功
+    let bodies = [];
+    globalThis.fetch = async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return bodies.length === 1 ? unknownParam("response_format") : new Response(okBody);
+    };
+    let out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].response_format, "b64_json");
+    assert.equal("response_format" in bodies[1], false);
+    ok("400 说不认 response_format → 去掉它重发，这一发出图成功");
+
+    // 剩下的字段一个都不许丢：少发 prompt 或 model 的话这次重发毫无意义
+    assert.equal(bodies[1].prompt, "毛血旺");
+    assert.equal(bodies[1].model, "gpt-image-2.5");
+    assert.equal(bodies[1].negative_prompt, "lowres");
+    assert.equal(bodies[1].size, "768x1344");
+    ok("只剥被点名的那一个，描述 / 模型 / 负面 / 尺寸照旧");
+
+    // 连着撞好几个：response_format → aspect_ratio → 成功
+    bodies = [];
+    globalThis.fetch = async (_url, init) => {
+      const b = JSON.parse(init.body);
+      bodies.push(b);
+      if ("response_format" in b) return unknownParam("response_format");
+      if ("aspect_ratio" in b) return unknownParam("aspect_ratio");
+      return new Response(okBody);
+    };
+    out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
+    assert.equal(bodies.length, 3);
+    assert.equal(bodies[2].size, "768x1344");
+    ok("一轮剥一个，连着撞两个也能收敛（aspect_ratio 走了 size 还留着）");
+
+    // 给不出 param 的站：从 message 里抠引号里那个词
+    bodies = [];
+    globalThis.fetch = async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return bodies.length === 1
+        ? new Response(
+            JSON.stringify({ error: { message: "unsupported parameter \"negative_prompt\"" } }),
+            { status: 400 }
+          )
+        : new Response(okBody);
+    };
+    await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.equal("negative_prompt" in bodies[1], false);
+    ok("没有 param 字段时从 message 里抠字段名");
+
+    // 400 但不是「不认识某字段」：原样抛出去，别把 prompt 剥成空请求
+    let hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return new Response(
+        JSON.stringify({
+          error: { message: "Invalid value: '768x1344'", param: "size", code: "invalid_value" },
+        }),
+        { status: 400 }
+      );
+    };
+    await assert.rejects(() => generateImage(ep, { prompt: "毛血旺" }, "测试"), /400/);
+    // size 在白名单里，所以这里会剥一次；剥完还是 400 就不再试了
+    assert.equal(hits, 2);
+    ok("剥完还是 400 → 老老实实抛错，不无限重发");
+
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return new Response(
+        JSON.stringify({ error: { message: "Unknown parameter: 'prompt'.", param: "prompt" } }),
+        { status: 400 }
+      );
+    };
+    await assert.rejects(() => generateImage(ep, { prompt: "毛血旺" }, "测试"), /400/);
+    assert.equal(hits, 1);
+    ok("被点名的是 prompt / model 这种必需字段 → 一次都不剥（剥了请求就没意义了）");
+
+    // 内容审查那类 400 也不该被当成「字段问题」反复发
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return new Response(
+        JSON.stringify({ error: { message: "Your request was rejected by safety system" } }),
+        { status: 400 }
+      );
+    };
+    await assert.rejects(() => generateImage(ep, { prompt: "毛血旺" }, "测试"), /400/);
+    assert.equal(hits, 1);
+    ok("认不出字段名的 400（比如内容审查）只发一次");
+
+    /*
+     * HTTP 200 装着一个报错。
+     *
+     * 用户日志里同一个 `Unknown parameter: 'response_format'`，这家中转站有时给
+     * 400、有时给 200。给 200 的那次原来报「缺 data 数组」，剥字段那条路没走到。
+     */
+    bodies = [];
+    globalThis.fetch = async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      if (bodies.length > 1) return new Response(okBody);
+      const r = unknownParam("response_format");
+      return new Response(await r.text(), { status: 200 });
+    };
+    out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
+    assert.equal(bodies.length, 2);
+    assert.equal("response_format" in bodies[1], false);
+    ok("200 但响应体是「不认 response_format」→ 一样剥掉重发");
+
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return new Response(JSON.stringify({ error: { message: "insufficient balance" } }), {
+        status: 200,
+      });
+    };
+    await assert.rejects(
+      () => generateImage(ep, { prompt: "毛血旺" }, "测试"),
+      /HTTP 200.*insufficient balance/
+    );
+    assert.equal(hits, 1);
+    ok("200 装着认不出字段的报错 → 原样报出来（说清是 200），不重发");
+
+    // 图出来了、顺带捎了个 error 字段：图照收，别当失败
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          data: [{ b64_json: PNG_MAGIC.toString("base64") }],
+          error: { message: "deprecated field ignored" },
+        })
+      );
+    out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
+    ok("有图又带 error 字段的 200 → 图照收");
+
+    // 图生图那条路也要跟着剥 —— 发的是同一份字段，只是换了 multipart 的载体
+    const forms = [];
+    globalThis.fetch = async (_url, init) => {
+      forms.push(init.body);
+      return forms.length === 1 ? unknownParam("response_format") : new Response(okBody);
+    };
+    await generateImage(ep, { prompt: "让它躺下", refFile: resolveRefFile("小猫") }, "测试");
+    assert.equal(forms.length, 2);
+    assert.equal(forms[1].get("response_format"), null);
+    assert.equal(forms[1].get("prompt"), "让它躺下");
+    // 参考图那个文件字段得还在，不然第二发等于降级成了文生图
+    assert.equal(forms[1].get("image")?.name, "小猫.png");
+    ok("图生图同样剥字段，参考图文件还在（不会静默降级成文生图）");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+/*
+ * 上游抖一下不该让这张图彻底发不出去。
+ *
+ * 用户的原话是「同一把密钥同一个模型名，我在 Cherry Studio 里能正常出」——
+ * 那边失败了他会手点一下重发，而这边原来一次都不重，于是中转站一次 504 / 一次
+ * 「连不上上游渠道」就是一张图没了。
+ *
+ * **这里只测「重试了没有」和「该不该重」，不测把重试次数耗尽。** 耗尽要真等完
+ * 1.2s + 5s 的退避，理由同 test-video.mjs:762 那条注释：一条断言不值得让整个
+ * 套件多跑六秒，而次数上限就是两行 `+= 1`，不是会跑歪的逻辑。
+ */
+console.log("\n[生图：上游抖动会重试]");
+{
+  const realFetch = globalThis.fetch;
+  const ep = {
+    url: "https://a.example.com/v1",
+    key: "K1",
+    model: "gpt-image-2.5",
+    label: "55 · gpt-image-2.5",
+  };
+  const okBody = JSON.stringify({ data: [{ b64_json: PNG_MAGIC.toString("base64") }] });
+
+  try {
+    // 504：中转站超时，第二发就好了
+    let hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return hits === 1 ? new Response("upstream timeout", { status: 504 }) : new Response(okBody);
+    };
+    let out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
+    assert.equal(hits, 2);
+    ok("504 会重试，第二发成功就当成功");
+
+    // 429：限流，同样值得再等一下
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return hits === 1 ? new Response("rate limited", { status: 429 }) : new Response(okBody);
+    };
+    await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.equal(hits, 2);
+    ok("429 会重试");
+
+    /*
+     * 中转站拿 404 转述「我连不上上游渠道」。
+     *
+     * 这是最坑的一种：404 的字面意思是「没有这个模型」「地址填错了」，会把人
+     * 带到配置里去查，而实际上同一个配置下一发就可能轮到一条通的渠道。
+     */
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return hits === 1
+        ? new Response(JSON.stringify({ error: { type: "openai_error", message: "404" } }), {
+            status: 404,
+          })
+        : new Response(okBody);
+    };
+    await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.equal(hits, 2);
+    ok("中转站拿 404 转述的上游故障（openai_error）会重试");
+
+    // 干净的 404 是真·模型名写错，重试一百次也一样
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return new Response(JSON.stringify({ error: { message: "model not found" } }), {
+        status: 404,
+      });
+    };
+    await assert.rejects(() => generateImage(ep, { prompt: "毛血旺" }, "测试"), /404/);
+    assert.equal(hits, 1);
+    ok("干净的 404（模型名写错）不重试");
+
+    // 401 / 余额不足这类：重试只是多烧一次额度
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      return new Response("bad key", { status: 401 });
+    };
+    await assert.rejects(() => generateImage(ep, { prompt: "毛血旺" }, "测试"), /401/);
+    assert.equal(hits, 1);
+    ok("鉴权失败不重试");
+
+    // 连接层抖动（走代理时是常态）
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      if (hits === 1) {
+        const e = new Error("fetch failed");
+        e.cause = { code: "ECONNRESET" };
+        throw e;
+      }
+      return new Response(okBody);
+    };
+    await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.equal(hits, 2);
+    ok("连接被掐断会重试");
+
+    /*
+     * 我们自己的请求超时不重试。
+     *
+     * 用户日志里的样子：一条慢渠道 66s 出图，下一次正好 90s 被掐断。等满一整个
+     * 超时说明上游在画、只是慢，再发一次只会让对方多等一整轮、按次计费的再扣一次。
+     */
+    hits = 0;
+    globalThis.fetch = async () => {
+      hits += 1;
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    };
+    await assert.rejects(() => generateImage(ep, { prompt: "毛血旺" }, "测试"), /生图请求失败/);
+    assert.equal(hits, 1);
+    ok("请求超时（TimeoutError）不重试，一次就报错");
+
+    /*
+     * 剥字段和重试是两份预算。
+     *
+     * 混在一个计数里的话，「剥掉 response_format 之后又赶上一次 504」会被当成
+     * 第二次重试 —— 而这两件事一件是「把请求改对」、一件是「再碰一次运气」。
+     */
+    hits = 0;
+    const seen = [];
+    globalThis.fetch = async (_url, init) => {
+      hits += 1;
+      const b = JSON.parse(init.body);
+      seen.push(b);
+      if ("response_format" in b) {
+        return new Response(
+          JSON.stringify({ error: { message: "Unknown parameter: 'response_format'.", param: "response_format" } }),
+          { status: 400 }
+        );
+      }
+      return hits === 2 ? new Response("upstream timeout", { status: 504 }) : new Response(okBody);
+    };
+    out = await generateImage(ep, { prompt: "毛血旺" }, "测试");
+    assert.deepEqual([...out.buffer], [...PNG_MAGIC]);
+    // 1 剥字段 + 2 撞 504 + 3 成功
+    assert.equal(hits, 3);
+    assert.equal("response_format" in seen[2], false);
+    ok("剥字段不占重试预算（剥完又撞 504 照样能重试成功）");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 console.log("\n[生图：图生图走 multipart]");
 {
   const realFetch = globalThis.fetch;
@@ -1869,6 +2203,42 @@ console.log("\n[只改已有气泡的那一轮：不许当成失败]");
     assert.ok(body.includes("return false"), `${fn} 该在没做成时 return false`);
   }
   ok("runReactPart / runUndoPart 都会报「做成了没有」");
+
+  /*
+   * 出图用的模型必须**当场重新解析**，不许吃这一轮开头的快照。
+   *
+   * 这个 bug 的样子是：用户在「连接」面板把生图模型换了（或者把出错的那个关掉），
+   * 「测试出图」立刻就好，私聊里却还在拿旧模型撞同一个错 —— 于是看起来像
+   * 「测试能出图、真聊天就不行」，而其实两条路走的是同一个 generateImage。
+   *
+   * 成因是 `eps?.image ?? resolveImageEndpoint(config)` 这个顺序：eps 是这一轮开头
+   * 解析的，而出图排在整轮最后，一张图四五十秒、一轮几条气泡能跑好几分钟。调用方
+   * 明明特意重读了 config（「传的是**这一刻**重新读的 config」），却被快照盖掉。
+   *
+   * sendImagePart 不导出，所以照上面那个路子验源码结构。
+   */
+  const at = src.indexOf("async function sendImagePart(");
+  assert.ok(at > 0, "找不到 sendImagePart");
+  // 注释**必须先剥掉**：那上面就写着 `eps?.image ?? …` 当反面教材，
+  // 不剥的话下面那两条断言会被解释 bug 的话本身绊倒
+  const imgBody = src
+    .slice(at, at + 2600)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  assert.ok(
+    /const endpoint = resolveImageEndpoint\(config\);/.test(imgBody),
+    "出图该当场 resolveImageEndpoint(config)"
+  );
+  // 这两种写法都会让几分钟前的快照赢，是这个 bug 本身
+  assert.ok(
+    !/eps\??\.image\s*\?\?/.test(imgBody),
+    "不许写 eps?.image ?? …（快照会盖过刚存的配置）"
+  );
+  assert.ok(
+    !/resolveImageEndpoint\(config\)\s*\?\?\s*eps/.test(imgBody),
+    "也不许拿 eps 兜底（现读为 null 的典型场景正是「用户刚把那个模型关掉」）"
+  );
+  ok("出图的模型当场重解析，不吃这一轮开头的快照");
 }
 
 /* ================= 收尾 ================= */

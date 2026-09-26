@@ -4514,13 +4514,27 @@ async function sendVoicePart(runner, space, part, ctx) {
  */
 async function sendImagePart(runner, space, part, ctx) {
   const scope = scopeOf(runner, "生图");
-  const { role, config, eps } = ctx;
+  const { role, config } = ctx;
 
   if (!role?.imageGen?.enabled) {
     logInfo(scope, `这个角色没开「生成图片」，跳过这条：${part.text}`);
     return false;
   }
-  const endpoint = eps?.image ?? resolveImageEndpoint(config);
+  /*
+   * 生图模型**当场重新解析**，不吃 ctx.eps 里那份。
+   *
+   * eps 是这一轮开头解析的，而出图排在整轮的最后：一张图四五十秒，一轮几条气泡
+   * 能跑好几分钟。用户在这段时间里去「连接」面板改了生图模型（换一家服务商、
+   * 把出错的那个模型关掉），改完立刻发一句试 —— 原来这里写的是
+   * `eps?.image ?? resolveImageEndpoint(config)`，那份几分钟前的快照会盖过刚存的
+   * 配置，于是「测试出图」用新配置成功、这条私聊还在拿旧模型撞同一个错。调用方
+   * 传 config 时特意重读过一次（见 sendBubbles 的调用点：「传的是**这一刻**重新读
+   * 的 config」），这里吃快照就把那份用心作废了。
+   *
+   * 也**不拿 eps 兜底**：现读返回 null 的典型场景正是「用户刚把出错的那个模型
+   * 关掉」，这时候回退到快照等于把他刚关掉的模型复活，又绕回同一个 bug。
+   */
+  const endpoint = resolveImageEndpoint(config);
   if (!endpoint) {
     logError(
       scope,

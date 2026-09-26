@@ -55,8 +55,17 @@ const TTS_SCOPE = "语音";
  */
 const TTS_RETRIES = 1;
 
-/** 出一张图最多等多久 —— 比聊天慢一个量级，30s 是常态。 */
-const IMAGE_TIMEOUT = 90000;
+/**
+ * 出一张图最多等多久。
+ *
+ * 原来是 90s，照「30s 是常态」定的。但 gpt-image 系列走中转站实测要 60~90 多秒
+ * （同一条渠道测试按钮 66s 出图，紧接着私聊两次都正好在 90s 被掐断）—— 超不超
+ * 全看运气，于是表现成「测试能出、真聊天时出不来」。
+ *
+ * 放到 180s：宁可对方多看一会儿打字指示器，也别把一张上游已经在画（按次计费的
+ * 渠道这时候多半已经扣了钱）的图中途掐掉。
+ */
+const IMAGE_TIMEOUT = 180000;
 
 /**
  * 一条语音最多念多少字。
@@ -1683,6 +1692,155 @@ async function parseImageResponse(data, raw, scope) {
 }
 
 /**
+ * 我们**赌中转站会忽略**的那几个可选字段。
+ *
+ * `response_format` / `negative_prompt` / `size` / `aspect_ratio` 都不是所有上游
+ * 都认的东西（每一个的理由都写在 generateImage 的注释里）。绝大多数中转站的
+ * 处理是忽略，但**官方 gpt-image 系列会为此把整个请求 400 掉**：
+ *
+ *     {"error":{"message":"Unknown parameter: 'response_format'.",…,"param":"response_format"}}
+ *
+ * 而一家中转站背后常常挂着好几条上游渠道，一次请求轮到哪条是随机的 —— 严格的
+ * 那条 400、宽松的那条正常出图。在用户那头这会表现成「一会儿能出图一会儿不能」，
+ * 完全看不出是参数的事（实测同一个模型同一分钟内两种结果都出现过，于是很容易
+ * 误判成「测试能出图、真聊天时不能」）。
+ *
+ * 所以撞上了就把那个字段剥掉重发。这几个字段**少发一个都不影响出图**：
+ * `response_format` 不发的话，上游给 b64 还是给 URL 我们两种都认（readImageFrom）；
+ * `n` 默认就是 1；剩下两个本来就是「认就更好，不认也无妨」。`model` 和 `prompt`
+ * 刻意不在这张表里 —— 剥掉它们请求就没意义了。
+ */
+const DROPPABLE_IMAGE_FIELDS = new Set([
+  "response_format",
+  "negative_prompt",
+  "size",
+  "aspect_ratio",
+  "n",
+]);
+
+/** 最多剥几个字段。上面那张表本来就是有限的，这个上限只防「上游每次换一个名字」。 */
+const MAX_FIELD_DROPS = 4;
+
+/**
+ * 出图撞上「再打一次可能就好了」的失败时，等多久再发。
+ *
+ * **只两次，而且刻意比聊天那条短。** 出图本来就要一分钟上下，而且是同步的
+ * （对方在那头看着打字指示器等）。我们自己的请求超时压根不重试，见 worthImageRetry。
+ * 但反过来，一次上游抖动就让这张图彻底发不出去也不对 —— 这正是
+ * 「同一把密钥同一个模型，Cherry Studio 里能出、这边时不时不行」的由来：
+ * 那边失败了你会手点一下重发，这边原来一次都不重。
+ */
+const IMAGE_RETRY_DELAYS = [1200, 5000];
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 中转站用来转述「我连不上上游渠道」的那几种说法。
+ *
+ * 这类响应的状态码是中转站自己编的，常见的是拿 404 冒充 —— 但 404 的字面意思
+ * （「没有这个模型」「地址填错了」）会把人带到完全错的方向去查配置，而实际上
+ * 同一个配置下一发就可能轮到一条通的渠道。
+ */
+const RELAY_UPSTREAM_MARKS = [
+  "openai_error",
+  "bad_response_status_code",
+  "无可用渠道",
+  "上游负载",
+  "load is saturated",
+  "no available channel",
+];
+
+/**
+ * 这个 HTTP 失败值不值得再发一次。
+ *
+ * 429 和 5xx 照 llm.js:isTransient 的老规矩。额外认一种：**中转站拿 404
+ * 转述的上游故障**（见 RELAY_UPSTREAM_MARKS）—— 干净的 404 仍然当「模型名写错」
+ * 直接报错，只有响应体里明确写着「连不上上游渠道」才重试。
+ */
+function transientImageFailure(status, raw) {
+  if (status === 429 || (status >= 500 && status <= 504)) return true;
+  if (status !== 404) return false;
+  const low = String(raw ?? "").toLowerCase();
+  return RELAY_UPSTREAM_MARKS.some((m) => low.includes(m.toLowerCase()));
+}
+
+/**
+ * 出图时连接层的失败值不值得再发一次。
+ *
+ * 和 worthRetry 只差一条：**我们自己的请求超时不重试**。语音超时重试是对的
+ * （一条 30s，便宜），出图不一样 —— 等满 IMAGE_TIMEOUT 还没回来，说明请求早就
+ * 到了上游、上游正在画，只是画得慢。这时候再发一次：
+ *   - 对方多等一整个超时（原来是 90s × 3 ≈ 4.5 分钟看着打字指示器）；
+ *   - 按次计费的渠道，被掐掉的那次多半已经扣了钱，重发再扣一次；
+ *   - 慢的渠道下一发照样慢，几乎不会「这次就快了」。
+ * 连不上（UND_ERR_CONNECT_TIMEOUT）、连接被掐断这类照旧重试 —— 那是请求压根
+ * 没送到，或者网络抖了一下。
+ */
+function worthImageRetry(e) {
+  if (e?.name === "TimeoutError") return false;
+  return worthRetry(e);
+}
+
+/**
+ * HTTP 200、响应体却是一个报错 —— 有的中转站就这么干。
+ *
+ * 实测：同一个 `Unknown parameter: 'response_format'`，同一家中转站有时给 400、
+ * 有时给 200。给 200 的那次原来一路走到 parseImageResponse，报一句「返回里没有
+ * 图片（缺 data 数组）」，剥字段重发那条路根本没机会走。
+ *
+ * 判据是「有 error、且没有任何一种图片数组」，免得把「图出来了、顺带捎了个
+ * 警告」的响应当成失败。
+ */
+function errorInOkBody(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!data?.error) return false;
+  return ![data.data, data.images, data.output].some((l) => Array.isArray(l) && l.length);
+}
+
+/**
+ * 400 的响应体里，上游嫌弃的是哪个字段。认不出来就返回空串。
+ *
+ * OpenAI 那套直接把字段名写在 `error.param` 里，这是最靠得住的。给不出 param
+ * 的站才退回去从 message 里抠引号里那个词 —— 而且只在话里出现 unknown /
+ * unsupported 这类词的时候抠，不然 `Invalid value: '576x1024'` 会被抠出一个尺寸串。
+ */
+function unknownFieldOf(raw) {
+  let err;
+  try {
+    err = JSON.parse(raw)?.error;
+  } catch {
+    return "";
+  }
+  const param = String(err?.param ?? "").trim();
+  if (param) return param;
+  const m = /(?:unknown|unrecognized|unsupported|extra)[^'"`]{0,40}['"`]([a-zA-Z0-9_]+)['"`]/i.exec(
+    String(err?.message ?? "")
+  );
+  return m?.[1] ?? "";
+}
+
+/**
+ * 上游不认某个可选字段的话，把它从 JSON body（以及 multipart 表单）里删掉。
+ *
+ * 两边一起删是因为图生图那条路发的是同一份字段，只是换了个载体。
+ *
+ * @returns {string|null} 删掉的字段名；没有可删的就是 null（那就该照常报错了）
+ */
+function dropUnknownField(body, form, raw) {
+  const name = unknownFieldOf(raw);
+  // 不在白名单里 / 我们压根没发过它 / 已经剥过一轮了 —— 都不是这里能救的
+  if (!name || !DROPPABLE_IMAGE_FIELDS.has(name) || !(name in body)) return null;
+  delete body[name];
+  form?.delete(name);
+  return name;
+}
+
+/**
  * 出一张图。
  *
  * 两条路：
@@ -1733,71 +1891,132 @@ export async function generateImage(endpoint, req, scope = "生图") {
   // 用户没选比例时是 null，下面两条路都据此整个跳过，一个字段都不加
   const ratio = endpoint?.ratio ?? null;
 
-  let res;
-  try {
-    if (refFile) {
-      // Node 18+ 自带 FormData / Blob / File，不需要额外依赖
-      const form = new FormData();
-      form.append("model", model);
-      form.append("prompt", prompt);
-      form.append("n", "1");
-      form.append("response_format", "b64_json");
-      if (negative) form.append("negative_prompt", negative);
-      if (ratio) {
-        form.append("size", ratio.size);
-        form.append("aspect_ratio", ratio.key);
-      }
-      const bytes = await fs.promises.readFile(refFile);
-      const ext = path.extname(refFile).toLowerCase();
-      form.append(
-        "image",
-        new Blob([bytes], { type: mimeForExt(ext) }),
-        path.basename(refFile)
-      );
-      /*
-       * form 这个对象在回退那一刀里**照样能再交一遍**：FormData 里存的是
-       * Blob（上面刚从文件读出来的字节），undici 每次发请求都重新序列化一遍，
-       * 不像读流那样一次性。所以这个闭包直接引用它就行。
-       */
-      res = await fetchVia(
-        "llm",
-        `${base}/images/edits`,
-        () => ({
+  /*
+   * 两条路发的是同一份字段，只是载体不一样，所以**先把字段摊在一个对象里**，
+   * 再各自装进 JSON / multipart。这样上游嫌弃某个字段时，剥掉它只要改这一处
+   * （dropUnknownField 会把 body 和 form 一起改），不用把两条路各写一遍。
+   */
+  const body = {
+    model,
+    prompt,
+    n: 1,
+    response_format: "b64_json",
+    ...(negative ? { negative_prompt: negative } : {}),
+    ...(ratio ? { size: ratio.size, aspect_ratio: ratio.key } : {}),
+  };
+
+  let form = null;
+  if (refFile) {
+    // Node 18+ 自带 FormData / Blob / File，不需要额外依赖
+    form = new FormData();
+    for (const [k, v] of Object.entries(body)) form.append(k, String(v));
+    const bytes = await fs.promises.readFile(refFile);
+    const ext = path.extname(refFile).toLowerCase();
+    form.append("image", new Blob([bytes], { type: mimeForExt(ext) }), path.basename(refFile));
+  }
+
+  const url = refFile ? `${base}/images/edits` : `${base}/images/generations`;
+  const init = () =>
+    refFile
+      ? {
           method: "POST",
           signal: AbortSignal.timeout(IMAGE_TIMEOUT),
           // Content-Type 不能自己写 —— multipart 的 boundary 要让 fetch 自己填
           headers: auth,
           body: form,
-        }),
-        (why) => logDebug(scope, `带参考图出图${why}`)
-      );
-    } else {
-      res = await fetchVia(
-        "llm",
-        `${base}/images/generations`,
-        () => ({
+        }
+      : {
           method: "POST",
           signal: AbortSignal.timeout(IMAGE_TIMEOUT),
           headers: { "Content-Type": "application/json", ...auth },
-          body: JSON.stringify({
-            model,
-            prompt,
-            n: 1,
-            response_format: "b64_json",
-            ...(negative ? { negative_prompt: negative } : {}),
-            ...(ratio ? { size: ratio.size, aspect_ratio: ratio.key } : {}),
-          }),
-        }),
-        (why) => logDebug(scope, `出图${why}`)
-      );
-    }
-  } catch (e) {
-    // 生图打的是模型 API（fetchVia("llm", …)），所以这里的 scope 也是 llm
-    throw new Error(`生图请求失败：${whyFetch(e, "llm", IMAGE_TIMEOUT)}`);
-  }
+          body: JSON.stringify(body),
+        };
 
-  const raw = await res.text();
-  if (!res.ok) throw new Error(`生图接口返回 ${res.status}：${clipBody(raw)}`);
+  /*
+   * 发请求。400 + 「不认识某个可选字段」时剥掉那个字段重发一次（见
+   * DROPPABLE_IMAGE_FIELDS 的注释：官方 gpt-image 系列会因为 response_format
+   * 把整个请求 400 掉，而同一家中转站背后的渠道有的严有的宽，于是表现成
+   * 「一会儿能出一会儿不能」）。
+   *
+   * 循环是因为可能连着撞好几个：剥掉 response_format 之后下一发可能轮到
+   * aspect_ratio。每一轮都必须重新读一次 res.text() —— body 只能读一遍。
+   */
+  let raw = "";
+  let res;
+  // 剥字段和重试各有自己的预算：剥字段是「把请求改对」，重试是「同一个请求再碰
+  // 一次运气」，混在一个计数里会让「剥完一个字段又赶上一次抖动」提前用光额度
+  let drops = 0;
+  let retries = 0;
+  for (;;) {
+    try {
+      /*
+       * form 这个对象**照样能再交一遍**（代理回退那一刀、这里的重发都一样）：
+       * FormData 里存的是 Blob（上面刚从文件读出来的字节），undici 每次发请求
+       * 都重新序列化一遍，不像读流那样一次性。
+       */
+      res = await fetchVia(
+        "llm",
+        url,
+        init,
+        (why) => logDebug(scope, `${refFile ? "带参考图出图" : "出图"}${why}`)
+      );
+    } catch (e) {
+      /*
+       * 连接层的失败也重试（连不上、连接被掐断这些）—— 判据是 worthImageRetry，
+       * 语音那套 worthRetry 去掉「我们自己的超时」那一条。重试预算用光了才抛。
+       */
+      if (retries < IMAGE_RETRY_DELAYS.length && worthImageRetry(e)) {
+        const delay = IMAGE_RETRY_DELAYS[retries];
+        retries += 1;
+        logWarn(
+          scope,
+          `出图没连上（${whyFetch(e, "llm", IMAGE_TIMEOUT)}），${delay}ms 后重试第 ${retries} 次`
+        );
+        await wait(delay);
+        continue;
+      }
+      // 生图打的是模型 API（fetchVia("llm", …)），所以这里的 scope 也是 llm
+      throw new Error(`生图请求失败：${whyFetch(e, "llm", IMAGE_TIMEOUT)}`);
+    }
+
+    raw = await res.text();
+    // 200 却装着一个报错（见 errorInOkBody）的，和 400 一样当成失败往下走
+    const okButError = res.ok && errorInOkBody(raw);
+    if (res.ok && !okButError) break;
+
+    // 先看是不是「请求本身要改」：剥掉上游点名的那个可选字段，立刻重发，不用等
+    if ((res.status === 400 || okButError) && drops < MAX_FIELD_DROPS) {
+      const dropped = dropUnknownField(body, form, raw);
+      if (dropped) {
+        drops += 1;
+        logInfo(scope, `上游不认 ${dropped} 这个字段，去掉它重发一次`);
+        continue;
+      }
+    }
+
+    /*
+     * 再看是不是「运气问题」：上游 429/5xx，或者中转站拿 404 转述的渠道故障。
+     * 这类原来一次都不重，于是一次抖动就是一张图彻底发不出去。
+     */
+    if (retries < IMAGE_RETRY_DELAYS.length && transientImageFailure(res.status, raw)) {
+      const delay = IMAGE_RETRY_DELAYS[retries];
+      retries += 1;
+      logWarn(
+        scope,
+        `出图上游返回 ${res.status}（${retries === 1 ? "可能是渠道抖动" : "还是不行"}），` +
+          `${delay}ms 后重试第 ${retries} 次`,
+        clipBody(raw)
+      );
+      await wait(delay);
+      continue;
+    }
+
+    throw new Error(
+      okButError
+        ? `生图接口返回了报错（HTTP 200，但里面没有图）：${clipBody(raw)}`
+        : `生图接口返回 ${res.status}：${clipBody(raw)}`
+    );
+  }
 
   let data = null;
   try {
@@ -1813,7 +2032,9 @@ export async function generateImage(endpoint, req, scope = "生图") {
   logInfo(
     scope,
     `${endpoint?.label ?? model} 出图成功，${Math.round(buffer.length / 1024)}KB ${ext}，` +
-      `耗时 ${ms}ms${ratio ? `（要的是 ${ratio.key}）` : ""}` +
+      // 比例可能在上面被剥掉了（上游不认），那就别再说「要的是 9:16」—— 那句话
+      // 会让人以为发过去了、是模型没照做
+      `耗时 ${ms}ms${ratio && "size" in body ? `（要的是 ${ratio.key}）` : ""}` +
       `${refFile ? `（参考图 ${path.basename(refFile)}）` : ""}`
   );
   return { buffer, mimeType, ext, ms };

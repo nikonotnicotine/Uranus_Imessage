@@ -9,8 +9,8 @@
   },
   "dependencies": {
     "@napi-rs/canvas": "0.1.80",
-    "@spectrum-ts/imessage": "^12.8.0",
-    "@spectrum-ts/imessage-local": "^12.8.0",
+    "@spectrum-ts/imessage": "^12.10.1",
+    "@spectrum-ts/imessage-local": "^12.10.1",
     "chinese-days": "^1.5.9",
     "cors": "^2.8.5",
     "date-holidays": "^3.36.1",
@@ -19,7 +19,7 @@
     "mammoth": "1.12.3",
     "nodemailer": "10.0.9",
     "pdf-parse": "2.4.5",
-    "spectrum-ts": "^12.8.0",
+    "spectrum-ts": "^12.10.1",
     "tar-fs": "^2.1.5"
   }
 }
