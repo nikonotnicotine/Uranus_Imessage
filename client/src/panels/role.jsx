@@ -1748,6 +1748,252 @@ function RoleUndoSendFields({ role, onGoto }) {
  * PUT /api/config 会重启所有 iMessage 桥。它们在 data/instagram/ 下，
  * 走 /api/ig/* 那套接口，见 server/src/igstore.js 文件头。
  */
+/**
+ * 「小红书」那一段。
+ *
+ * 和 IG 不一样，这里发出去的是**真的小红书**：干活的是用户自己在本机跑的
+ * xiaohongshu-mcp（https://github.com/xpzouying/xiaohongshu-mcp），我们只调它的
+ * HTTP 接口，不把它的工具塞给模型（见 server/src/xhstags.js 文件头）。
+ *
+ * 访问令牌不走 PUT /api/config —— 角色对象会跟着导出 / 云备份出去。它单独存在
+ * data/xiaohongshu/secrets.json，界面上只知道「有没有」。
+ */
+function RoleXiaohongshuFields({ role }) {
+  const { updateRole } = useConfig();
+  const openGate = usePresetGate(role);
+  const x = role.xiaohongshu ?? {};
+  const patch = (part) => updateRole(role.id, { xiaohongshu: { ...x, ...part } });
+  const baseUrl = x.baseUrl || "http://localhost:18060";
+
+  const [info, setInfo] = useState(null);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState({ ok: true, text: "" });
+
+  const reload = async () => {
+    try {
+      setInfo(await api(`/api/xhs/${encodeURIComponent(role.id)}`));
+    } catch {
+      setInfo(null);
+    }
+  };
+  useEffect(() => {
+    if (x.enabled) void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role.id, x.enabled]);
+
+  async function doCheck() {
+    setBusy("check");
+    setMsg({ ok: true, text: "" });
+    try {
+      const r = await api(`/api/xhs/${encodeURIComponent(role.id)}/check`, { method: "POST", body: { baseUrl } });
+      setMsg(
+        r.ok
+          ? r.isLoggedIn
+            ? { ok: true, text: `连上了，登着「${r.username || r.userId || "某个号"}」` }
+            : { ok: false, text: "连上了，但 xiaohongshu-mcp 那边还没登录小红书，先去它那边扫码" }
+          : { ok: false, text: r.error || "连不上" }
+      );
+    } catch (e) {
+      setMsg({ ok: false, text: e.message || "连不上" });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doToken(value) {
+    setBusy("token");
+    try {
+      const r = await api("/api/xhs/token", { method: "PUT", body: { baseUrl, token: value } });
+      setToken("");
+      setInfo((s) => ({ ...(s ?? {}), hasToken: r.hasToken }));
+      setMsg({ ok: true, text: r.hasToken ? "令牌存好了" : "令牌清掉了" });
+    } catch (e) {
+      setMsg({ ok: false, text: e.message || "没存上" });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doPoll() {
+    setBusy("poll");
+    setMsg({ ok: true, text: "在翻通知页，可能要一两分钟…" });
+    try {
+      const r = await api(`/api/xhs/${encodeURIComponent(role.id)}/poll`, { method: "POST" });
+      if (!r.ok) setMsg({ ok: false, text: r.error || "没跑成" });
+      else if (r.reason) setMsg({ ok: true, text: r.reason });
+      else
+        setMsg({
+          ok: true,
+          text: `看了 ${r.picked} 条新评论，回了 ${r.replied.length} 条${r.dropped ? `，跳过更早的 ${r.dropped} 条` : ""}`,
+        });
+      await reload();
+    } catch (e) {
+      setMsg({ ok: false, text: e.message || "没跑成" });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const when = (t) => (t ? new Date(t).toLocaleString() : "还没有");
+
+  return (
+    <div className="grid grid-cols-1 gap-6">
+      <label className="flex items-start justify-between gap-4">
+        <span className="min-w-0">
+          <span className="block text-ui text-ink">启用小红书</span>
+          <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+            聊天里它可以写
+            <code className="mx-1 bg-sunken px-1">[小红书:标题|正文]</code>
+            发一篇笔记。发出去的是
+            <strong className="text-ink-soft">真的小红书，所有人都看得到</strong>
+            。要先在本机跑起 xiaohongshu-mcp 并扫码登录，还要配好生图模型（小红书的笔记必须带图）。
+          </span>
+        </span>
+        <Switch
+          checked={Boolean(x.enabled)}
+          onChange={(v) => {
+            patch({ enabled: v });
+            if (v) openGate("xiaohongshu");
+          }}
+          label="启用小红书"
+        />
+      </label>
+
+      {x.enabled && (
+        <>
+          <Field label="xiaohongshu-mcp 地址" hint="它默认跑在 18060 端口。一个实例只登得了一个号，两个角色要用两个号就起两个实例">
+            <input
+              className={inputCls}
+              value={x.baseUrl ?? ""}
+              onChange={(e) => patch({ baseUrl: e.target.value })}
+              placeholder="http://localhost:18060"
+            />
+          </Field>
+
+          <Field
+            label="访问令牌"
+            hint={`只有 xiaohongshu-mcp 启动时带了 -token（或 AUTH_TOKEN）才要填。${
+              info?.hasToken ? "现在已经存了一个。" : "现在没存。"
+            }令牌单独存，不进配置、不进云备份`}
+          >
+            <div className="flex gap-2">
+              <input
+                className={inputCls}
+                type="password"
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                placeholder={info?.hasToken ? "••••••（已存，填新的会覆盖）" : "没开令牌就留空"}
+              />
+              <Button variant="outline" disabled={busy === "token" || !token.trim()} onClick={() => doToken(token)}>
+                存
+              </Button>
+              {info?.hasToken && (
+                <Button variant="ghost" disabled={busy === "token"} onClick={() => doToken("")}>
+                  清掉
+                </Button>
+              )}
+            </div>
+          </Field>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <Button variant="outline" disabled={Boolean(busy)} onClick={doCheck}>
+              {busy === "check" ? "在查…" : "查一下连没连上"}
+            </Button>
+            {msg.text && (
+              <span className={`text-meta leading-relaxed ${msg.ok ? "text-ink-soft" : "text-warn"}`}>{msg.text}</span>
+            )}
+          </div>
+          <p className="text-meta leading-relaxed text-ink-faint">
+            地址是新填的话要<strong className="text-ink-soft">先保存</strong>，发笔记和回评论才会用新地址（「查一下」直接用输入框里的）。
+            xiaohongshu-mcp 用 Docker 跑的话，它看不到这台机器上的图片路径，发不了笔记 —— 请直接跑它的可执行文件。
+          </p>
+
+          <label className="flex items-start justify-between gap-4 border-l-2 border-line pl-4">
+            <span className="min-w-0">
+              <span className="block text-ui text-ink">主动发笔记</span>
+              <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                在<strong className="text-ink-soft">主动消息那一轮</strong>里顺手决定要不要发一篇。
+                跟着「角色主动消息」走，那个关着的话这个也不会动。关着的时候它只在聊天里被你带到了才会发。
+              </span>
+            </span>
+            <Switch checked={Boolean(x.autoPublish)} onChange={(v) => patch({ autoPublish: v })} label="主动发笔记" />
+          </label>
+
+          <label className="flex items-start justify-between gap-4 border-l-2 border-line pl-4">
+            <span className="min-w-0">
+              <span className="block text-ui text-ink">回自己笔记下面的评论</span>
+              <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                隔一阵子去小红书的「评论和@」里看一眼，挑新评论回。
+                <strong className="text-ink-soft">第一次只记位置不回</strong>
+                ，之前的老评论不会被翻出来回一遍。
+              </span>
+            </span>
+            <Switch checked={Boolean(x.replyEnabled)} onChange={(v) => patch({ replyEnabled: v })} label="回评论" />
+          </label>
+
+          {x.replyEnabled && (
+            <div className="grid grid-cols-1 gap-3 border-l-2 border-line pl-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <NumberField
+                  label="每次最多回几条"
+                  value={x.topN ?? 5}
+                  min={1}
+                  max={20}
+                  step={1}
+                  onChange={(v) => patch({ topN: v })}
+                  suffix="条"
+                />
+                <NumberField
+                  label="多久看一次"
+                  value={x.pollMinutes ?? 30}
+                  min={5}
+                  max={1440}
+                  step={5}
+                  onChange={(v) => patch({ pollMinutes: v })}
+                  suffix="分钟"
+                />
+              </div>
+              <p className="text-meta leading-relaxed text-ink-faint">
+                每次只看上次之后的新评论，
+                <strong className="text-ink-soft">按时间取最新的这么多条</strong>
+                ，更早的直接跳过、不留到下次 —— 笔记爆了一晚上来几百条，也只回最新的几条。
+                不是每条都回，它自己挑。回过什么会进聊天上下文。
+              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button variant="outline" disabled={Boolean(busy)} onClick={doPoll}>
+                  {busy === "poll" ? "在看…" : "现在看一轮"}
+                </Button>
+                <span className="text-meta text-ink-faint">
+                  上次：{when(info?.lastPollAt)}
+                  {info?.lastError ? `（出错：${info.lastError}）` : ""}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {(info?.notes?.length > 0 || info?.replies?.length > 0) && (
+            <Field label="最近的动静" hint="只是本地流水，给你看的">
+              <div className="grid max-h-64 grid-cols-1 gap-1.5 overflow-auto text-meta leading-relaxed">
+                {(info.notes ?? []).slice(0, 5).map((n, i) => (
+                  <p key={`n${i}`} className={n.ok ? "text-ink-soft" : "text-warn"}>
+                    笔记「{n.title}」{n.ok ? "发出去了" : `没发出去：${n.error}`} · {when(n.at)}
+                  </p>
+                ))}
+                {(info.replies ?? []).slice(0, 10).map((r, i) => (
+                  <p key={`r${i}`} className="text-ink-soft">
+                    回 {r.from}「{r.comment}」：{r.reply} · {when(r.at)}
+                  </p>
+                ))}
+              </div>
+            </Field>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function RoleInstagramFields({ role, onGoto }) {
   const { config, updateRole } = useConfig();
   const openGate = usePresetGate(role);
@@ -5203,6 +5449,13 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
         .filter(Boolean)
         .join(" · ")
     : "关";
+  const xhsCfg = role.xiaohongshu ?? {};
+  const xhsBadge = xhsCfg.enabled
+    ? [
+        xhsCfg.autoPublish ? "自己发笔记" : "聊天里发",
+        xhsCfg.replyEnabled ? `每 ${xhsCfg.pollMinutes ?? 30} 分钟回最新 ${xhsCfg.topN ?? 5} 条` : "不回评论",
+      ].join(" · ")
+    : "关";
   const pro = role.proactive ?? {};
   // 开着的时候这行要能一眼看出「多久会自己开口」和「几点到几点不会」——
   // 这一栏和 Instagram 是仅有的两个会在你不看着的时候自己动的，折起来也得说清楚
@@ -5778,6 +6031,14 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
           badge={igBadge}
         >
           <RoleInstagramFields role={role} onGoto={onGoto} />
+        </Fold>
+
+        <Fold
+          title="小红书"
+          desc="让这个角色发真的小红书笔记，并回自己笔记下面的评论（经本机的 xiaohongshu-mcp）"
+          badge={xhsBadge}
+        >
+          <RoleXiaohongshuFields role={role} />
         </Fold>
       </div>
 

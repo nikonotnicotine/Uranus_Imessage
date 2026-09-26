@@ -297,7 +297,10 @@ export function sceneBlock(scene, vars, selfOwner, now, templates) {
  * @param {object} config 完整配置
  * @param {object} role 要说话的那个角色
  * @param {object} scene {kind, owner, post?, story?, commentId?, peerName?, mentioned?}
- * @param {object} [opts] {user?, history?, now?, templates?}
+ * @param {object} [opts] {user?, history?, now?, templates?, tag?, block?, action?}
+ *   tag / block / action 是给小红书那一轮借壳用的（xhsrun.js）：同一套人设 /
+ *   世界书 / 记忆 / 上文的结构，只换最顶上的场景块和最底下的行动指令。
+ *   不传就是 Instagram 原样。
  * @returns {Promise<{messages:{role:string,content:string}[], params:object,
  *                    preset:object, vars:object, worldInfo:object}>}
  */
@@ -322,7 +325,10 @@ export async function buildIgPrompt(config, role, scene, opts = {}) {
   const hist = trimHistory(opts.history, role);
   const sent = filterHistory(hist, preset.regex, { char: vars.char, user: vars.user });
 
-  const block = sceneBlock(scene, vars, selfOwner, now, templates);
+  const block =
+    typeof opts.block === "string"
+      ? applyVars(opts.block, vars).trim()
+      : sceneBlock(scene, vars, selfOwner, now, templates);
 
   // 预设里关掉的条目，这一轮也不产出
   const entryOn = (kind) => preset.entries.find((e) => e.kind === kind)?.enabled !== false;
@@ -343,7 +349,7 @@ export async function buildIgPrompt(config, role, scene, opts = {}) {
   const parts = [];
 
   // 1. 场景压在最顶上
-  parts.push({ role: "system", content: wrap("Instagram", block) });
+  parts.push({ role: "system", content: wrap(opts.tag || "Instagram", block) });
 
   // 2. 人设
   if (entryOn("char")) {
@@ -412,7 +418,10 @@ export async function buildIgPrompt(config, role, scene, opts = {}) {
    * 两层都有：这里从源头不产出这种形状，那里给所有链路兜底。
    */
   const actionKey = PEER_SCENES.has(scene?.kind) ? "peerAction" : "action";
-  const action = String(templates?.[actionKey] ?? "").trim() || defaultTemplate(actionKey);
+  const action =
+    typeof opts.action === "string"
+      ? opts.action
+      : String(templates?.[actionKey] ?? "").trim() || defaultTemplate(actionKey);
   const lastTurn = parts.filter((p) => p.role !== "system" && String(p.content ?? "").trim()).at(-1);
   parts.push({
     role: lastTurn?.role === "user" ? "system" : "user",

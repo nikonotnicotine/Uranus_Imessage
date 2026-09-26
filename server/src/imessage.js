@@ -41,6 +41,8 @@ import { notePrompt } from "./lastprompt.js";
 import { fetchLinkImages, fetchLinkVideos, renderLinks } from "./linkmeta.js";
 import { igComposeNote, igRouteFor, publishIgTags, publishLines, tickIgQueue } from "./igrun.js";
 import { splitIg, stripIgTags } from "./igtags.js";
+import { publishXhsNotes, xhsComposeNote, xhsRouteFor } from "./xhsrun.js";
+import { splitXhs, stripXhsTags } from "./xhstags.js";
 import {
   WORD_EFFECT_LABELS,
   degradeToPlain,
@@ -3353,6 +3355,13 @@ async function handleTurn(
    */
   let recorded = reply;
   let igDone = false;
+  /*
+   * 小红书：[小红书:…] 要在 IG 之前摘 —— 紧跟它的 [image:] 归小红书，
+   * 先让 IG 那边看见的话会被当成私聊发图。发布在后台跑（见 xhsrun.js 顶上），
+   * 这里拿到的只是写上下文的那几句。
+   */
+  const xhsLines = takeXhs(freshConfig, freshRole, forUser, scope);
+  forUser = xhsLines.rest;
   if (igRouteFor(freshRole, forUser)) {
     try {
       const parsed = splitIg(forUser, freshConfig.chat?.separator ?? "");
@@ -3371,6 +3380,10 @@ async function handleTurn(
       logError(scope, "Instagram 这一轮没发出去（短信照发）", e);
       forUser = stripIgTags(forUser);
     }
+  }
+  if (xhsLines.lines.length) {
+    igDone = true;
+    recorded = [xhsLines.lines.join("\n"), stripXhsTags(recorded)].filter(Boolean).join("\n");
   }
 
   /*
@@ -3574,6 +3587,25 @@ function runnerForRole(config, role) {
  * 整段跑在 `chain` 里：对方可能正好在这一秒发消息进来，两边同时写 history
  * 和存档会串不起来（和 fireProactive 同一个考虑）。
  */
+/**
+ * 这一轮输出里的 [小红书:…]：摘出来、丢给后台发，返回写上下文的那几句和
+ * 剩下的正文。没开小红书 / 没写标签就原样返回。
+ *
+ * 出错不能连短信一起黄掉，但标签要摘干净 —— 同 IG 那段的理由。
+ */
+function takeXhs(config, role, text, scope) {
+  if (!xhsRouteFor(role, text)) return { lines: [], rest: text };
+  try {
+    const parsed = splitXhs(text, config.chat?.separator ?? "");
+    const lines = publishXhsNotes(config, role, parsed.notes);
+    if (lines.length) logInfo(scope, `小红书：${lines.length} 篇笔记开始在后台发`, lines.join("\n"));
+    return { lines, rest: parsed.rest };
+  } catch (e) {
+    logError(scope, "小红书这一轮没发出去（短信照发）", e);
+    return { lines: [], rest: stripXhsTags(text) };
+  }
+}
+
 async function commitIgTurn(getConfig, runner, role, outcome) {
   const config = getConfig?.() ?? {};
   const fresh = currentRole(config, runner) ?? role;
@@ -4134,7 +4166,9 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
    * 只进**这一次请求**，和上面那段提示词一样不落历史 —— 落了的话每轮都要
    * 重发一遍，而且模型会以为自己刚被要求发帖，下一轮接着发。
    */
-  const composeNote = igComposeNote(config, role, { user });
+  const composeNote = [igComposeNote(config, role, { user }), xhsComposeNote(config, role, { user })]
+    .filter(Boolean)
+    .join("\n\n");
   const forModel = composeNote ? `${toModel}\n\n${composeNote}` : toModel;
   if (composeNote) logDebug(scope, `${role.name} 这一轮可以顺手发条 Instagram`);
 
@@ -4306,6 +4340,9 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
   const freshRole = currentRole(freshConfig, runner) ?? role;
   let recorded = reply;
   let igDone = false;
+  // 小红书先摘，理由见正常轮次那段
+  const xhsLines = takeXhs(freshConfig, freshRole, forUser, scope);
+  forUser = xhsLines.rest;
   if (igRouteFor(freshRole, forUser)) {
     try {
       const parsed = splitIg(forUser, freshConfig.chat?.separator ?? "");
@@ -4320,6 +4357,10 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
       logError(scope, "Instagram 这一轮没发出去（短信照发）", e);
       forUser = stripIgTags(forUser);
     }
+  }
+  if (xhsLines.lines.length) {
+    igDone = true;
+    recorded = [xhsLines.lines.join("\n"), stripXhsTags(recorded)].filter(Boolean).join("\n");
   }
 
   /*

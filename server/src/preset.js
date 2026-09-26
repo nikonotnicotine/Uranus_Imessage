@@ -81,7 +81,7 @@ const ENTRY_ROLES = ["system", "user", "assistant"];
 export const REGEX_TARGETS = ["userInput", "aiOutput"];
 
 /**
- * 「消息格式与功能」的子条目，固定十八条、不能增删。
+ * 「消息格式与功能」的子条目，固定十九条、不能增删。
  *
  * 拆成子条目是为了能单独开关：生图链路接上了但语音还没接的时候，
  * 可以只开图片那条，不用手改一整段文字再改回来。
@@ -89,7 +89,7 @@ export const REGEX_TARGETS = ["userInput", "aiOutput"];
  * 查岗占**四条**（看屏幕 / 看手机里的东西 / 动手机 / 放歌），对着角色面板上
  * 那四摊开关，理由见 SPY_SCREEN_CHILD 上面那段。
  *
- * 十八条的执行链路**都是接上的**。除了 quote 之外，其余十七条都多压一道闸 ——
+ * 十九条的执行链路**都是接上的**。除了 quote 之外，其余十八条都多压一道闸 ——
  * 角色单独配置里那个开关关着时，这一条无论开没开都不注入（见 ROLE_GATED_CHILDREN 和
  * prompt.js:formatBlock）。voice / image / search 的理由是会往外发请求、要花钱；
  * leaveOnRead 不花钱，但它会让角色**干脆不回消息**；sticker 也不花钱，
@@ -127,6 +127,7 @@ export const FORMAT_CHILD_KINDS = [
   "react",
   "effect",
   "instagram",
+  "xiaohongshu",
   "spyScreen",
   "spyView",
   "spyControl",
@@ -163,6 +164,7 @@ export const FORMAT_CHILD_TAGS = {
   react: "tapback",
   effect: "message_effect",
   instagram: "instagram",
+  xiaohongshu: "小红书",
   // 查岗四条各用自己的标签。原来共用一个 `<查岗>`，拆开之后必须分开 ——
   // 四条可能只注入一两条，同名标签会让模型以为后一段是前一段的续写
   spyScreen: "看屏幕",
@@ -209,6 +211,8 @@ export const ROLE_GATED_CHILDREN = {
   react: "reactSend",
   effect: "effectSend",
   instagram: "instagram",
+  // 小红书和 IG 一个道理：没开的角色压根没有这个号，教它发笔记就是教它写一条发不出去的标记
+  xiaohongshu: "xiaohongshu",
 };
 
 /** 「消息格式与功能」的引言：怎么说话、怎么分气泡。 */
@@ -428,7 +432,7 @@ export const LEGACY_FORMAT_INTRO = [
 ].join("\n");
 
 /**
- * 每个子条目的默认内容（FORMAT_CHILD_KINDS 那十八条各一段）。
+ * 每个子条目的默认内容（FORMAT_CHILD_KINDS 那十九条各一段）。
  *
  * voice / sticker / image / quote / undoSend 这几段是用户给的规范原文（含
  * `{{表情包变量}}`、`{{图生图变量}}` 两个变量）。外层的
@@ -663,6 +667,26 @@ export const DEFAULT_FORMAT_CHILDREN = {
     "          - [post:周末的战利品][image:木桌上摊开的三本旧书][image:一只手举着冰美式，背景是书店门口]" +
       "{{sep}}刚从书店出来，给你也带了一本",
   ].join("\n"),
+  xiaohongshu: [
+    "      小红书:",
+    '        描述: "你有一个小红书账号，可以在聊天之外自己发笔记。发出去的是**真的**小红书笔记，' +
+      "所有人都刷得到，也会有人来评论。" +
+      '发不发、什么时候发，你按人设和当下的状态自己定 —— 不是每次回消息都要发一条。"',
+    '        发笔记: "[小红书:标题|正文]，竖线前是标题（20 字以内），竖线后是正文。' +
+      '正文里想带话题就写 #话题，发出去会变成能点的话题标签。"',
+    '        配图: "[image:画面描述]，紧跟在 [小红书:…] 后面写。小红书的笔记必须有图，' +
+      '想放几张就连着写几个（最多 9 张）；一张都不写的话会按标题和正文自动配一张。"',
+    "        规则:",
+    "          - 方括号**里面**禁止出现 {{sep}} 和方括号，正文要断句就用标点。",
+    "          - 这个标记不会作为短信发给 {{user}}，它是发到小红书上的 ——" +
+      " 所以不占气泡，也不用拿 {{sep}} 和紧跟其后的 [image:…] 隔开，连着写就行。",
+    "          - 同一条回复里标记之外的文字照旧当短信发出去。",
+    "          - 按 {{char}} 自己会发的样子写，像真人分享日常，别写成营销文案。",
+    "        正确示例:",
+    "          - [小红书:终于吃到这家了|排了四十分钟，但是值 🥹 芝士是会拉丝的那种 #探店 #周末去哪儿]" +
+      "[image:木桌上一份刚出炉的芝士焗饭，勺子拉出长长的丝][image:店门口排队的人，暖黄色的招牌]" +
+      "{{sep}}下次带你去",
+  ].join("\n"),
   spyScreen: SPY_SCREEN_CHILD,
   spyView: SPY_VIEW_CHILD,
   spyControl: SPY_CONTROL_CHILD,
@@ -773,7 +797,7 @@ export const LEGACY_FORMAT_PROMPT = [
 /**
  * 某个子条目缺 `enabled` 字段时默认开不开：**恒定为开**。
  *
- * 十八条的链路现在都接上了，其中十七条还各自压着第二道闸 —— 角色单独配置里那个开关
+ * 十九条的链路现在都接上了，其中十八条还各自压着第二道闸 —— 角色单独配置里那个开关
  * （ROLE_GATED_CHILDREN），默认全是关的，所以这里开着也不会凭空往提示词里
  * 加东西。反过来如果它们跟着 `enabled` 走，用户在角色里打开之后还得再翻进
  * 预设面板开一次，两个开关都要对才生效 —— 那是很难猜到的。
@@ -792,7 +816,7 @@ function defaultChildEnabled() {
 /**
  * 新建 format 条目时的子条目。
  *
- * 十八条默认全开着，但其中十七条压着角色那道闸（默认关），所以实际注入的只有
+ * 十九条默认全开着，但其中十八条压着角色那道闸（默认关），所以实际注入的只有
  * quote 一条 —— 用户在哪个角色上打开「发送表情包」，才会在那个角色的提示词里
  * 看到它。
  */
@@ -1088,7 +1112,7 @@ function normalizeParams(input) {
 }
 
 /**
- * 「消息格式与功能」的子条目：固定十八条、不能增删，只能开关和改内容。
+ * 「消息格式与功能」的子条目：固定十九条、不能增删，只能开关和改内容。
  *
  * 老配置里没有 children 字段，得从那一整段 content 迁过来 —— 缺 `enabled` 的
  * 一律补成开（见 defaultChildEnabled）。以前这里还分「用户改没改过引言」，

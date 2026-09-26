@@ -388,7 +388,7 @@ export const ENTRY_KIND_HINTS = {
   user: "对这个角色生效的那条用户人设，注入 <User>",
   world: "这一轮命中的世界书条目，注入 <World_Info>",
   format:
-    "怎么分气泡，以及语音 / 表情包 / 图片 / 链接卡片 / 分享位置 / 转账 / 投票 / 联网搜索 / 已读不回 / 引用回复 / 消息撤回 / 消息回应 / 消息特效 / Instagram / 查岗那四条 十八个子条目",
+    "怎么分气泡，以及语音 / 表情包 / 图片 / 链接卡片 / 分享位置 / 转账 / 投票 / 联网搜索 / 已读不回 / 引用回复 / 消息撤回 / 消息回应 / 消息特效 / Instagram / 小红书 / 查岗那四条 十九个子条目",
   context: "这条会话的上文，夹在 <Chat_History> 之间（条数受角色的「上下文限制」约束）",
   memory:
     "四个变量：{{近N天记忆}}、{{回忆起来的记忆}}、{{备忘录}}、{{近N天日记}}，各自包在 XML 标签里。哪个都受角色那三个开关约束，全关就整条不产出",
@@ -398,7 +398,7 @@ export const ENTRY_KIND_HINTS = {
     "只有线下预设有这一条。要模型在正文之后另给四条「我接下来可以怎么做」，注入 <User_Choices>。还得角色那边的「用户选项」开着才生效",
 };
 
-/** 「消息格式与功能」的十八个子条目。和 server/src/preset.js:FORMAT_CHILD_KINDS 对齐。 */
+/** 「消息格式与功能」的十九个子条目。和 server/src/preset.js:FORMAT_CHILD_KINDS 对齐。 */
 export const FORMAT_CHILD_KINDS = [
   "voice",
   "sticker",
@@ -414,6 +414,7 @@ export const FORMAT_CHILD_KINDS = [
   "react",
   "effect",
   "instagram",
+  "xiaohongshu",
   // 查岗占四条，对着角色面板上那四摊开关（屏幕 / 查看 / 控制 / 网易云）
   "spyScreen",
   "spyView",
@@ -436,6 +437,7 @@ export const FORMAT_CHILD_LABELS = {
   react: "消息回应",
   effect: "消息特效",
   instagram: "Instagram",
+  xiaohongshu: "小红书",
   spyScreen: "查岗 · 看屏幕",
   spyView: "查岗 · 看手机",
   spyControl: "查岗 · 动手机",
@@ -464,6 +466,7 @@ export const FORMAT_CHILD_TAGS = {
   react: "tapback",
   effect: "message_effect",
   instagram: "instagram",
+  xiaohongshu: "小红书",
   // 四条各用自己的标签，理由见 server/src/preset.js:FORMAT_CHILD_TAGS
   spyScreen: "看屏幕",
   spyView: "查看手机",
@@ -475,7 +478,7 @@ export const FORMAT_CHILD_TAGS = {
  * 发送链路还没接的子条目：开了也只是让模型输出标记，标记会被当普通文字
  * 原样发给对方。界面上要标出来，见 panels/preset.jsx。
  *
- * 现在**一条都没有** —— 十八条的链路全接上了。
+ * 现在**一条都没有** —— 十九条的链路全接上了。
  * 留着这个数组是因为以后还可能先写提示词、后接链路。
  */
 export const FORMAT_CHILD_UNWIRED = [];
@@ -510,6 +513,7 @@ export const ROLE_GATED_CHILDREN = {
   react: "reactSend",
   effect: "effectSend",
   instagram: "instagram",
+  xiaohongshu: "xiaohongshu",
   spyScreen: "spy",
   spyView: "spy",
   spyControl: "spy",

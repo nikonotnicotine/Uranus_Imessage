@@ -1205,6 +1205,7 @@ function normalizeRole(input, id, legacy) {
     // Instagram：这个角色要不要上 IG，以及点赞/评论的概率和时间窗口。
     // 内容本身（帖子、快拍、主页）在 data/instagram/，不在配置里，见下面那个函数
     instagram: normalizeInstagram(input?.instagram),
+    xiaohongshu: normalizeXiaohongshu(input?.xiaohongshu),
   };
 }
 
@@ -1265,6 +1266,33 @@ function normalizeInstagram(input) {
     // 同步到这个角色的**真** Instagram 账号。默认关，见上面那段注释。
     // 只是一道闸 —— 绑哪个账号、token 是什么在 data/instagram/accounts.json
     syncReal: Boolean(input?.syncReal),
+  };
+}
+
+/**
+ * 角色身上的小红书配置。真正干活的是用户自己跑的 xiaohongshu-mcp（见 xhsapi.js），
+ * 这里只存开关和它的地址。
+ *
+ * **访问令牌不放这里** —— 角色对象会跟着备份 / 分享一起导出去。令牌在
+ * data/xiaohongshu/secrets.json 或环境变量 XHS_MCP_TOKEN 里。
+ *
+ * 一个 xiaohongshu-mcp 实例只登得了一个号，想让两个角色各用各的号就得起两个
+ * 实例、各填各的地址。两个角色填了同一个地址 = 共用一个号，回评论只让排在
+ * 前面的那个角色回（xhsrun.js:pollTargets），不然一条评论会被回两遍。
+ */
+function normalizeXiaohongshu(input) {
+  const base = str(input?.baseUrl).trim().replace(/\/+$/, "");
+  return {
+    enabled: Boolean(input?.enabled),
+    // 主动发笔记。和 IG 的 autoPublish 一样并进主动消息轮次，依赖 proactive.enabled
+    autoPublish: Boolean(input?.autoPublish),
+    // 回自己笔记下面的评论
+    replyEnabled: Boolean(input?.replyEnabled),
+    // 每次最多回几条（取最新的 N 条，更早的直接跳过 —— 帖子爆了也不会被刷屏拖垮）
+    topN: clampInt(input?.topN, 5, 1, 20),
+    // 多久看一次新评论（分钟）
+    pollMinutes: clampInt(input?.pollMinutes, 30, 5, 1440),
+    baseUrl: /^https?:\/\//i.test(base) ? base : "http://localhost:18060",
   };
 }
 

@@ -209,6 +209,9 @@ import { scheduleComment, schedulePublish, startIgQueue } from "./igrun.js";
 import { writeAccount, writeRealSettings, writeUserAccount } from "./igaccounts.js";
 import { bindAccount } from "./igapi.js";
 import { pollOnce, realOverview, startIgPolling, syncOut } from "./igreal.js";
+import { pollXhsReplies, startXhsPolling } from "./xhsrun.js";
+import { loginStatus as xhsLoginStatus } from "./xhsapi.js";
+import { hasToken as hasXhsToken, roleState as xhsRoleState, saveToken as saveXhsToken } from "./xhsstore.js";
 import { checkUpdate } from "./update.js";
 import {
   deleteSession,
@@ -2155,6 +2158,80 @@ app.post("/api/ig/real/publish/:owner/:id", async (req, res) => {
   res.json({ ok: result.ok, error: result.why ?? "", result });
 });
 
+// ---- 小红书（经用户自己跑的 xiaohongshu-mcp）----
+
+/** 前端传来的地址：只认 http(s)，没传就用角色上存的。 */
+function xhsBase(raw, role) {
+  const s = String(raw ?? "").trim().replace(/\/+$/, "");
+  if (/^https?:\/\//i.test(s)) return s;
+  return String(role?.xiaohongshu?.baseUrl || "http://localhost:18060").replace(/\/+$/, "");
+}
+
+/**
+ * 某个角色的小红书流水：发过的笔记、回过的评论、水位、上次出错。
+ * 令牌只回「有没有」，不回本体。
+ */
+app.get("/api/xhs/:roleId", (req, res) => {
+  const role = loadConfig().roles.find((r) => r.id === req.params.roleId);
+  if (!role) return res.status(404).json({ ok: false, error: "找不到这个角色" });
+  const s = xhsRoleState(role.id);
+  res.json({
+    ok: true,
+    hasToken: hasXhsToken(xhsBase("", role)),
+    watermark: s.watermark,
+    lastPollAt: s.lastPollAt,
+    lastError: s.lastError,
+    notes: s.notes.slice(-20).reverse(),
+    replies: s.replies.slice(-30).reverse(),
+  });
+});
+
+/**
+ * 查 xiaohongshu-mcp 连不连得上、登的是哪个号。地址可以用还没保存的
+ * （body.baseUrl）—— 用户刚敲进去就想试一下。
+ */
+app.post("/api/xhs/:roleId/check", async (req, res) => {
+  const role = loadConfig().roles.find((r) => r.id === req.params.roleId);
+  const base = xhsBase(req.body?.baseUrl, role);
+  try {
+    const st = await xhsLoginStatus(base);
+    res.json({ ok: true, baseUrl: base, ...st });
+  } catch (e) {
+    res.json({ ok: false, baseUrl: base, error: String(e?.message ?? e) });
+  }
+});
+
+/**
+ * 存 / 清 xiaohongshu-mcp 的访问令牌。按地址存在 data/xiaohongshu/secrets.json，
+ * **不放在角色对象上** —— 角色会被导出、进云备份。
+ */
+app.put("/api/xhs/token", (req, res) => {
+  const base = xhsBase(req.body?.baseUrl, null);
+  saveXhsToken(base, req.body?.token ?? "");
+  res.json({ ok: true, baseUrl: base, hasToken: hasXhsToken(base) });
+});
+
+/** 手动看一轮评论（不管到没到点、回评论开没开）。可能要一两分钟。 */
+app.post("/api/xhs/:roleId/poll", async (req, res) => {
+  const config = loadConfig();
+  const role = config.roles.find((r) => r.id === req.params.roleId);
+  if (!role) return res.status(404).json({ ok: false, error: "找不到这个角色" });
+  try {
+    const result = await pollXhsReplies(config, role, { force: true, session: igSessionFor(loadConfig) });
+    res.json({
+      ok: result.ok,
+      error: result.ok ? "" : result.reason ?? "",
+      reason: result.reason ?? "",
+      picked: result.picked ?? 0,
+      dropped: result.dropped ?? 0,
+      replied: (result.replied ?? []).map((d) => ({ from: d.comment.fromName, comment: d.comment.text, reply: d.text })),
+    });
+  } catch (e) {
+    logError("小红书", `手动看 ${role.name} 的评论时出错`, e);
+    res.json({ ok: false, error: String(e?.message ?? e) });
+  }
+});
+
 // ---- 环境感知预览 ----
 
 /**
@@ -3670,6 +3747,12 @@ app.listen(PORT, () => {
    * （本地的赞和评论要准时），真 IG 默认每 3 小时一次（省 Meta 的额度）。
    */
   startIgPolling(loadConfig);
+
+  /*
+   * 小红书的评论轮询。每分钟看一眼哪个角色到点了（到点 = 过了它自己设的
+   * 间隔），一个角色都没开「回评论」时那一 tick 直接返回，不碰网络。
+   */
+  startXhsPolling(loadConfig, { session: igSessionFor(loadConfig) });
 
   /*
    * 定时维护（定时重启 / 定时清缓存）。

@@ -89,7 +89,9 @@ export const SCOPES = {
   },
   chats: {
     label: "聊天与记忆",
-    paths: ["sessions", "memories", "instagram"],
+    // 小红书只带 state.json（水位 + 流水）：secrets.json 是令牌，不能跟着
+    // 「聊天与记忆」上网；media/ 是发完就删的暂存图
+    paths: ["sessions", "memories", "instagram", "xiaohongshu/state.json"],
   },
   images: {
     label: "表情包与参考图",

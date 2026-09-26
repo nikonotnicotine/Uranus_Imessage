@@ -60,6 +60,7 @@ const GATED_CHILD_HINTS = {
   react: { switch: "贴 Tapback", why: "贴上去的表情对方立刻能看到，收不回来" },
   effect: { switch: "文字效果", why: "全屏特效会在对方整个屏幕上放动画" },
   instagram: { switch: "启用 Instagram", why: "发出去的帖子和快拍是公开的，而且没开的角色压根没有这个账号" },
+  xiaohongshu: { switch: "启用小红书", why: "发出去的是真的小红书笔记，所有人都看得到" },
   /*
    * 查岗那**四条各提自己那个开关**（对应见 labels.js:SPY_CHILD_SWITCHES）。
    *
@@ -563,7 +564,7 @@ export function PresetEntryEditor({ preset, entry, onGoto }) {
 
         <p className="border-l-2 border-line py-1.5 pl-3 text-meta leading-relaxed text-ink-faint">
           <span>
-            这十八条都是
+            这十九条都是
             <strong className="text-ink-soft">真能用的</strong>
             ，除引用回复之外都还压着角色那道开关：要在「角色 → 单独配置」里给那个角色
             单独打开才生效。语音 / 图片 / 联网搜索会往外发请求、要花钱，已读不回会让角色

@@ -163,6 +163,18 @@ export const IG_HIGHLIGHTS_DIR = path.join(INSTAGRAM_DIR, "highlights");
 export const IG_MEDIA_DIR = path.join(INSTAGRAM_DIR, "media");
 
 /**
+ * 小红书：角色在真小红书号上发过什么、回过哪些评论、评论看到哪儿了（水位线），
+ * 外加连 xiaohongshu-mcp 用的凭据。
+ *
+ * 帖子本身在小红书上，这边只留一本账 —— 发布走 xiaohongshu-mcp，本地不做
+ * 「小红书面板」。不进 config.json 的理由同上：每轮轮询都要推水位线。
+ * 凭据也放这儿而不放角色上：角色对象会被原样打进可分享的备份包。
+ */
+export const XHS_DIR = path.join(DATA_DIR, "xiaohongshu");
+/** 发笔记时生成的配图。xiaohongshu-mcp 只吃本地路径，得先落成文件。 */
+export const XHS_MEDIA_DIR = path.join(XHS_DIR, "media");
+
+/**
  * 线下模式（线下剧情）。一个角色一份索引 + 一条剧情一个文件 + 头像。
  *
  * **不进 config.json**，理由和 IG 那条同一条：`PUT /api/config` 会顺带重启
@@ -380,6 +392,8 @@ export function ensureLayout() {
     IG_STORIES_DIR,
     IG_HIGHLIGHTS_DIR,
     IG_MEDIA_DIR,
+    XHS_DIR,
+    XHS_MEDIA_DIR,
     OFFLINE_DIR,
     OFFLINE_INDEX_DIR,
     OFFLINE_STORIES_DIR,
