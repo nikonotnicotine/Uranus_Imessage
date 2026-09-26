@@ -62,7 +62,7 @@
 
 import { logDebug, logWarn } from "./logs.js";
 import { sniffImageType } from "./media.js";
-import { fetchVia, whyNetwork } from "./proxy.js";
+import { whyNetwork } from "./net.js";
 
 /**
  * 抓一条链接最多等多久。
@@ -310,17 +310,12 @@ function isFetchable(u) {
  */
 async function followViaGet(url, scope) {
   try {
-    const res = await fetchVia(
-      "link",
-      url.toString(),
-      () => ({
-        method: "GET",
-        redirect: "follow",
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        headers: headersFor(url),
-      }),
-      (why) => logDebug(scope, `用 GET 跟这条短链${why}`)
-    );
+    const res = await fetch(url.toString(), {
+      method: "GET",
+      redirect: "follow",
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      headers: headersFor(url),
+    });
     // 只要落点，正文不读 —— 掐掉连接，别让它挂着传几十 KB 回来
     await res.body?.cancel().catch(() => {});
     if (!res.ok || !res.url) return null;
@@ -343,17 +338,12 @@ async function followRedirects(url, scope) {
   for (let i = 0; i < MAX_REDIRECTS; i += 1) {
     let res;
     try {
-      res = await fetchVia(
-        "link",
-        current.toString(),
-        () => ({
-          method: "HEAD",
-          redirect: "manual",
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-          headers: headersFor(current),
-        }),
-        (why) => logDebug(scope, `用 HEAD 跟跳转${why}`)
-      );
+      res = await fetch(current.toString(), {
+        method: "HEAD",
+        redirect: "manual",
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        headers: headersFor(current),
+      });
     } catch {
       // HEAD 打不通不代表这条链接是死的（有些站压根不认 HEAD）。
       // 交给下一步的 GET 去试，别在这儿判死
@@ -407,17 +397,12 @@ async function followRedirects(url, scope) {
  * meta 把一个几 MB 的首页整篇拉回来没有意义。
  */
 async function fetchHead(url, scope) {
-  const res = await fetchVia(
-    "link",
-    url.toString(),
-    () => ({
-      // 起点已经过了 isFetchable，这一步让 fetch 自己跟剩下的跳
-      redirect: "follow",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      headers: headersFor(url),
-    }),
-    (why) => logDebug(scope, `读网页开头${why}`)
-  );
+  const res = await fetch(url.toString(), {
+    // 起点已经过了 isFetchable，这一步让 fetch 自己跟剩下的跳
+    redirect: "follow",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    headers: headersFor(url),
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
   // 图片、视频、PDF 这些没有 og 可读，别把字节拉回来白费流量
@@ -739,15 +724,10 @@ async function biliDetail(u, scope) {
   const id = m[1];
   const qs = /^av/i.test(id) ? `aid=${id.slice(2)}` : `bvid=${id}`;
   try {
-    const res = await fetchVia(
-      "link",
-      `https://api.bilibili.com/x/web-interface/view?${qs}`,
-      () => ({
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        headers: { ...BROWSER_HEADERS, Accept: "application/json", Referer: "https://www.bilibili.com/" },
-      }),
-      (why) => logDebug(scope, `问 B 站的接口${why}`)
-    );
+    const res = await fetch(`https://api.bilibili.com/x/web-interface/view?${qs}`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      headers: { ...BROWSER_HEADERS, Accept: "application/json", Referer: "https://www.bilibili.com/" },
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     // 它的失败是夹在 HTTP 200 里的，靠 code 判（-404 视频不存在、-352 风控）
@@ -762,7 +742,7 @@ async function biliDetail(u, scope) {
       desc: clean(data?.data?.desc ?? "", MAX_DESC),
     };
   } catch (e) {
-    logDebug(scope, `B 站 API 没问到 ${id}：${whyNetwork(e, "link", FETCH_TIMEOUT_MS)}`);
+    logDebug(scope, `B 站 API 没问到 ${id}：${whyNetwork(e, FETCH_TIMEOUT_MS)}`);
     return null;
   }
 }
@@ -830,16 +810,11 @@ async function douyinDetail(u, scope) {
 
   try {
     // 第一趟：收 cookie。正文这趟基本是空壳，不解析
-    const first = await fetchVia(
-      "link",
-      target,
-      () => ({
-        redirect: "follow",
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        headers,
-      }),
-      (why) => logDebug(scope, `抖音第一趟${why}`)
-    );
+    const first = await fetch(target, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      headers,
+    });
     if (!first.ok) throw new Error(`HTTP ${first.status}`);
 
     const ttwid = (first.headers.getSetCookie?.() ?? [])
@@ -856,16 +831,11 @@ async function douyinDetail(u, scope) {
      */
     let html = firstHtml;
     if (ttwid) {
-      const second = await fetchVia(
-        "link",
-        first.url,
-        () => ({
-          redirect: "follow",
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-          headers: { ...headers, Cookie: `ttwid=${ttwid}` },
-        }),
-        (why) => logDebug(scope, `抖音第二趟${why}`)
-      );
+      const second = await fetch(first.url, {
+        redirect: "follow",
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        headers: { ...headers, Cookie: `ttwid=${ttwid}` },
+      });
       if (!second.ok) throw new Error(`第二趟 HTTP ${second.status}`);
       html = await second.text();
     }
@@ -967,7 +937,7 @@ async function douyinDetail(u, scope) {
       ...(videoSkip ? { videoSkip } : {}),
     };
   } catch (e) {
-    logDebug(scope, `抖音没解开 ${u.pathname}：${whyNetwork(e, "link", FETCH_TIMEOUT_MS)}`);
+    logDebug(scope, `抖音没解开 ${u.pathname}：${whyNetwork(e, FETCH_TIMEOUT_MS)}`);
     return null;
   }
 }
@@ -993,16 +963,11 @@ async function douyinDetail(u, scope) {
  */
 async function xhsDetail(u, scope) {
   try {
-    const res = await fetchVia(
-      "link",
-      u.toString(),
-      () => ({
-        redirect: "follow",
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        headers: MOBILE_HEADERS,
-      }),
-      (why) => logDebug(scope, `问小红书${why}`)
-    );
+    const res = await fetch(u.toString(), {
+      redirect: "follow",
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      headers: MOBILE_HEADERS,
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
 
@@ -1059,7 +1024,7 @@ async function xhsDetail(u, scope) {
       images: urls.filter(Boolean),
     };
   } catch (e) {
-    logDebug(scope, `小红书没解开 ${u.pathname}：${whyNetwork(e, "link", FETCH_TIMEOUT_MS)}`);
+    logDebug(scope, `小红书没解开 ${u.pathname}：${whyNetwork(e, FETCH_TIMEOUT_MS)}`);
     return null;
   }
 }
@@ -1247,9 +1212,7 @@ async function resolveOne(raw, scope) {
         logDebug(scope, `${final.hostname} 的 og 只是套话（${og.title}），当没解开`);
       }
     } catch (e) {
-      // 这一类默认不走代理（国内站直连更快），所以 YouTube / Instagram 这些
-      // 抓不到时最该说的就是「去勾代理」—— whyNetwork 会分情况说这句
-      logDebug(scope, `抓 ${final.hostname} 失败：${whyNetwork(e, "link", FETCH_TIMEOUT_MS)}`);
+      logDebug(scope, `抓 ${final.hostname} 失败：${whyNetwork(e, FETCH_TIMEOUT_MS)}`);
     }
   }
 
@@ -1413,20 +1376,15 @@ export async function fetchLinkImages(urls, scope = "链接") {
       if (!isFetchable(u)) return null;
 
       try {
-        const res = await fetchVia(
-          "link",
-          u.toString(),
-          () => ({
-            redirect: "follow",
-            signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
-            headers: {
-              ...BROWSER_HEADERS,
-              Accept: "image/webp,image/jpeg,image/png,*/*;q=0.8",
-              ...refererFor(u),
-            },
-          }),
-          (why) => logDebug(scope, `下第 ${i + 1} 张图${why}`)
-        );
+        const res = await fetch(u.toString(), {
+          redirect: "follow",
+          signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
+          headers: {
+            ...BROWSER_HEADERS,
+            Accept: "image/webp,image/jpeg,image/png,*/*;q=0.8",
+            ...refererFor(u),
+          },
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
         const ctype = String(res.headers.get("content-type") ?? "").toLowerCase();
@@ -1461,7 +1419,7 @@ export async function fetchLinkImages(urls, scope = "链接") {
           name: `链接图片${i + 1}${kind.ext}`,
         };
       } catch (e) {
-        logDebug(scope, `链接里的图${i + 1}没取到：${whyNetwork(e, "link", IMAGE_TIMEOUT_MS)}`);
+        logDebug(scope, `链接里的图${i + 1}没取到：${whyNetwork(e, IMAGE_TIMEOUT_MS)}`);
         return null;
       }
     })
@@ -1509,21 +1467,16 @@ export async function fetchLinkVideos(videos, scope = "链接") {
       if (!isFetchable(u)) return null;
 
       try {
-        const res = await fetchVia(
-          "link",
-          u.toString(),
-          () => ({
-            redirect: "follow",
-            signal: AbortSignal.timeout(VIDEO_TIMEOUT_MS),
-            headers: {
-              ...MOBILE_HEADERS,
-              Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8",
-              // 抖音的视频 CDN 认这个（和图片那条一样）
-              Referer: "https://www.douyin.com/",
-            },
-          }),
-          (why) => logDebug(scope, `下第 ${i + 1} 个视频${why}`)
-        );
+        const res = await fetch(u.toString(), {
+          redirect: "follow",
+          signal: AbortSignal.timeout(VIDEO_TIMEOUT_MS),
+          headers: {
+            ...MOBILE_HEADERS,
+            Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8",
+            // 抖音的视频 CDN 认这个（和图片那条一样）
+            Referer: "https://www.douyin.com/",
+          },
+        });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
         /*
@@ -1571,7 +1524,7 @@ export async function fetchLinkVideos(videos, scope = "链接") {
         };
         return out;
       } catch (e) {
-        logDebug(scope, `链接里的视频${i + 1}没取到：${whyNetwork(e, "link", VIDEO_TIMEOUT_MS)}`);
+        logDebug(scope, `链接里的视频${i + 1}没取到：${whyNetwork(e, VIDEO_TIMEOUT_MS)}`);
         return null;
       }
     })

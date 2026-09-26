@@ -1531,21 +1531,6 @@ checkThat("大写的 ACCESS_TOKEN 也打码", !maskToken("https://x?ACCESS_TOKEN
 check("没有敏感参数就原样返回", maskToken("https://x/y?fields=id"), "https://x/y?fields=id");
 check("空值不炸", maskToken(null), "");
 
-// 代理地址：日志和错误信息里都会出现，而这种串很多带 user:pass@
-const { maskProxy } = await import("../server/src/ignet.js");
-checkThat(
-  "代理里的密码抹掉",
-  !maskProxy("http://alice:hunter2@proxy.corp:8080").includes("hunter2"),
-  maskProxy("http://alice:hunter2@proxy.corp:8080")
-);
-checkThat(
-  "抹了密码还留主机和端口（不然没法定位问题）",
-  maskProxy("http://alice:hunter2@proxy.corp:8080").includes("proxy.corp:8080")
-);
-check("没带凭据的原样留 origin", maskProxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
-check("socks5 也认", maskProxy("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080");
-check("解析不了就整个换掉（宁可少条线索）", maskProxy("这不是个地址"), "***");
-check("空值返回空串", maskProxy(""), "");
 
 console.log("\n=== 43. remote：本地那条记着「发到真 IG 了吗」 ===");
 const EMPTY_REMOTE = { mediaId: "", permalink: "", at: "", error: "" };
@@ -1598,7 +1583,6 @@ check("角色那条带着 bound / username / syncReal", [
   ov.accounts[0].syncReal,
 ], [true, "niki_real", true]);
 check("你的大号那条也带 bound", ov.user.bound, true);
-checkThat("代理只回「配没配」和来源变量名，不回地址", !("url" in (ov.proxy ?? {})));
 
 /*
  * 没名字的角色不能出现在列表里。
@@ -1658,17 +1642,6 @@ console.log("\n=== 46. igFetch 给这一族错误打标 ===");
  * code/error_subcode** 来的，而不是靠 match 中文错误文案（文案会改，code 不会）。
  */
 {
-  /*
-   * 前面某一节为了测 maskProxy 设过代理环境变量，而 igFetch 会给**所有**请求
-   * 挂上 dispatcher —— 挂着的话这个跑在 127.0.0.1 上的假服务压根连不上。
-   * 存下来、跑完还回去，别影响后面的节。
-   */
-  const savedProxy = {};
-  for (const k of ["URANUS_IG_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {
-    savedProxy[k] = process.env[k];
-    delete process.env[k];
-  }
-
   const http = await import("node:http");
   let body = {};
   const srv = http.createServer((req, res) => {
@@ -1701,10 +1674,6 @@ console.log("\n=== 46. igFetch 给这一族错误打标 ===");
   checkThat("限流没被打标", !net.isMediaFetchError(await grab()));
 
   await new Promise((r) => srv.close(r));
-  for (const [k, v] of Object.entries(savedProxy)) {
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
-  }
 }
 
 console.log("\n=== 47. 野图清理：留在用的、删没人要的 ===");

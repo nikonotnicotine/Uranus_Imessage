@@ -48,8 +48,9 @@ import {
  *  - `group`   260px 面板的分组标签
  *  - `itemIcon` 列表项左边那个 16px 图标
  *  - `add`     useConfig 里那个新增方法的名字，有它才画「+」
+ *  - `addChooser` 点「+」先弹个选择框再建（目前只有服务商源选 API 类型：`"providerType"`）
  *  - `empty`   一条都没有时那栏显示什么
- *  - `groups`  `(config, live) => [{ key, label, itemIcon?, add?, addLabel?, empty, items }]`
+ *  - `groups`  `(config, live) => [{ key, label, itemIcon?, add?, addChooser?, addLabel?, empty, items }]`
  */
 export const NAV = [
   {
@@ -60,6 +61,7 @@ export const NAV = [
     group: "服务商源",
     desc: "一个源填一次地址和密钥，模型加进来之后由各个角色自己挑。换一次密钥，所有用它的角色一起生效。",
     add: "addProvider",
+    addChooser: "providerType",
     addLabel: "新增服务商源",
     empty: "还没有服务商源。",
     items: (c) =>
@@ -299,8 +301,8 @@ export const NAV = [
     id: "console",
     label: "控制台",
     icon: Terminal,
-    desc: "后端实时日志：收到什么消息、打给哪条 API、图片识别成什么、哪里报错。下面是进控制台用的账号密码、出网代理、服务控制（重启、定时重启、清理缓存、定时清缓存）、把整个数据文件夹导出成一个包的备份 / 恢复，以及把数据打包传到缤纷云或 GitHub 的云备份。",
-    anchors: ["运行控制台", "账号", "代理", "服务控制", "备份 / 恢复", "云备份"],
+    desc: "后端实时日志：收到什么消息、打给哪条 API、图片识别成什么、哪里报错。下面是进控制台用的账号密码、服务控制（重启、定时重启、清理缓存、定时清缓存）、把整个数据文件夹导出成一个包的备份 / 恢复，以及把数据打包传到缤纷云或 GitHub 的云备份。",
+    anchors: ["运行控制台", "账号", "服务控制", "备份 / 恢复", "云备份"],
   },
 ];
 
@@ -326,6 +328,7 @@ export function sectionGroups(section, config, live) {
       label: section.group,
       itemIcon: section.itemIcon,
       add: section.add,
+      addChooser: section.addChooser,
       addLabel: section.addLabel,
       empty: section.empty,
       items: section.live ? live ?? [] : section.items ? section.items(config) : [],

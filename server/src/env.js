@@ -34,8 +34,7 @@
  *
  * 「有总比没有好」这条贯彻到底：同一坐标两小时内不重查（WEATHER_TTL），
  * 三家都打不通时拿上一次查到的顶上（staleWeather，最多 24 小时），
- * 那份缓存还落盘（重启也不丢），代理自己坏掉时脱开代理直连再试一次
- * （fetchJson）。全落空了才是「这一轮不带天气」。
+ * 那份缓存还落盘（重启也不丢）。全落空了才是「这一轮不带天气」。
  */
 
 import chineseDaysPkg from "chinese-days";
@@ -43,7 +42,7 @@ import Holidays from "date-holidays";
 
 import { WEATHER_CACHE_PATH, readJson, writeJson } from "./datadir.js";
 import { logDebug, logWarn } from "./logs.js";
-import { fetchVia, whyNetwork } from "./proxy.js";
+import { whyNetwork } from "./net.js";
 
 /**
  * chinese-days 的 ESM 默认导出套了两层：顶层既有各个函数、又有一个
@@ -110,7 +109,7 @@ export const WEATHER_TTL = 2 * 60 * 60 * 1000;
 const WEATHER_STALE_MAX = 24 * 60 * 60 * 1000;
 /**
  * 天气查失败后多久之内不再打网络（毫秒）。和 GEO_FAIL_TTL 一个道理：
- * 代理坏掉的时候，每轮消息都去赔一次 5 秒超时，用户那头就是每条都慢 5 秒，
+ * 网络不通的时候，每轮消息都去赔一次 5 秒超时，用户那头就是每条都慢 5 秒，
  * 而买回来的还是同一份旧数据。10 分钟够网络恢复后很快再试。
  */
 const WEATHER_FAIL_TTL = 10 * 60 * 1000;
@@ -258,7 +257,7 @@ const weatherCache = new Map(loadWeatherCache());
  *
  * 和 geoFailCache 同一个路子，也和 weatherCache 分开：那边是「查到了什么」，
  * 这边是「刚才没查成，十分钟内别再赔一次超时了」。按**坐标**而不是完整缓存键
- * 记 —— 代理坏掉的时候三个数据源一个都打不通，没必要一家一家再试一遍。
+ * 记 —— 网络不通的时候三个数据源一个都打不通，没必要一家一家再试一遍。
  */
 const weatherFailCache = new Map();
 /** date-holidays 的实例按国家码复用 —— 每次 new 都要载一遍该国规则。 */
@@ -291,8 +290,8 @@ function loadWeatherCache() {
 /**
  * 把内存里这份天气缓存写到盘上（节流）。
  *
- * 写盘的理由只有一个：查不到的时候拿上一次查到的顶上。纯内存的话，代理坏着的
- * 时候重启一次进程，连「上一次」都没有了 —— 而代理坏掉和重启进程恰恰经常
+ * 写盘的理由只有一个：查不到的时候拿上一次查到的顶上。纯内存的话，网络不通的
+ * 时候重启一次进程，连「上一次」都没有了 —— 而网络不通和重启进程恰恰经常
  * 同时发生（用户看见报错，第一反应就是重启）。
  *
  * 写不进去只 warn：这份缓存丢了最多让下一轮多打一次网络。
@@ -513,32 +512,20 @@ function dayTag(country, date, year, at, dow) {
 /**
  * 天气和地名查询的唯一出网口。
  *
- * 三家天气源（open-meteo / 和风 / WeatherAPI）和 geocoding 都走这儿，所以代理
- * 只要在这一处挂：`weather` 那一类**出厂就是勾上的**（用户实测这几个域名
- * 直连不通）。想改去控制台的「代理」那节。
+ * 三家天气源（open-meteo / 和风 / WeatherAPI）和 geocoding 都走这儿。
  *
  * 出错时用 `whyNetwork` 翻译一遍再抛 —— 这个错误串会进日志，而
- * 「请求超时」和「代理拒绝连接」要改的地方完全不同。
+ * 「请求超时」和「域名解析不了」要改的地方完全不同。
  */
 async function fetchJson(url, timeout, headers) {
-  /*
-   * 代理自己坏掉时脱开代理直连再试一次 —— 那一整套现在在 `fetchVia` 里，
-   * 所有类别共用（原来只有天气这一处有，是这个项目里第一个撞上它的场景：
-   * 用户报的 `连接被重置 —— 代理 http://127.0.0.1:7892 不稳定？`）。
-   *
-   * `init` 必须是函数：里面的 `AbortSignal.timeout()` 第一发用掉之后已经在
-   * 计时，重试那发要拿个新的。
-   */
-  const init = () => ({
-    signal: AbortSignal.timeout(timeout),
-    ...(headers ? { headers } : {}),
-  });
-
   let res;
   try {
-    res = await fetchVia("weather", url, init, (why) => logDebug("环境", `查天气${why}`));
+    res = await fetch(url, {
+      signal: AbortSignal.timeout(timeout),
+      ...(headers ? { headers } : {}),
+    });
   } catch (e) {
-    throw new Error(whyNetwork(e, "weather", timeout));
+    throw new Error(whyNetwork(e, timeout));
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
@@ -1006,7 +993,7 @@ async function weatherAt(geo, weather, keys) {
   /*
    * 刚失败过：这十分钟里连试都不试，直接吃旧的。
    *
-   * 代理坏掉的时候每一轮都去打一遍，等于每条消息都赔一次 5 秒超时（两个城市
+   * 网络不通的时候每一轮都去打一遍，等于每条消息都赔一次 5 秒超时（两个城市
    * 是 Promise.all，所以是并排赔），而买回来的还是同一份旧数据。
    */
   const failedAt = weatherFailCache.get(at);

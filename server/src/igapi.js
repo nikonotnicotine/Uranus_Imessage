@@ -59,7 +59,7 @@ function api(pathname, params = {}, token = "") {
  *
  * @param {string} token
  * @returns {Promise<{userId: string, username: string, expiresAt: number}>}
- * @throws {Error} 中文原因（token 无效、网络不通、代理没配…）
+ * @throws {Error} 中文原因（token 无效、网络不通…）
  */
 export async function probeToken(token) {
   const clean = String(token ?? "").trim();
@@ -105,7 +105,7 @@ export async function bindAccount(roleName, token) {
  * Meta 的规矩：token 必须**活过 24 小时**才能续、**过期了就不能续**。
  * 所以这个函数只在 `needsRefresh` 为真时被调（还没过期、但快了）。
  *
- * 失败**不清空 token**：网络抖一下、代理挂了都会失败，而那个 token 还能用好几天。
+ * 失败**不清空 token**：网络抖一下、断网了都会失败，而那个 token 还能用好几天。
  * 只把原因记进 `lastError` 让界面上显示，下一轮再试。
  *
  * @param {string} roleName 空串 = 你自己的大号

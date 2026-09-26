@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 // labels.js 是纯常量 + 纯函数，不 import 这个文件，不会成环
-import { FORMAT_CHILD_KINDS } from "./labels.js";
+import { FORMAT_CHILD_KINDS, PROVIDER_TYPES } from "./labels.js";
 // 八股文规则的客户端副本，内容和服务端 cliche.js 一致（那边是单一事实来源）
 import { clicheRules } from "./clicherules.js";
 
@@ -216,13 +216,16 @@ export function newMessage(role = "user") {
   return { id: `c-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role, content: "" };
 }
 
-function blankProvider(index) {
+function blankProvider(index, type = "custom") {
   // id 用位置生成而不是时间戳：服务端 normalizeConfig 也是这么排的，
   // 两边算出来一致，密钥才能按 id 对上（data.config.json 里就是按 id 索引）
+  const meta = PROVIDER_TYPES.find((t) => t.id === type) ?? PROVIDER_TYPES[0];
   return {
     id: `prov-${index + 1}`,
     name: "",
-    url: "",
+    type: meta.id,
+    // 官方类型把地址预填好，自定义留空让用户填中转站
+    url: meta.url,
     keys: [""],
     models: [],
   };
@@ -1243,15 +1246,15 @@ export function ConfigProvider({ children }) {
 
   /* ---------- 服务商源 / 模型注册表 ---------- */
 
-  /** 新增一个空的服务商源，返回它的 id（调用方拿去选中）。 */
-  const addProvider = useCallback(() => {
+  /** 新增一个空的服务商源（默认自定义类型），返回它的 id（调用方拿去选中）。 */
+  const addProvider = useCallback((type = "custom") => {
     let id = "";
     updateConfig((c) => {
       const list = c.providers ?? [];
       // 位置生成的 id 可能和已有的撞上（删过中间那个再加），往后找到空位
       let n = list.length;
-      let candidate = blankProvider(n);
-      while (list.some((p) => p.id === candidate.id)) candidate = blankProvider(++n);
+      let candidate = blankProvider(n, type);
+      while (list.some((p) => p.id === candidate.id)) candidate = blankProvider(++n, type);
       id = candidate.id;
       return { ...c, providers: [...list, candidate] };
     });

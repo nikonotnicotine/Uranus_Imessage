@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from "react";
 import { NAV, sectionById, sectionGroups } from "./nav.js";
-import { ProviderPanel } from "./panels/api.jsx";
+import { NewProviderModal, ProviderPanel } from "./panels/api.jsx";
 import { AssistantBubble } from "./panels/assistant.jsx";
 import { ChatPanel, ChatPreview, PrivacyPanel } from "./panels/chat.jsx";
 import { CommandsButton } from "./panels/commands.jsx";
@@ -31,7 +31,6 @@ import { InstagramPanel } from "./panels/instagram.jsx";
 import { MemoriesPanel } from "./panels/memories.jsx";
 import { OfflinePanel } from "./panels/offline.jsx";
 import { PresetPanel } from "./panels/preset.jsx";
-import { ProxyPanel } from "./panels/proxy.jsx";
 import { RolePanel } from "./panels/role.jsx";
 import { SetupButton, SetupWizard, useAutoOpenSetup } from "./panels/setup.jsx";
 import { GlobalSearch } from "./search.jsx";
@@ -208,6 +207,8 @@ export function ErrorBanner({ onGoto }) {
  */
 export function SectionList({ section, groups, itemId, onPick, onAnchor }) {
   const store = useConfig();
+  // 「+」要先问一句的（服务商源选 API 类型）：记下是哪个新增方法，弹框选完再调
+  const [choosing, setChoosing] = useState(null);
 
   // 章节锚点：没有条目可选的分区（发送节奏 / 控制台）
   if (section.anchors) {
@@ -236,7 +237,9 @@ export function SectionList({ section, groups, itemId, onPick, onAnchor }) {
                 add ? (
                   <button
                     type="button"
-                    onClick={() => onPick(add())}
+                    onClick={() =>
+                      g.addChooser ? setChoosing({ kind: g.addChooser, add }) : onPick(add())
+                    }
                     aria-label={g.addLabel ?? "新增"}
                     title={g.addLabel ?? "新增"}
                     className="shrink-0 rounded-item p-1 text-ink-faint transition-colors duration-150 hover:bg-sunken hover:text-ink"
@@ -269,6 +272,17 @@ export function SectionList({ section, groups, itemId, onPick, onAnchor }) {
           </Fragment>
         );
       })}
+
+      {choosing?.kind === "providerType" && (
+        <NewProviderModal
+          onClose={() => setChoosing(null)}
+          onChoose={(type) => {
+            const { add } = choosing;
+            setChoosing(null);
+            onPick(add(type));
+          }}
+        />
+      )}
     </>
   );
 }
@@ -678,9 +692,6 @@ export function AppShell() {
                       {/* 账号排在服务控制之前：改密码是「这台服务谁能进」，
                           比重启和备份更靠前，而且新用户装完最先该来这儿看一眼 */}
                       <AccountPanel />
-                      {/* 代理紧跟账号：这两节都是「这台服务怎么跟外面打交道」，
-                          而且新装的人配完连接之后，第二个会卡住的地方就是出网 */}
-                      <ProxyPanel />
                       <ServicePanel />
                       <BackupPanel />
                       <CloudBackupPanel />

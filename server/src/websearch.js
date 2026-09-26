@@ -29,16 +29,7 @@
  */
 
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { fetchVia, whyNetwork } from "./proxy.js";
-
-/**
- * 数据源那几个函数记日志用的作用域。
- *
- * runSearch 收的那个 `scope` 参数是**调用方**给的（哪个角色、哪条会话），
- * 但三个 search* 函数拿不到它 —— 它们只在「代理挂了，脱开代理重试」那一下
- * 记一句 debug，写死一个模块级的名字就够。
- */
-const SCOPE = "搜索";
+import { whyNetwork } from "./net.js";
 
 /** 搜一次最多等多久。用户在 iMessage 那头干等着，不能太长。 */
 const SEARCH_TIMEOUT = 12000;
@@ -245,21 +236,16 @@ function stripTags(html) {
  */
 async function searchDuckDuckGo(query, limit) {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const res = await fetchVia(
-    "search",
-    url,
-    () => ({
-      signal: AbortSignal.timeout(SEARCH_TIMEOUT),
-      headers: {
-        // 不带 UA 的话对方直接返回空页面
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      },
-    }),
-    (why) => logDebug(SCOPE, `DuckDuckGo${why}`)
-  );
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+    headers: {
+      // 不带 UA 的话对方直接返回空页面
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    },
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const html = await res.text();
 
@@ -330,23 +316,17 @@ async function searchTavily(query, key, limit, opts = {}) {
   const fields = { ...TAVILY_FIELDS, ...(opts.fields ?? {}) };
   const minScore = clampScore(opts.minScore);
 
-  // Tavily 国内实测直连就通（1 秒），所以代理挂了那一刀在这儿几乎总能救回来
-  const res = await fetchVia(
-    "search",
-    "https://api.tavily.com/search",
-    () => ({
-      method: "POST",
-      signal: AbortSignal.timeout(SEARCH_TIMEOUT),
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        query,
-        max_results: limit,
-        // 让它自己压一遍长度，我们这边还会再截一刀
-        search_depth: "basic",
-      }),
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      query,
+      max_results: limit,
+      // 让它自己压一遍长度，我们这边还会再截一刀
+      search_depth: "basic",
     }),
-    (why) => logDebug(SCOPE, `Tavily${why}`)
-  );
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
 
@@ -374,15 +354,10 @@ async function searchBrave(query, key, limit) {
   const url =
     "https://api.search.brave.com/res/v1/web/search" +
     `?q=${encodeURIComponent(query)}&count=${limit}`;
-  const res = await fetchVia(
-    "search",
-    url,
-    () => ({
-      signal: AbortSignal.timeout(SEARCH_TIMEOUT),
-      headers: { Accept: "application/json", "X-Subscription-Token": key },
-    }),
-    (why) => logDebug(SCOPE, `Brave${why}`)
-  );
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT),
+    headers: { Accept: "application/json", "X-Subscription-Token": key },
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   const items = (Array.isArray(data?.web?.results) ? data.web.results : [])
@@ -464,11 +439,10 @@ export async function runSearch(queries, api, scope = "搜索", limits = {}) {
        * 搜不到不是致命错误：模型照常回答，只是没有实时信息。
        *
        * 但**原因要说清**。原来这行只把 e 交给 logWarn，标题里一个字的原因都
-       * 没有 —— 明细档里是一句 `fetch failed` 加一坨栈，而这一类默认不走代理
-       * （DuckDuckGo 直连不通），所以最常见的失败恰恰就是「该勾代理没勾」。
-       * whyNetwork 会把这句话说出来，scope 用 "search"，和 fetchVia 同一个开关。
+       * 没有 —— 明细档里是一句 `fetch failed` 加一坨栈。DuckDuckGo 国内直连不通，
+       * 要么在系统层面开全局代理（Clash 的 TUN 模式），要么换 Tavily / Brave。
        */
-      logWarn(scope, `搜「${query}」失败（${source.name}）：${whyNetwork(e, "search", SEARCH_TIMEOUT)}，这条跳过`, e);
+      logWarn(scope, `搜「${query}」失败（${source.name}）：${whyNetwork(e, SEARCH_TIMEOUT)}，这条跳过`, e);
       continue;
     }
     const ms = Date.now() - startedAt;

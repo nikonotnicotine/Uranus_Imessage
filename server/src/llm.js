@@ -11,13 +11,29 @@
  * OpenAI 那个 `input_audio` 字段实测没有一家中转站往上游透传，只能走
  * Gemini 原生的 `/v1beta/models/{model}:generateContent`，见 transcribeAudio。
  *
+ * 服务商源选了 Gemini / Claude 类型的话，上面这些都改打各家原生接口 ——
+ * 翻译在 apitype.js，这里的重试、脱参数、错误归因照旧只写一份。
+ *
  * 所有请求都会往日志中枢写一条，前端控制台能看到打给了哪条线、花了多久、
  * 失败时上游到底回了什么。
  */
 
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import { DEFAULT_AUDIO_PROMPT, DEFAULT_VIDEO_PROMPT, DEFAULT_VISION_PROMPT } from "./config.js";
-import { fetchVia, netCodes, whyNetwork } from "./proxy.js";
+import { netCodes, whyNetwork } from "./net.js";
+import {
+  ANTHROPIC_DEFAULT_MAX_TOKENS,
+  GEMINI_SAFETY_OFF,
+  anthropicHeaders,
+  anthropicRoot,
+  apiType,
+  chatRequest,
+  geminiHeaders,
+  geminiModelUrl,
+  geminiRoot,
+  isOfficialGemini,
+  nativeResult,
+} from "./apitype.js";
 
 const REQUEST_TIMEOUT = 60000;
 const TEST_TIMEOUT = 30000;
@@ -84,7 +100,8 @@ const UPSTREAM_DETAIL_MAX = 1200;
  * 重试就过去的连接抖动，变成了当场换副 API、甚至整轮失败。
  */
 function isTransient(status, error) {
-  if (status) return status === 429 || (status >= 500 && status <= 504);
+  // 529 是 Claude 的「过载了」，和 503 一个意思
+  if (status) return status === 429 || (status >= 500 && status <= 504) || status === 529;
   if (error?.name === "TimeoutError" || error?.name === "AbortError") return true;
   // netCodes 排过序，但这里是「有没有一条值得重试」，所以全看一遍
   const codes = netCodes(error);
@@ -290,7 +307,7 @@ const FAULT_ADVICE = {
   // 上游收到了请求、明确回了个错误码。Uranus 改不了它
   upstream: "这是模型服务商回的错，不是 Uranus 的问题，请把上面这句话发给你的 API 服务商",
   // 请求压根没到上游。可能是本机出不了网，也可能是那家站点挂了/域名填错了
-  network: "这一步没能连上模型服务商，先看网络和代理通不通、接口地址有没有填错",
+  network: "这一步没能连上模型服务商，先看网络通不通、接口地址有没有填错",
   // 内容安全。也在上游那一侧，但解决办法是换说法/换模型，不是找客服要额度
   blocked: "这是模型服务商的内容审核拦下的，不是 Uranus 的问题，换个说法或换个模型再试",
   // 这一档是我们自己的事，别往外推
@@ -367,6 +384,27 @@ function rejectsStream(status, text) {
   const s = String(text ?? "");
   if (!/\bstream(ing)?\b/i.test(s)) return false;
   return /unsupported|not\s+support|unrecognized|invalid|disabled|not\s+allowed|cannot|can't/i.test(s);
+}
+
+/**
+ * 上游是不是在说「不收以 assistant 结尾的消息」（预填）。
+ *
+ * Gemini 3.7/3.8 回的是 `Requests ending with a model turn are not supported`，
+ * Claude 新型号说的是 prefill 不支持，自建反代的措辞更随意 —— 认几个关键词。
+ */
+function rejectsPrefill(status, text) {
+  if (status !== 400 && status !== 422) return false;
+  return /prefill|ending with a(n)? (model|assistant) (turn|message)|must end with (a |the )?user/i.test(
+    String(text ?? "")
+  );
+}
+
+/** Claude 报「max_tokens 超上限」时挖出那个上限；不是这句话就是 null。 */
+function maxTokensCap(status, text) {
+  if (status !== 400) return null;
+  const m = /max_tokens:\s*\d+\s*>\s*(\d+)/i.exec(String(text ?? ""));
+  const cap = m ? Number(m[1]) : 0;
+  return cap > 0 ? cap : null;
 }
 
 /* ================= 内容安全那一类失败 ================= */
@@ -526,7 +564,7 @@ function logUpstreamFailure(label, status, text, body) {
  * e.cause 里（连不上、DNS 解析不了、证书不对…）。控制台就是给用户排查
  * 问题用的，所以这里要把 cause 挖出来。
  *
- * ── 为什么改成转给 proxy.js:whyNetwork ──
+ * ── 为什么改成转给 net.js:whyNetwork ──
  *
  * 这里原来自己挖 `e.cause.code`，**只挖一层**，而真正的原因经常比一层深：
  *
@@ -534,15 +572,8 @@ function logUpstreamFailure(label, status, text, body) {
  *    `AggregateError`，外层只有一个笼统的 code，**每条具体原因在
  *    `e.errors[]` 里**。只看 `cause.code` 的话一条都读不到，于是掉到最后那个
  *    兜底，把 undici 的 `fetch failed` 原样吐出去 —— 用户报上来的就是这句。
- *  - 走代理时 TLS / HTTP 隧道里的错还会再包一层。
  *
- * `netCodes` 会把 `errors[]` 和 `cause` 一起往下走四层，而 `whyNetwork` 还多
- * 做一件这里做不到的事：**区分「走着代理出的错」和「直连出的错」**。同一个
- * ECONNREFUSED，走代理时该去看代理开没开，直连时该去看地址填对没有 ——
- * 两种要改的地方完全不同，而这里压根不知道这一类有没有挂代理。
- *
- * 传的 scope 是 `"llm"`，和这条路 `fetchVia("llm", …)` 用的是同一个 key ——
- * 「挂代理看哪个开关，报错就照哪个开关说话」，两边不会各说一套。
+ * `netCodes` 会把 `errors[]` 和 `cause` 一起往下走四层。
  *
  * 每种情况都带上原始错误码：这句话会原样发到用户的 iMessage 里
  * （见 imessage.js:notifyFailure），有个能搜的关键词比一句中文描述管用。
@@ -551,7 +582,7 @@ function describeNetworkError(e, timeout = REQUEST_TIMEOUT) {
   // AbortError 是「用户按停」和「我们自己的超时」共用的名字，whyNetwork
   // 认不出后者的语义（它只看错误码），所以这一种留在这儿自己说
   if (e?.name === "AbortError") return `上游超时，没在限定时间内响应（代码 AbortError）`;
-  return whyNetwork(e, "llm", timeout);
+  return whyNetwork(e, timeout);
 }
 
 /**
@@ -571,28 +602,16 @@ async function requestJson(
   url,
   { method = "POST", key, body, timeout = REQUEST_TIMEOUT, headers, signal }
 ) {
-  /*
-   * 模型 API 那一类**默认不走代理**：中转站在国内直连本来就通，套上代理多半
-   * 更慢，还可能因为落地 IP 变了被风控。要走的话在控制台的「代理」那节勾上。
-   *
-   * 走 `fetchVia` 而不是自己挂 dispatcher：勾了代理的人，代理没开时会自动脱开
-   * 代理直连补一刀 —— 对这一类尤其划算，因为目标本来就直连通。
-   *
-   * `init` 每次重造：`signal` 里有 `AbortSignal.timeout`，第一发用掉就在计时了。
-   */
-  const init = () => {
-    const timer = AbortSignal.timeout(timeout);
-    return {
-      method,
-      headers: headers ?? {
-        ...(body ? { "Content-Type": "application/json" } : {}),
-        ...(key ? { Authorization: `Bearer ${key}` } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: signal ? AbortSignal.any([timer, signal]) : timer,
-    };
-  };
-  const res = await fetchVia("llm", url, init, (why) => logDebug("LLM", why));
+  const timer = AbortSignal.timeout(timeout);
+  const res = await fetch(url, {
+    method,
+    headers: headers ?? {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: signal ? AbortSignal.any([timer, signal]) : timer,
+  });
 
   const text = await res.text();
   let data = null;
@@ -629,26 +648,30 @@ async function requestJson(
  * `onDelta` 每收到一小块正文调一次。它自己抛的异常**不会**打断这一轮 ——
  * 那是「写给前端的管子断了」，而模型这边还在正常吐字；断的是显示，不是生成。
  *
+ * `headers` / `decode` 是给原生接口（Gemini、Claude）用的：鉴权头不一样，每一帧
+ * 的形状也不一样（见 apitype.js 那两个 decode）。不给就是 OpenAI 那一套。
+ *
  * @param {(text: string) => void} onDelta 每一小块正文
  * @returns {Promise<{ok: boolean, status: number, data: any, text: string}>}
  */
-async function requestStream(url, { key, body, timeout = REQUEST_TIMEOUT, signal, onDelta }) {
-  // 和 requestJson 同一条规矩：模型 API 默认不走代理，勾了的话代理挂了自动直连
-  const init = () => {
-    const timer = AbortSignal.timeout(timeout);
-    return {
-      method: "POST",
-      headers: {
+async function requestStream(
+  url,
+  { key, headers, body, timeout = REQUEST_TIMEOUT, signal, onDelta, decode = decodeOpenAiChunk }
+) {
+  const timer = AbortSignal.timeout(timeout);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...(headers ?? {
         "Content-Type": "application/json",
         ...(key ? { Authorization: `Bearer ${key}` } : {}),
-        // 有些反代靠这个头决定回不回 SSE
-        Accept: "text/event-stream",
-      },
-      body: JSON.stringify(body),
-      signal: signal ? AbortSignal.any([timer, signal]) : timer,
-    };
-  };
-  const res = await fetchVia("llm", url, init, (why) => logDebug("LLM", why));
+      }),
+      // 有些反代靠这个头决定回不回 SSE
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+    signal: signal ? AbortSignal.any([timer, signal]) : timer,
+  });
 
   // 错误响应不是 SSE，原样读成文本交给调用方那套错误处理
   if (!res.ok) {
@@ -681,6 +704,8 @@ async function requestStream(url, { key, body, timeout = REQUEST_TIMEOUT, signal
   let finish = null;
   let model = "";
   let upstreamError = null;
+  let errorStatus = 200;
+  let blocked = null;
 
   await readSse(res, (payload) => {
     if (payload === "[DONE]") return true;
@@ -691,14 +716,16 @@ async function requestStream(url, { key, body, timeout = REQUEST_TIMEOUT, signal
       // 心跳、注释、反代插的那点垃圾 —— 跳过，别为此毁掉一整轮
       return false;
     }
+    const d = decode(chunk);
+    if (!d) return false;
     // 流中途报错：`data: {"error":{...}}`
-    if (chunk?.error) {
-      upstreamError = chunk.error;
+    if (d.error) {
+      upstreamError = d.error;
+      // 响应头早就发成 200 了；原生接口能从错误类型补出一个真正的状态码
+      errorStatus = d.status ?? 200;
       return true;
     }
-    const choice = chunk.choices?.[0];
-    // reasoning_content 是思考过程（DeepSeek R1 那一路），不是正文，不累进去
-    const piece = choice?.delta?.content;
+    const piece = d.piece;
     if (typeof piece === "string" && piece) {
       full += piece;
       // 前端的管子断了不该连累这一轮生成
@@ -708,16 +735,22 @@ async function requestStream(url, { key, body, timeout = REQUEST_TIMEOUT, signal
         /* 显示断了，生成继续 */
       }
     }
-    if (choice?.finish_reason) finish = choice.finish_reason;
-    // usage 一般只挂在最后一个 chunk 上（有的源压根不给）
-    if (chunk.usage) usage = chunk.usage;
-    if (chunk.model) model = String(chunk.model);
-    return false;
+    if (d.finish) finish = d.finish;
+    // usage 一般只挂在最后一个 chunk 上（有的源压根不给）；Claude 是拆成两半给的
+    if (d.usage) usage = { ...(usage ?? {}), ...d.usage };
+    if (d.model) model = String(d.model);
+    if (d.blocked) blocked = d.blocked;
+    return Boolean(d.stop);
   });
 
   if (upstreamError) {
     const text = JSON.stringify({ error: upstreamError });
-    return { ok: false, status: 200, data: { error: upstreamError }, text };
+    return { ok: false, status: errorStatus, data: { error: upstreamError }, text };
+  }
+
+  // 一个字都没有、而且上游说了是审核拦的：当成 400 交出去，让内容安全那套认得出来
+  if (!full && blocked) {
+    return { ok: false, status: 400, data: { error: { message: blocked } }, text: blocked };
   }
 
   /*
@@ -731,6 +764,18 @@ async function requestStream(url, { key, body, timeout = REQUEST_TIMEOUT, signal
     ...(usage ? { usage } : {}),
   };
   return { ok: true, status: res.status, data, text: JSON.stringify(data) };
+}
+
+/** OpenAI 形状的一帧。reasoning_content 是思考过程（DeepSeek R1 那一路），不是正文，不累进去。 */
+function decodeOpenAiChunk(chunk) {
+  if (chunk?.error) return { error: chunk.error };
+  const choice = chunk?.choices?.[0];
+  return {
+    piece: choice?.delta?.content,
+    finish: choice?.finish_reason,
+    usage: chunk?.usage,
+    model: chunk?.model,
+  };
 }
 
 /**
@@ -833,6 +878,8 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
   const base = trimBase(endpoint?.url);
   const key = endpoint?.key ?? "";
   const model = endpoint?.model ?? "";
+  // 服务商源的类型（apitype.js）。body 始终按 OpenAI 的形状攒，发之前才翻译
+  const type = apiType(endpoint);
 
   // 这三条是 Uranus 侧的配置没填全，不是上游的错 —— 标成 config，
   // 免得用户拿着「没填密钥」去问服务商客服
@@ -918,10 +965,14 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
    * 请求体，既不该占抖动的重试额度，也没有等的必要。
    */
   let attempt = 0;
+  // 预填被拒之后挪过一次尾巴就够了，见下面 rejectsPrefill 那段
+  let tailMoved = false;
   for (;;) {
     // 每圈开头看一眼：等重试的那几秒里用户可能已经按停了
     if (opts.signal?.aborted) throw abortedError();
     const retryIn = delays[attempt];
+    // 每圈重新翻译：上一圈可能刚脱掉一个参数、换了一句说法
+    const wire = chatRequest(type, base, key, body, streaming);
     try {
       /*
        * 流式和非流式走两个函数，但**返回同一个形状** —— 下面整段重试、脱参数、
@@ -932,19 +983,24 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
        * 这里不自己去清：chatCompletion 不知道前端长什么样。
        */
       result = streaming
-        ? await requestStream(`${base}/chat/completions`, {
+        ? await requestStream(wire.url, {
             key,
-            body,
+            headers: wire.headers,
+            body: wire.body,
             timeout: opts.timeout ?? REQUEST_TIMEOUT,
             signal: opts.signal,
             onDelta: opts.onDelta,
+            ...(wire.decode ? { decode: wire.decode } : {}),
           })
-        : await requestJson(`${base}/chat/completions`, {
+        : await requestJson(wire.url, {
             key,
-            body,
+            headers: wire.headers ?? undefined,
+            body: wire.body,
             timeout: opts.timeout ?? REQUEST_TIMEOUT,
             signal: opts.signal,
           });
+      // 原生接口的响应翻回 choices[0].message.content，下面一行都不用改
+      if (wire.native) result = nativeResult(type, result);
     } catch (e) {
       /*
        * 按停要在 isTransient 之前判掉。
@@ -961,7 +1017,7 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
         await wait(retryIn);
         continue;
       }
-      // 请求没能到上游：可能是这台机器出不了网/要代理，也可能是那家站点自己挂了。
+      // 请求没能到上游：可能是这台机器出不了网，也可能是那家站点自己挂了。
       // 两边都有可能，所以建议是「先看网络和地址」而不是「去找服务商」
       throw faultKind(new Error(`${label} 请求失败：${why}`), "network");
     }
@@ -1028,6 +1084,48 @@ export async function chatCompletion(endpoint, messages, opts = {}) {
       streaming = false;
       logWarn(label, `${model} 不收 stream，改成整段拿一次`, why);
       continue;
+    }
+
+    /*
+     * OpenAI 的推理型模型（o 系、GPT-5 系）不收 `max_tokens`，要的是
+     * `max_completion_tokens`，而且报错里会点名让你换。照它说的改名重打。
+     * 中转站和官方都可能这么回，所以不分类型。
+     */
+    if (
+      result.status === 400 &&
+      body.max_tokens !== undefined &&
+      /max_completion_tokens/.test(result.text) &&
+      /\bmax_tokens\b/.test(result.text)
+    ) {
+      body.max_completion_tokens = body.max_tokens;
+      delete body.max_tokens;
+      logWarn(label, `${model} 要的是 max_completion_tokens，改个名重打一次`, why);
+      continue;
+    }
+
+    /*
+     * Claude 的老型号输出上限比 ANTHROPIC_DEFAULT_MAX_TOKENS 小，会回
+     * `max_tokens: 8192 > 4096, which is the maximum allowed…`。照它报的上限改小。
+     */
+    const cap = type === "anthropic" ? maxTokensCap(result.status, result.text) : null;
+    if (cap && cap < (body.max_tokens > 0 ? body.max_tokens : ANTHROPIC_DEFAULT_MAX_TOKENS)) {
+      body.max_tokens = cap;
+      logWarn(label, `${model} 最多只能输出 ${cap} token，按这个上限重打一次`, why);
+      continue;
+    }
+
+    /*
+     * 上游不收预填（消息以 assistant 结尾）。GEMINI_STRICT 那两个型号是预先知道的，
+     * 别的是撞上了才知道 —— 新一代的 Claude 也不收了，而且型号还会越来越多。
+     * 和脱参数同一个路子：认上游的抱怨，把尾巴挪到 user 名下再打一次。
+     */
+    if (!tailMoved && rejectsPrefill(result.status, result.text)) {
+      const moved = moveModelTail(body.messages, label);
+      tailMoved = true;
+      if (moved !== body.messages) {
+        body.messages = moved;
+        continue;
+      }
     }
 
     // 摘要那句会被截断（要发成短信），全文只在日志里 —— 这是最后一次机会
@@ -1239,6 +1337,9 @@ export async function testEndpoint(endpoint, label = "API") {
  * 拉模型列表（GET /models）。
  * 不同中转站返回结构有差异，这里尽量兼容 {data:[{id}]} 和 {data:["name"]}。
  *
+ * Gemini / Claude 类型打各自的原生列表：Gemini 回 `{models:[{name:"models/xxx"}]}`
+ * （前缀要剥掉），Claude 回 `{data:[{id}]}`，下面那段解析两种都认得。
+ *
  * @returns {Promise<{ok:boolean, models?:string[], error?:string}>}
  */
 export async function listModels(endpoint, label = "API") {
@@ -1247,11 +1348,20 @@ export async function listModels(endpoint, label = "API") {
   if (!base) return { ok: false, error: `${label} 没填接口地址` };
   if (!key) return { ok: false, error: `${label} 没填密钥` };
 
+  const type = apiType(endpoint);
+  const target =
+    type === "gemini"
+      ? { url: `${geminiRoot(base)}/v1beta/models?pageSize=1000`, headers: geminiHeaders(base, key) }
+      : type === "anthropic"
+      ? { url: `${anthropicRoot(base)}/v1/models?limit=1000`, headers: anthropicHeaders(base, key) }
+      : { url: `${base}/models` };
+
   let result;
   try {
-    result = await requestJson(`${base}/models`, {
+    result = await requestJson(target.url, {
       method: "GET",
       key,
+      headers: target.headers,
       timeout: TEST_TIMEOUT,
     });
   } catch (e) {
@@ -1282,7 +1392,9 @@ export async function listModels(endpoint, label = "API") {
 
   const models = raw
     .map((m) => (typeof m === "string" ? m : m?.id ?? m?.name ?? m?.model))
-    .filter((m) => typeof m === "string" && m.length > 0);
+    .filter((m) => typeof m === "string" && m.length > 0)
+    // Gemini 原生列表的名字带 `models/` 前缀，拼 URL 时不要它
+    .map((m) => (type === "gemini" ? m.replace(/^models\//, "") : m));
 
   // 排序方便找，但别去重掉大小写不同的同名模型
   models.sort((a, b) => a.localeCompare(b));
@@ -1340,23 +1452,6 @@ export async function describeImage(endpoint, prompt, image) {
 }
 
 /* ================= 听音：Gemini 原生 generateContent ================= */
-
-/**
- * Gemini 官方自己的域名。官方认 `x-goog-api-key`，中转站一律认
- * `Authorization: Bearer`（它们前面挡着一层 OpenAI 网关）。
- */
-const GEMINI_OFFICIAL_HOSTS = new Set([
-  "generativelanguage.googleapis.com",
-  "aiplatform.googleapis.com",
-]);
-
-function isOfficialGemini(url) {
-  try {
-    return GEMINI_OFFICIAL_HOSTS.has(new URL(url).hostname);
-  } catch {
-    return false;
-  }
-}
 
 /**
  * 从服务商的 base URL 拼出 Gemini 原生的 generateContent 地址。
@@ -1426,10 +1521,19 @@ async function inlineMedia(endpoint, prompt, media, kind) {
   if (!media?.base64) {
     throw faultKind(new Error(`${label} 拿到的是一段空${kind.noun}`), "config");
   }
+  const type = apiType(endpoint);
+  // Claude 压根不收音频和视频，打过去只会白花一次钱再 400
+  if (type === "anthropic") {
+    throw faultKind(
+      new Error(`${label} 选的是 Claude 的模型，Claude 不收${kind.noun}，换一个 Gemini 或自定义类型的服务商源`),
+      "config"
+    );
+  }
 
   const usePrompt = String(prompt ?? "").trim() || kind.defaultPrompt;
   const mimeType = media.mimeType || kind.fallbackMime;
-  const url = geminiNativeUrl(base, model);
+  // 自定义 / OpenAI 类型照旧：同一个域名拼原生路径（中转站就是这么通的）
+  const url = type === "gemini" ? geminiModelUrl(base, model, "generateContent") : geminiNativeUrl(base, model);
 
   /*
    * parts 的顺序：媒体在前、提示词在后。
@@ -1447,11 +1551,16 @@ async function inlineMedia(endpoint, prompt, media, kind) {
         ],
       },
     ],
+    // 直连官方要自己关安全过滤（中转站替你关了），见 apitype.js
+    ...(type === "gemini" ? { safetySettings: GEMINI_SAFETY_OFF } : {}),
   };
 
-  const headers = isOfficialGemini(base)
-    ? { "Content-Type": "application/json", "x-goog-api-key": key }
-    : { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
+  const headers =
+    type === "gemini"
+      ? geminiHeaders(base, key)
+      : isOfficialGemini(base)
+      ? { "Content-Type": "application/json", "x-goog-api-key": key }
+      : { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
 
   const kb = Math.round((media.base64.length * 3) / 4 / 1024);
   logDebug(
@@ -1626,15 +1735,33 @@ export async function embedText(endpoint, text, opts = {}) {
   // 空文本算出来的向量没有意义，白花一次请求
   if (!input) throw new Error(`${label} 收到空文本`);
 
+  const type = apiType(endpoint);
+  if (type === "anthropic") {
+    throw faultKind(
+      new Error(`${label} 选的是 Claude 的模型，Claude 没有向量模型，换一个别的服务商源`),
+      "config"
+    );
+  }
+  // Gemini 原生是 `:embedContent`，请求和响应的形状都和 OpenAI 那个不一样
+  const target =
+    type === "gemini"
+      ? {
+          url: geminiModelUrl(base, model, "embedContent"),
+          headers: geminiHeaders(base, key),
+          body: { content: { parts: [{ text: input }] } },
+        }
+      : { url: `${base}/embeddings`, body: { model, input } };
+
   const delays = RETRY_DELAYS.slice(0, opts.retries ?? 1);
 
   let result;
   for (let attempt = 0; ; attempt += 1) {
     const retryIn = delays[attempt];
     try {
-      result = await requestJson(`${base}/embeddings`, {
+      result = await requestJson(target.url, {
         key,
-        body: { model, input },
+        headers: target.headers,
+        body: target.body,
         timeout: opts.timeout ?? REQUEST_TIMEOUT,
       });
     } catch (e) {
@@ -1659,11 +1786,11 @@ export async function embedText(endpoint, text, opts = {}) {
     throw new Error(`${label} ${why}`);
   }
 
-  const vector = result.data?.data?.[0]?.embedding;
+  const vector =
+    type === "gemini" ? result.data?.embedding?.values : result.data?.data?.[0]?.embedding;
   if (!Array.isArray(vector) || !vector.length) {
-    throw new Error(
-      `${label} 返回格式看不懂（缺 data[0].embedding）：${result.text.slice(0, 300)}`
-    );
+    const need = type === "gemini" ? "embedding.values" : "data[0].embedding";
+    throw new Error(`${label} 返回格式看不懂（缺 ${need}）：${result.text.slice(0, 300)}`);
   }
   // 有的中转站会把数字发成字符串，这里统一成 number —— 余弦那边要算术运算
   return vector.map((n) => Number(n) || 0);

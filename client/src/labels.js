@@ -110,6 +110,68 @@ export function userBlockReason(config, user) {
 
 /* ================= 服务商源 / 模型 ================= */
 
+/**
+ * 服务商源的 API 类型。和服务端 config.js:PROVIDER_TYPES 一一对应。
+ *
+ * 老版本升上来的、没有 type 字段的一律按「自定义」处理 —— 就是以前那条
+ * OpenAI 兼容的路，行为不变。OpenAI 和自定义发出去的请求一模一样，
+ * 区别只在新建时预填了官方地址。
+ */
+export const PROVIDER_TYPES = [
+  {
+    id: "custom",
+    label: "自定义",
+    desc: "中转站、自建反代，任何 OpenAI 兼容的接口",
+    url: "",
+    urlHint: "OpenAI 兼容，填到 /v1",
+    placeholder: "https://your-relay.example.com/v1",
+    keyPlaceholder: "sk-…",
+  },
+  {
+    id: "openai",
+    label: "OpenAI",
+    desc: "OpenAI 官方接口",
+    url: "https://api.openai.com/v1",
+    urlHint: "官方地址已经填好，一般不用改",
+    placeholder: "https://api.openai.com/v1",
+    keyPlaceholder: "sk-…",
+  },
+  {
+    id: "gemini",
+    label: "Google Gemini",
+    desc: "Google AI Studio 的原生接口，安全过滤自动全关",
+    url: "https://generativelanguage.googleapis.com",
+    urlHint: "官方地址已经填好；走反代就换成反代的域名",
+    placeholder: "https://generativelanguage.googleapis.com",
+    keyPlaceholder: "AIza…",
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic Claude",
+    desc: "Claude 官方原生接口。不能画图、听音、做向量",
+    url: "https://api.anthropic.com",
+    urlHint: "官方地址已经填好；走反代就换成反代的域名",
+    placeholder: "https://api.anthropic.com",
+    keyPlaceholder: "sk-ant-…",
+  },
+];
+
+/** 一个源的类型说明。缺的、不认识的都当自定义。 */
+export function providerTypeOf(provider) {
+  return PROVIDER_TYPES.find((t) => t.id === provider?.type) ?? PROVIDER_TYPES[0];
+}
+
+/**
+ * 换类型时地址怎么办：空着，或者还是某个类型预填的官方地址（用户没动过），
+ * 就换成新类型的预填；用户自己填过的地址不碰。
+ */
+export function urlForType(currentUrl, nextType) {
+  const cur = String(currentUrl ?? "").trim().replace(/\/+$/, "");
+  const untouched = !cur || PROVIDER_TYPES.some((t) => t.url && t.url === cur);
+  if (!untouched) return currentUrl;
+  return PROVIDER_TYPES.find((t) => t.id === nextType)?.url ?? "";
+}
+
 /** 服务商源的显示名：没起名就退回它的 ID。 */
 export function providerLabel(provider) {
   return provider?.name?.trim() || provider?.id || "未命名服务商";

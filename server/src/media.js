@@ -32,20 +32,12 @@ import { formatAmount } from "./card.js";
 import { IMAGES_DIR, REF_IMAGES_DIR, ensureLayout } from "./datadir.js";
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { fetchVia, netCodes, whyNetwork } from "./proxy.js";
+import { netCodes, whyNetwork } from "./net.js";
+import { GEMINI_SAFETY_OFF, apiType, geminiHeaders, geminiModelUrl } from "./apitype.js";
 import { xmlBlockRanges } from "./websearch.js";
 
 /** 合成一条语音最多等多久。对方在 iMessage 那头看着打字指示器干等。 */
 const TTS_TIMEOUT = 30000;
-
-/**
- * 三家 TTS 那几个函数记日志用的作用域。
- *
- * synthesizeVoice 收的那个 `scope` 是调用方给的（哪个角色在说话），但
- * ttsMinimax / ttsElevenLabs 拿不到它 —— 它们只在「代理挂了、脱开代理重试」
- * 那一下记一句 debug，写死一个模块级的名字就够。
- */
-const TTS_SCOPE = "语音";
 
 /**
  * 连接失败之后再试几次。
@@ -969,26 +961,21 @@ function trimBase(url) {
 /**
  * 网络层错误挖出人能看的一句话。
  *
- * 转给 proxy.js:whyNetwork。这里原来自己挖一层 `e.cause.code`，挖不着就把
+ * 转给 net.js:whyNetwork。这里原来自己挖一层 `e.cause.code`，挖不着就把
  * `e.message` 原样吐出去 —— 而 undici 的 message 就是那句没信息量的
  * `fetch failed`。`AggregateError`（IPv6 / IPv4 都连不上时 Node 抛的，具体
  * 原因在 `errors[]` 里）正好落在这个口子上，用户报上来的就是那一句。
- *
- * `scope` 要和这条路 `fetchVia(...)` 用的 key **一致**：合成语音走 `"tts"`、
- * 生图走 `"llm"`。whyNetwork 会照这个 key 去看「这一类到底有没有挂代理」，
- * 然后分开说 —— 同一个 ECONNREFUSED，走代理时该去看代理开没开，直连时该去看
- * 地址填对没有。传错 key 的话它会理直气壮地指错方向。
  */
-function whyFetch(e, scope, timeout) {
+function whyFetch(e, timeout) {
   if (e?.name === "AbortError") return "请求超时";
-  return whyNetwork(e, scope, timeout);
+  return whyNetwork(e, timeout);
 }
 
 /**
  * 这个错误值不值得再试一次。
  *
  * 只认**连接层**的失败：TCP 连不上、握手超时、连接被掐断。这类错误重试一次
- * 通常就过去了（走代理的时候尤其常见 —— 偶发的连接卡死不该让整条语音发不出去）。
+ * 通常就过去了（偶发的连接卡死不该让整条语音发不出去）。
  *
  * 反过来，鉴权失败、余额不足、参数不对、上游明确报错，重试只是多花一次钱、
  * 多等一个超时，所以一律不重试。HTTP 状态码类的错误在各家适配器里就抛成
@@ -1349,34 +1336,29 @@ async function ttsMinimax(cfg, text, voiceId) {
   const group = String(cfg?.groupId ?? "").trim();
   const url = `${host}/v1/t2a_v2${group ? `?GroupId=${encodeURIComponent(group)}` : ""}`;
 
-  const res = await fetchVia(
-    "tts",
-    url,
-    () => ({
-      method: "POST",
-      signal: AbortSignal.timeout(TTS_TIMEOUT),
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${String(cfg?.key ?? "").trim()}`,
+  const res = await fetch(url, {
+    method: "POST",
+    signal: AbortSignal.timeout(TTS_TIMEOUT),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${String(cfg?.key ?? "").trim()}`,
+    },
+    body: JSON.stringify({
+      model: String(cfg?.model ?? "").trim() || "speech-02-hd",
+      text,
+      stream: false,
+      language_boost: "auto",
+      output_format: "hex",
+      // 音色 ID 留空时用官方的系统音色，让「没填也能出声」
+      voice_setting: {
+        voice_id: voiceId || "male-qn-qingse",
+        speed: 1,
+        vol: 1,
+        pitch: 0,
       },
-      body: JSON.stringify({
-        model: String(cfg?.model ?? "").trim() || "speech-02-hd",
-        text,
-        stream: false,
-        language_boost: "auto",
-        output_format: "hex",
-        // 音色 ID 留空时用官方的系统音色，让「没填也能出声」
-        voice_setting: {
-          voice_id: voiceId || "male-qn-qingse",
-          speed: 1,
-          vol: 1,
-          pitch: 0,
-        },
-        audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3", channel: 1 },
-      }),
+      audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3", channel: 1 },
     }),
-    (why) => logDebug(TTS_SCOPE, `MiniMax${why}`)
-  );
+  });
 
   const body = await res.text();
   if (!res.ok) throw new Error(`MiniMax 返回 ${res.status}：${clipBody(body)}`);
@@ -1411,36 +1393,31 @@ async function ttsElevenLabs(cfg, text, voiceId) {
     `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(id)}` +
     "?output_format=mp3_44100_128";
 
-  const res = await fetchVia(
-    "tts",
-    url,
-    () => ({
-      method: "POST",
-      signal: AbortSignal.timeout(TTS_TIMEOUT),
-      headers: {
-        "Content-Type": "application/json",
-        "xi-api-key": String(cfg?.key ?? "").trim(),
+  const res = await fetch(url, {
+    method: "POST",
+    signal: AbortSignal.timeout(TTS_TIMEOUT),
+    headers: {
+      "Content-Type": "application/json",
+      "xi-api-key": String(cfg?.key ?? "").trim(),
+    },
+    body: JSON.stringify({
+      text,
+      model_id: String(cfg?.model ?? "").trim() || "eleven_multilingual_v2",
+      voice_settings: {
+        stability: Number(cfg?.stability ?? 0.5),
+        similarity_boost: Number(cfg?.similarityBoost ?? 0.75),
+        /*
+         * 风格夸张度**只在大于 0 时才发**。
+         *
+         * 这一项是 v2 系模型的（multilingual_v2 / turbo_v2_5）；eleven_v3 的
+         * voice_settings 认的是另一套，多塞一个它不认的字段有被整个请求打回的
+         * 风险。默认 0 时干脆不发，请求体和加这个功能之前一模一样 —— 不碰
+         * 已经调好的配置。官方也提醒 style > 0 会让合成变慢、更容易念飘。
+         */
+        ...(Number(cfg?.style ?? 0) > 0 ? { style: Number(cfg.style) } : {}),
       },
-      body: JSON.stringify({
-        text,
-        model_id: String(cfg?.model ?? "").trim() || "eleven_multilingual_v2",
-        voice_settings: {
-          stability: Number(cfg?.stability ?? 0.5),
-          similarity_boost: Number(cfg?.similarityBoost ?? 0.75),
-          /*
-           * 风格夸张度**只在大于 0 时才发**。
-           *
-           * 这一项是 v2 系模型的（multilingual_v2 / turbo_v2_5）；eleven_v3 的
-           * voice_settings 认的是另一套，多塞一个它不认的字段有被整个请求打回的
-           * 风险。默认 0 时干脆不发，请求体和加这个功能之前一模一样 —— 不碰
-           * 已经调好的配置。官方也提醒 style > 0 会让合成变慢、更容易念飘。
-           */
-          ...(Number(cfg?.style ?? 0) > 0 ? { style: Number(cfg.style) } : {}),
-        },
-      }),
     }),
-    (why) => logDebug(TTS_SCOPE, `ElevenLabs${why}`)
-  );
+  });
 
   if (!res.ok) {
     throw new Error(`ElevenLabs 返回 ${res.status}：${clipBody(await res.text())}`);
@@ -1456,11 +1433,6 @@ async function ttsElevenLabs(cfg, text, voiceId) {
  * `ref_audio_path` **每次都要传**，即使事先调过 /set_refer_audio —— 那个接口
  * 只是预热，参数校验照样会拦下缺这个字段的请求。所以角色上那个「音色 ID」
  * 在这一家的含义是**参考音频的路径**（界面上写了这句话），留空就退回全局配的那条。
- *
- * **这一家刻意不走代理**（另外两家 TTS 都走 `fetchVia("tts", …)`）：它打的是
- * 本机或局域网地址，把 127.0.0.1 交给机场代理多半直接连不上 —— 而用户在
- * 「代理」里勾「语音合成」，想的是 ElevenLabs 那种出不了国的，不是自己电脑上
- * 跑着的这个。
  */
 async function ttsSovits(cfg, text, voiceId) {
   const base = trimBase(cfg?.url) || "http://127.0.0.1:9880";
@@ -1592,7 +1564,7 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音") {
   /*
    * 连接类的失败重试一次。
    *
-   * 这台机器上的请求是走代理出去的（三个官方域名都解析到 198.18.x.x），
+   * 开着 Clash 这类全局代理时（官方域名都解析到 198.18.x.x），
    * 偶发的 UND_ERR_CONNECT_TIMEOUT 是常态 —— 同一个配置上一条刚合成成功、
    * 下一条就连不上。一次连接抖动不该让这条语音退化成文字。
    *
@@ -1606,10 +1578,10 @@ export async function synthesizeVoice(api, voiceId, text, scope = "语音") {
       break;
     } catch (e) {
       if (attempt <= TTS_RETRIES && worthRetry(e)) {
-        logWarn(scope, `${source.name} 没连上（${whyFetch(e, "tts", TTS_TIMEOUT)}），重试一次`);
+        logWarn(scope, `${source.name} 没连上（${whyFetch(e, TTS_TIMEOUT)}），重试一次`);
         continue;
       }
-      throw new Error(`${source.name} 合成失败：${whyFetch(e, "tts", TTS_TIMEOUT)}`);
+      throw new Error(`${source.name} 合成失败：${whyFetch(e, TTS_TIMEOUT)}`);
     }
   }
   const ms = Date.now() - startedAt;
@@ -1655,12 +1627,7 @@ async function readImageFrom(item, scope) {
   if (typeof url === "string" && /^https?:\/\//i.test(url)) {
     logDebug(scope, "上游返回的是图片链接，再取一次字节");
     // 跟着「模型 API」那个勾走：这条链接是出图接口自己给的，域名通常和它同一家
-    const res = await fetchVia(
-      "llm",
-      url,
-      () => ({ signal: AbortSignal.timeout(IMAGE_TIMEOUT) }),
-      (why) => logDebug(scope, `取图片链接${why}`)
-    );
+    const res = await fetch(url, { signal: AbortSignal.timeout(IMAGE_TIMEOUT) });
     if (!res.ok) throw new Error(`取图片链接失败：HTTP ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   }
@@ -1841,6 +1808,143 @@ function dropUnknownField(body, form, raw) {
 }
 
 /**
+ * Gemini 类型的服务商源出一张图（Google 官方原生接口）。
+ *
+ * 两种模型两个接口：
+ *   Imagen 系    POST …/models/{model}:predict，回 `predictions[0].bytesBase64Encoded`
+ *   Gemini 画图  POST …/models/{model}:generateContent，`responseModalities` 里要有
+ *                IMAGE，图在 `candidates[0].content.parts[].inlineData` 里
+ *
+ * 负面提示词两边都没有对应字段（Imagen 3 起把 negativePrompt 撤了），只能写进
+ * 正文里让模型自己避开。比例两边都认同一套写法（`9:16`），config.js:IMAGE_RATIOS
+ * 那几档全在它们支持的范围里。
+ *
+ * 重试规则和 OpenAI 那条路一样（IMAGE_RETRY_DELAYS / worthImageRetry）；比例被嫌弃
+ * 时去掉比例重发一次，和那边剥 aspect_ratio 是同一个意思。
+ *
+ * @returns {Promise<{buffer: Buffer, ratioSent: boolean}>}
+ */
+async function geminiImage({ base, key, model, prompt, negative, refFile, ratio }, scope) {
+  if (!key) throw new Error("生图模型没填密钥");
+  const imagen = /^(models\/)?imagen/i.test(model);
+  const text = negative ? `${prompt}\n\n画面里不要出现：${negative}` : prompt;
+
+  let body;
+  if (imagen) {
+    if (refFile) logWarn(scope, "Imagen 不收参考图，这张按纯文生图出");
+    body = {
+      instances: [{ prompt: text }],
+      parameters: { sampleCount: 1, ...(ratio ? { aspectRatio: ratio.key } : {}) },
+    };
+  } else {
+    const parts = [];
+    if (refFile) {
+      const bytes = await fs.promises.readFile(refFile);
+      parts.push({
+        inline_data: {
+          mime_type: mimeForExt(path.extname(refFile).toLowerCase()),
+          data: bytes.toString("base64"),
+        },
+      });
+    }
+    parts.push({ text });
+    body = {
+      contents: [{ role: "user", parts }],
+      generationConfig: {
+        responseModalities: ["TEXT", "IMAGE"],
+        ...(ratio ? { imageConfig: { aspectRatio: ratio.key } } : {}),
+      },
+      safetySettings: GEMINI_SAFETY_OFF,
+    };
+  }
+
+  const url = geminiModelUrl(base, model, imagen ? "predict" : "generateContent");
+  const headers = geminiHeaders(base, key);
+  /** 比例还在不在请求体里（上游嫌弃的话会被去掉）。 */
+  const ratioIn = () =>
+    imagen ? "aspectRatio" in body.parameters : Boolean(body.generationConfig.imageConfig);
+
+  let raw = "";
+  let res;
+  let retries = 0;
+  for (;;) {
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        signal: AbortSignal.timeout(IMAGE_TIMEOUT),
+        headers,
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      if (retries < IMAGE_RETRY_DELAYS.length && worthImageRetry(e)) {
+        const delay = IMAGE_RETRY_DELAYS[retries];
+        retries += 1;
+        logWarn(scope, `出图没连上（${whyFetch(e, IMAGE_TIMEOUT)}），${delay}ms 后重试第 ${retries} 次`);
+        await wait(delay);
+        continue;
+      }
+      throw new Error(`生图请求失败：${whyFetch(e, IMAGE_TIMEOUT)}`);
+    }
+
+    raw = await res.text();
+    if (res.ok) break;
+
+    // 这个模型不认比例：去掉重发。只试一次 —— 去掉之后就没有可剥的了
+    if (res.status === 400 && ratioIn() && /aspect|imageConfig|image_config/i.test(raw)) {
+      if (imagen) delete body.parameters.aspectRatio;
+      else delete body.generationConfig.imageConfig;
+      logInfo(scope, "这个模型不认画面比例，去掉比例重发一次");
+      continue;
+    }
+
+    if (retries < IMAGE_RETRY_DELAYS.length && transientImageFailure(res.status, raw)) {
+      const delay = IMAGE_RETRY_DELAYS[retries];
+      retries += 1;
+      logWarn(scope, `出图上游返回 ${res.status}，${delay}ms 后重试第 ${retries} 次`, clipBody(raw));
+      await wait(delay);
+      continue;
+    }
+    throw new Error(`生图接口返回 ${res.status}：${clipBody(raw)}`);
+  }
+
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`生图接口返回的不是 JSON：${clipBody(raw)}`);
+  }
+  if (data?.error) throw new Error(`生图接口返回了报错：${clipBody(raw)}`);
+
+  let b64 = "";
+  if (imagen) {
+    const pred = data?.predictions?.[0];
+    b64 = pred?.bytesBase64Encoded ?? "";
+    if (!b64) {
+      // 被安全过滤筛掉的时候 predictions 是空的，原因在 raiFilteredReason 里
+      const why = pred?.raiFilteredReason ?? data?.predictions?.find((p) => p?.raiFilteredReason)?.raiFilteredReason;
+      throw new Error(`Imagen 没出图${why ? `（${why}）` : ""}：${clipBody(raw)}`);
+    }
+  } else {
+    const cand = data?.candidates?.[0];
+    const parts = cand?.content?.parts ?? [];
+    const img = parts.map((p) => p?.inlineData ?? p?.inline_data).find((d) => d?.data);
+    b64 = img?.data ?? "";
+    if (!b64) {
+      // 模型回了一段话没画图（拒绝、或者它觉得该先问问你）—— 把那段话和原因都带上
+      const said = parts.map((p) => (typeof p?.text === "string" ? p.text : "")).join("").trim();
+      const why = cand?.finishReason ?? data?.promptFeedback?.blockReason;
+      throw new Error(
+        `Gemini 没出图${why && why !== "STOP" ? `（${why}）` : ""}：${said ? clipBody(said) : clipBody(raw)}`
+      );
+    }
+  }
+
+  const buffer = Buffer.from(b64, "base64");
+  if (!buffer.length) throw new Error(`返回的图片是空的：${clipBody(raw)}`);
+  return { buffer, ratioSent: Boolean(ratio) && ratioIn() };
+}
+
+/**
  * 出一张图。
  *
  * 两条路：
@@ -1871,6 +1975,11 @@ export async function generateImage(endpoint, req, scope = "生图") {
   const model = String(endpoint?.model ?? "").trim();
   if (!base) throw new Error("生图模型没填接口地址");
   if (!model) throw new Error("生图模型没填模型名");
+  const type = apiType(endpoint);
+  // Claude 只会看图不会画图，打过去只会白花一次钱再 404
+  if (type === "anthropic") {
+    throw new Error("生图模型选的是 Claude 类型的服务商源，Claude 不会画图，换一个别的服务商源");
+  }
 
   const desc = String(req?.prompt ?? "").trim();
   if (!desc) throw new Error("画面描述是空的");
@@ -1890,6 +1999,23 @@ export async function generateImage(endpoint, req, scope = "生图") {
   );
   // 用户没选比例时是 null，下面两条路都据此整个跳过，一个字段都不加
   const ratio = endpoint?.ratio ?? null;
+
+  // Gemini 类型走原生接口，请求和响应都是另一个样子，见 geminiImage
+  if (type === "gemini") {
+    const { buffer, ratioSent } = await geminiImage(
+      { base, key, model, prompt, negative, refFile, ratio },
+      scope
+    );
+    const ms = Date.now() - startedAt;
+    const { mimeType, ext } = sniffImage(buffer);
+    logInfo(
+      scope,
+      `${endpoint?.label ?? model} 出图成功，${Math.round(buffer.length / 1024)}KB ${ext}，` +
+        `耗时 ${ms}ms${ratioSent ? `（要的是 ${ratio.key}）` : ""}` +
+        `${refFile ? `（参考图 ${path.basename(refFile)}）` : ""}`
+    );
+    return { buffer, mimeType, ext, ms };
+  }
 
   /*
    * 两条路发的是同一份字段，只是载体不一样，所以**先把字段摊在一个对象里**，
@@ -1950,16 +2076,11 @@ export async function generateImage(endpoint, req, scope = "生图") {
   for (;;) {
     try {
       /*
-       * form 这个对象**照样能再交一遍**（代理回退那一刀、这里的重发都一样）：
+       * form 这个对象**照样能再交一遍**（这里的重发）：
        * FormData 里存的是 Blob（上面刚从文件读出来的字节），undici 每次发请求
        * 都重新序列化一遍，不像读流那样一次性。
        */
-      res = await fetchVia(
-        "llm",
-        url,
-        init,
-        (why) => logDebug(scope, `${refFile ? "带参考图出图" : "出图"}${why}`)
-      );
+      res = await fetch(url, init());
     } catch (e) {
       /*
        * 连接层的失败也重试（连不上、连接被掐断这些）—— 判据是 worthImageRetry，
@@ -1970,13 +2091,12 @@ export async function generateImage(endpoint, req, scope = "生图") {
         retries += 1;
         logWarn(
           scope,
-          `出图没连上（${whyFetch(e, "llm", IMAGE_TIMEOUT)}），${delay}ms 后重试第 ${retries} 次`
+          `出图没连上（${whyFetch(e, IMAGE_TIMEOUT)}），${delay}ms 后重试第 ${retries} 次`
         );
         await wait(delay);
         continue;
       }
-      // 生图打的是模型 API（fetchVia("llm", …)），所以这里的 scope 也是 llm
-      throw new Error(`生图请求失败：${whyFetch(e, "llm", IMAGE_TIMEOUT)}`);
+      throw new Error(`生图请求失败：${whyFetch(e, IMAGE_TIMEOUT)}`);
     }
 
     raw = await res.text();

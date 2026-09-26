@@ -43,6 +43,7 @@ import {
 } from "lucide-react";
 
 import { DEFAULT_QQ_GROUP, DOC_URL } from "../assistant-help.js";
+import { providerTypeOf, urlForType } from "../labels.js";
 import { useConfig } from "../store.jsx";
 import {
   Button,
@@ -56,7 +57,7 @@ import {
   UranusBadge,
   inputCls,
 } from "../ui.jsx";
-import { SecretInput } from "./api.jsx";
+import { ProviderTypeButtons, SecretInput } from "./api.jsx";
 import { EnrollBox, GUIDE_STEPS, ManualLineBox, TERMINAL_CMDS } from "./imessage.jsx";
 import { ModelSelect, usePresetGate } from "./role.jsx";
 
@@ -354,6 +355,7 @@ function StepProvider({ provider }) {
   const { updateProvider, updateProviderKey, addModels, config } = useConfig();
   const [names, setNames] = useState("");
   const models = provider?.models ?? [];
+  const typeMeta = providerTypeOf(provider);
 
   const add = () => {
     const list = names
@@ -370,11 +372,20 @@ function StepProvider({ provider }) {
       <Says>
         <p>接下来是模型 —— 你的角色靠它想事情、说话。</p>
         <p className="text-ui text-ink-soft">
-          填一个 OpenAI 兼容的接口地址和密钥就行。中转站、官方、自己搭的都可以。
+          先选接口类型：中转站、自己搭的反代选「自定义」；直连官方就选对应的那家，
+          地址会帮你填好，只要贴密钥。
         </p>
       </Says>
 
       <div className="grid grid-cols-1 gap-6">
+        <Field label="API 类型" hint={typeMeta.desc}>
+          <ProviderTypeButtons
+            value={typeMeta.id}
+            onChange={(type) =>
+              updateProvider(provider.id, { type, url: urlForType(provider?.url, type) })
+            }
+          />
+        </Field>
         <Field label="显示名" hint="随便起，只是给你自己看的">
           <input
             className={inputCls}
@@ -383,19 +394,19 @@ function StepProvider({ provider }) {
             placeholder="例如：我的中转站"
           />
         </Field>
-        <Field label="API Base URL" hint="OpenAI 兼容，填到 /v1">
+        <Field label="API Base URL" hint={typeMeta.urlHint}>
           <input
             className={inputCls}
             value={provider?.url ?? ""}
             onChange={(e) => updateProvider(provider.id, { url: e.target.value })}
-            placeholder="https://api.openai.com/v1"
+            placeholder={typeMeta.placeholder}
           />
         </Field>
         <Field label="API Key" hint="只写进本地配置文件">
           <SecretInput
             value={(provider?.keys ?? [""])[0] ?? ""}
             onChange={(v) => updateProviderKey(provider.id, 0, v)}
-            placeholder="sk-…"
+            placeholder={typeMeta.keyPlaceholder}
           />
         </Field>
       </div>

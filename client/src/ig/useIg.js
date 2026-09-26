@@ -156,7 +156,7 @@ export function useIgSettings() {
 }
 
 /**
- * 真 Instagram 的状态：每个角色绑了谁、token 还剩几天、图床和代理配没配。
+ * 真 Instagram 的状态：每个角色绑了谁、token 还剩几天、图床配没配。
  *
  * 返回的东西里**没有任何凭据** —— 后端只回用户名和「配好了没有」，token 和
  * 图床 secret 一个字节都不下来（igreal.js:realOverview）。所以这份状态可以

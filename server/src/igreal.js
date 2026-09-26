@@ -65,7 +65,6 @@ import {
 } from "./igstore.js";
 import { roleFor } from "./instagram.js";
 import { logInfo, logWarn } from "./logs.js";
-import { fetchVia, proxyStatus, usesProxy } from "./proxy.js";
 
 const SCOPE = "Instagram";
 
@@ -462,18 +461,13 @@ export async function replyOut(config, roleName, commentRemoteId, text) {
  *
  * **必须现在就下**：Meta 给的 `media_url` 是 CDN 链接，几小时到几天就失效。
  * 只存 URL 的话过一阵子本地面板全是裂图，识图那一步也拿不到图。
- *
- * 跟着「Instagram」那个勾走（和 uploadToHost 同理）。CDN 本身国内直连大多通，
- * 但它和上面那一串 Graph API 调用是同一条链路 —— 一个勾管到底，用户才猜得到
- * 勾了会发生什么。
  */
 async function downloadMedia(url) {
   if (!url) return "";
   try {
-    // CDN 本身国内大多直连通，所以代理挂了那一刀（fetchVia）在这儿胜率不低
-    const res = await fetchVia("ig", url, () => ({
+    const res = await fetch(url, {
       signal: AbortSignal.timeout(IG_TIMEOUT),
-    }));
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error("下回来是空的");
@@ -858,20 +852,5 @@ export function realOverview(config) {
       }),
     inDnd: inDnd(data.settings, now),
     pollDue: pollDue(data.settings, now),
-    proxy: proxyNote(),
   };
-}
-
-/**
- * 代理配没配，Instagram 那一页上提示一句。**不显示地址** —— 里面可能带账号密码。
- *
- * 判据是 `usesProxy("ig")`，也就是「地址填了**并且**Instagram 这一类勾上了」——
- * 光看有没有地址不够：现在一个地址下面挂着十个勾，只勾了联网搜索的人在这一页
- * 会看到「代理已配好」，然后照旧连不上 Meta，界面上还告诉他配好了。
- *
- * `from` 是这个地址读自哪儿（控制台 / 某个环境变量），照旧只给来源不给值。
- */
-function proxyNote() {
-  const on = usesProxy("ig");
-  return { configured: on, from: on ? proxyStatus().from : "" };
 }

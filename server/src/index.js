@@ -210,7 +210,6 @@ import { writeAccount, writeRealSettings, writeUserAccount } from "./igaccounts.
 import { bindAccount } from "./igapi.js";
 import { pollOnce, realOverview, startIgPolling, syncOut } from "./igreal.js";
 import { checkUpdate } from "./update.js";
-import { SCOPE_KEYS, checkProxyUrl, proxyStatus, testProxy } from "./proxy.js";
 import {
   deleteSession,
   listSessions,
@@ -1187,68 +1186,6 @@ app.get("/api/update/check", async (req, res) => {
   res.json(await checkUpdate({ force }));
 });
 
-/* ---- 出网代理 ----
- *
- * 三条路由都**不走 `PUT /api/config`**，虽然代理确实存在配置里。原因是那条
- * 路由存完会 `syncBridges()` 把所有 iMessage 桥接对齐一遍（等于重连），而改
- * 代理跟桥接毫无关系 —— 为了勾一个「天气走代理」把正在聊的号踢下线，代价离谱。
- *
- * 这一节存完**当场生效**，不用重启：出网那边每次请求都现读一遍配置
- * （proxy.js:proxySettings），ProxyAgent 按地址缓存、地址一变自动换新的。
- */
-
-/** 现状：配没配、脱敏后的地址、读自哪儿、九类各自勾没勾、类别清单。 */
-app.get("/api/proxy", (_req, res) => {
-  res.json(proxyStatus());
-});
-
-/**
- * 测一下这个地址通不通。**不保存** —— 界面上「测试连通」是存之前的试探。
- *
- * 不传 `url` 就测现在生效的那个（存完之后想再确认一下）。空字符串是
- * 「测直连」，也有意义：能分清「代理坏了」和「这台机器压根出不了网」。
- *
- * 一律回 200，理由和检查更新那条一样：测不通是结果不是故障，前端照 `detail`
- * 那句话显示就行。
- */
-app.post("/api/proxy/test", async (req, res) => {
-  // 没带 url 这个字段时测当前生效的；带了空串是「测直连」，两者不同义
-  const raw = req.body?.url;
-  res.json(await testProxy(raw === undefined ? undefined : String(raw)));
-});
-
-/**
- * 存代理设置。
- *
- * 地址先过 `checkProxyUrl` —— 拦下 `socks5://`（机场最爱给这个，而 undici 的
- * ProxyAgent 压根不支持）和一眼看就不对的串。**存下去再报错就太晚了**：那时
- * 用户看到的是「保存成功」，然后所有出网悄悄退回直连。
- *
- * 勾选表只认清单里那九个 key、只认布尔值，其余一概丢掉。
- */
-app.put("/api/proxy", (req, res) => {
-  const url = String(req.body?.url ?? "").trim();
-  const bad = url ? checkProxyUrl(url) : "";
-  if (bad) return res.status(400).json({ ok: false, error: bad });
-
-  const scopes = {};
-  const input = req.body?.scopes ?? {};
-  for (const key of SCOPE_KEYS) {
-    if (typeof input[key] === "boolean") scopes[key] = input[key];
-  }
-
-  const config = loadConfig();
-  saveConfig({ ...config, proxy: { url, scopes } });
-  const status = proxyStatus();
-  logInfo(
-    "代理",
-    url
-      ? `代理已更新：${status.masked}，走代理的有 ${SCOPE_KEYS.filter((k) => status.scopes[k]).length} 类`
-      : "代理地址已清空，全部改回直连"
-  );
-  res.json({ ok: true, ...status });
-});
-
 /**
  * 登记手机号，向 Photon 换一条 iMessage 线路号码。
  *
@@ -1343,6 +1280,7 @@ app.post("/api/imessage/enroll", async (req, res) => {
 function bodyEndpoint(req) {
   const ep = req.body?.endpoint ?? {};
   return {
+    type: String(ep.type ?? "custom"),
     url: String(ep.url ?? ""),
     key: String(ep.key ?? ""),
     model: String(ep.model ?? ""),
@@ -2112,7 +2050,7 @@ app.get("/api/ig/media/:file", (req, res) => {
 /* ---- 真 Instagram ---- */
 
 /**
- * 真 IG 的状态总览：每个角色绑了谁、token 还有几天、图床配没配、代理有没有。
+ * 真 IG 的状态总览：每个角色绑了谁、token 还有几天、图床配没配。
  *
  * **响应里没有任何凭据** —— token 和图床的 api_secret 一个字节都不回
  * （见 igreal.js:realOverview）。这条 GET 的响应会进浏览器网络面板、
@@ -2126,7 +2064,7 @@ app.get("/api/ig/real", (_req, res) => {
  * 绑定 / 解绑一个账号。`roleName` 空串 = 你自己的大号。
  *
  * 绑定会**真的打一次 Meta 的接口**（`GET /me`）来验证 —— 验不通就不落盘，
- * 理由见 igapi.js:bindAccount。所以这条路由可能要等几秒（还要过代理），
+ * 理由见 igapi.js:bindAccount。所以这条路由可能要等几秒，
  * 前端那个按钮得有 loading 态。
  */
 app.post("/api/ig/real/bind", async (req, res) => {

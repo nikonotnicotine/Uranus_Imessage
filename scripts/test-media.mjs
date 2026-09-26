@@ -2152,8 +2152,8 @@ console.log("\n[只改已有气泡的那一轮：不许当成失败]");
    * 「只贴了个爱心」和「只有一张图且出图失败了」在调用方眼里一模一样，报错
    * 那句话只能猜 —— 猜错了就是一句和事实无关的话发给对方。
    *
-   * sendBubbles 不导出（它要 runner 和 space 两个活对象），所以这里按 test-proxy
-   * 那个路子验源码结构：三个调用点都得判 `acted`，报错那句话不许写死「图片」。
+   * sendBubbles 不导出（它要 runner 和 space 两个活对象），所以这里直接
+   * 验源码结构：三个调用点都得判 `acted`，报错那句话不许写死「图片」。
    */
   const src = fs.readFileSync(new URL("../server/src/imessage.js", import.meta.url), "utf8");
 

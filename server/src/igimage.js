@@ -39,9 +39,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
-import { logDebug, logInfo, logWarn } from "./logs.js";
+import { logInfo, logWarn } from "./logs.js";
 import { IG_TIMEOUT, maskToken } from "./ignet.js";
-import { fetchVia, whyNetwork } from "./proxy.js";
+import { whyNetwork } from "./net.js";
 
 const SCOPE = "Instagram";
 
@@ -229,7 +229,7 @@ function signParams(params, apiSecret) {
  * 上传重试：最多 3 次，间隔 1.5 秒。
  *
  * 实测传图床本身很稳（10/10），偶尔一次握手超时，重试一次就过。3 次是给
- * 「代理刚重连」那种连着失败两次的场合留的余量。
+ * 网络刚重连那种连着失败两次的场合留的余量。
  */
 const UPLOAD_TRIES = 3;
 const UPLOAD_GAP = 1500;
@@ -283,12 +283,7 @@ export async function uploadToHost(buffer, imageHost) {
   /*
    * 连不上就重试几次。
    *
-   * 跟着「Instagram」那个勾走（proxy.js）。图床本身国内直连就通，实测直连和
-   * 走代理的成功率、耗时基本一样（10/10 vs 10/10，775ms vs 748ms，代理还略快
-   * 一点点），所以这里不需要单独一类 —— 一个勾管一整条发布链路，用户才猜得到
-   * 勾了会发生什么。真遇上图床也不通的网络时，勾上 IG 就一起兜住了。
-   *
-   * 但偶尔会撞 `UND_ERR_CONNECT_TIMEOUT` —— 握手那一下没成，重试一次就好。
+   * 图床本身国内直连就通，但偶尔会撞 `UND_ERR_CONNECT_TIMEOUT` —— 握手那一下没成，重试一次就好。
    * 不重试的代价很大：这一步失败会让前面的生图和转码全白做。
    * 只重试**网络层**异常；HTTP 层的错（签名不对、额度满了）重试没意义，
    * 交给下面的分支去报。
@@ -297,12 +292,7 @@ export async function uploadToHost(buffer, imageHost) {
   let netErr = null;
   for (let attempt = 1; attempt <= UPLOAD_TRIES; attempt += 1) {
     try {
-      res = await fetchVia(
-        "ig",
-        url,
-        () => ({ method: "POST", body: form, signal: AbortSignal.timeout(IG_TIMEOUT) }),
-        (why) => logDebug(SCOPE, `传图床${why}`)
-      );
+      res = await fetch(url, { method: "POST", body: form, signal: AbortSignal.timeout(IG_TIMEOUT) });
       netErr = null;
       break;
     } catch (e) {
@@ -314,8 +304,8 @@ export async function uploadToHost(buffer, imageHost) {
     }
   }
   // 这句会进日志、也会成为「这条帖子没发出去」的原因。原来是 e.message，
-  // 也就是一句 fetch failed；图床和 IG 同一个代理开关，所以 scope 用 "ig"
-  if (netErr) throw new Error(`图床上传失败：${whyNetwork(netErr, "ig", IG_TIMEOUT)}`);
+  // 也就是一句 fetch failed
+  if (netErr) throw new Error(`图床上传失败：${whyNetwork(netErr, IG_TIMEOUT)}`);
 
   const raw = await res.text();
   let data = null;
@@ -357,12 +347,7 @@ export async function deleteFromHost(publicId, imageHost) {
   form.append("signature", signature);
 
   try {
-    const res = await fetchVia(
-      "ig",
-      `https://api.cloudinary.com/v1_1/${encodeURIComponent(cloud)}/image/destroy`,
-      () => ({ method: "POST", body: form, signal: AbortSignal.timeout(IG_TIMEOUT) }),
-      (why) => logDebug(SCOPE, `删图床上那张临时图${why}`)
-    );
+    const res = await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloud)}/image/destroy`, { method: "POST", body: form, signal: AbortSignal.timeout(IG_TIMEOUT) });
     const data = await res.json().catch(() => null);
     if (data?.result === "ok" || data?.result === "not found") return true;
     logWarn(SCOPE, `图床上那张临时图没删掉（${publicId}）：${data?.result ?? res.status}`);

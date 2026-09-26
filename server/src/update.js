@@ -36,7 +36,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { fetchVia, netCode, usesProxy } from "./proxy.js";
+import { netCode } from "./net.js";
 
 /**
  * 项目根目录（放着那份 package.json）。
@@ -157,7 +157,7 @@ function clipNotes(text) {
  * 就该告诉用户「网络不通，回头再点」—— 检查更新不是非成功不可的动作，
  * 静默重试三次只会让按钮转得更久。
  *
- * 也没直接用 proxy.js:whyNetwork：那个说的是通用的「连不上目标」，而这里每一句
+ * 也没直接用 net.js:whyNetwork：那个说的是通用的「连不上目标」，而这里每一句
  * 都要落到「过一会儿再点一次，或者直接打开仓库页面看」这个具体动作上 ——
  * 检查更新失败了用户该干什么，比错误码本身有用。
  *
@@ -176,9 +176,7 @@ function explain(e) {
   if (code === "ECONNRESET" || code === "UND_ERR_SOCKET" || code === "EPIPE") {
     return "连接被中途掐断了。过一会儿再点一次，或者直接打开仓库页面看。";
   }
-  // 这一类出厂不勾代理，而国内直连 GitHub 时好时坏 —— 所以兜底那句要提一下代理
-  const via = usesProxy("update") ? "" : "（这一类没走代理，去控制台的「代理」那节可以勾上）";
-  return `连不上 GitHub${code ? `（${code}）` : ""}${via}。过一会儿再点一次，或者直接打开仓库页面看。`;
+  return `连不上 GitHub${code ? `（${code}）` : ""}。过一会儿再点一次，或者直接打开仓库页面看。`;
 }
 
 /**
@@ -187,20 +185,15 @@ function explain(e) {
  * @returns {Promise<{tag: string, name: string, notes: string, url: string, at: string}>}
  */
 async function fetchLatest() {
-  const res = await fetchVia(
-    "update",
-    LATEST_API,
-    () => ({
-      headers: {
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        // GitHub 要求带 UA，不带的话直接 403
-        "User-Agent": "Uranus-iMessage",
-      },
-      signal: AbortSignal.timeout(TIMEOUT),
-    }),
-    (why) => logDebug("更新", `查最新版本${why}`)
-  );
+  const res = await fetch(LATEST_API, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      // GitHub 要求带 UA，不带的话直接 403
+      "User-Agent": "Uranus-iMessage",
+    },
+    signal: AbortSignal.timeout(TIMEOUT),
+  });
 
   // 404 是「这个仓库还没发过 release」，不是错误 —— 分开说，
   // 不然用户会以为是自己网络或者地址填错了

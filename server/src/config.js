@@ -520,24 +520,6 @@ export const DEFAULT_CONFIG = {
     enabled: false,
     trigger: DEFAULT_PRIVACY_TRIGGER,
   },
-  /*
-   * 出网代理：一个地址 + 一张「哪些类别走它」的表。
-   *
-   * `url` 空 = 不走代理（也会退回认 `URANUS_PROXY` / `HTTPS_PROXY` 那几个
-   * 环境变量，见 proxy.js）。`scopes` 里没写到的类别按 proxy.js 的出厂值算 ——
-   * 那边的 `PROXY_SCOPES` 是唯一的类别清单，这里刻意不重复一份（重复了迟早跑偏）。
-   *
-   * 出厂只勾 IG 和联网搜索：那两类是实测直连不通的（都吃满 8 秒超时），其余
-   * （天气三家源、用户自己填的中转站、Photon、音乐实测直连全通）默认直连，
-   * 理由见 proxy.js 文件头。
-   *
-   * 这两个值必须和 proxy.js:PROXY_SCOPES 的 `default` 对得上 —— 这里是新装时
-   * 写进 config.json 的那一份，会盖住那边的出厂值。test-proxy.mjs 第 3 节钉着。
-   */
-  proxy: {
-    url: "",
-    scopes: { ig: true, search: true },
-  },
   // Photon 项目：凭据只写 data.config.json
   projects: [
     {
@@ -797,6 +779,24 @@ function normalizeModelEntry(input, id) {
   };
 }
 
+/**
+ * 服务商源的接口类型。决定请求**长什么样**（路径、鉴权头、消息格式），见 llm.js。
+ *
+ *  - `custom`    自定义：OpenAI 兼容的 `/chat/completions`。中转站、自建反代都是这种
+ *  - `openai`    OpenAI 官方。请求和 custom 一模一样，区别只在新建时预填的地址
+ *  - `gemini`    Google Gemini 原生接口（`generateContent`，`x-goog-api-key`）
+ *  - `anthropic` Anthropic Claude 原生接口（`/v1/messages`，`x-api-key`）
+ *
+ * 认不出的、以及**老配置里压根没有这个字段的，一律算 custom** —— 用户的原话：
+ * 「老版本、已经有 API 的一律是自定义 API」。老配置在加这个字段之前走的就是
+ * OpenAI 兼容那一套，算成 custom 行为一个字都不变。
+ */
+export const PROVIDER_TYPES = ["custom", "openai", "gemini", "anthropic"];
+
+function normalizeProviderType(value) {
+  return PROVIDER_TYPES.includes(value) ? value : "custom";
+}
+
 function normalizeProvider(input, id) {
   // 注意：空字符串的 key 要留着占位。config.json 里 key 一律被抹成 ""，
   // 靠位置和 data.config.json 里的真 key 一一对应，过滤掉会让两边长度错开。
@@ -810,6 +810,7 @@ function normalizeProvider(input, id) {
   return {
     id,
     name: str(input?.name),
+    type: normalizeProviderType(input?.type),
     url: str(input?.url).trim(),
     keys: rawKeys.length ? rawKeys : [""],
     models: (Array.isArray(input?.models) ? input.models : [])
@@ -879,6 +880,7 @@ export function resolveEndpoint(config, ref) {
   const provider = config.providers.find((p) => p.id === ref.provider);
   if (!provider?.url) return null;
   return {
+    type: provider.type,
     url: provider.url,
     key: nextKey(provider),
     model: entry.model,
@@ -906,6 +908,7 @@ export function resolveImageEndpoint(config) {
       if (!entry.enabled || !entry.model) continue;
       if (!entry.categories?.includes("image")) continue;
       return {
+        type: provider.type,
         url: provider.url,
         key: nextKey(provider),
         model: entry.model,
@@ -2348,30 +2351,6 @@ function normalizePrivacy(input) {
   };
 }
 
-/**
- * 出网代理（见 DEFAULT_CONFIG.proxy 上面那段）。
- *
- * `scopes` 只**保留布尔值**，别的形态一律丢掉，而且不在这儿补默认值 ——
- * 类别清单在 proxy.js（`PROXY_SCOPES`），那边是唯一一份。这里认得它的话
- * 两个文件会互相 import 成环，而 `PROXY_SCOPES` 是顶层 `const`、循环下会撞 TDZ。
- *
- * 所以这个函数写得很笨：照抄用户给的布尔，读的时候由 proxy.js 补齐缺的。
- * 代价是 config.json 里可能只存了两三个 key —— 无所谓，读那头以 proxy.js 为准。
- *
- * 地址不做合法性校验：那是 `checkProxyUrl` 的活，保存路由会先过一遍
- * （填错了当场退回一句中文，而不是存进去之后所有请求默默直连）。
- */
-function normalizeProxy(input) {
-  const scopes = {};
-  const raw = input?.scopes;
-  if (raw && typeof raw === "object") {
-    for (const [key, value] of Object.entries(raw)) {
-      if (typeof value === "boolean") scopes[key] = value;
-    }
-  }
-  return { url: str(input?.url).trim(), scopes };
-}
-
 function normalizeWeatherApi(input) {
   return {
     qweather: {
@@ -2895,7 +2874,6 @@ export function normalizeConfig(input) {
   base.maintenance = normalizeMaintenance(input.maintenance);
   base.cloudBackup = normalizeCloudBackup(input.cloudBackup);
   base.privacy = normalizePrivacy(input.privacy);
-  base.proxy = normalizeProxy(input.proxy);
   base.users = normalizeUsers(input.users);
   base.worldBooks = normalizeWorldBooks(input.worldBooks);
   base.weatherApi = normalizeWeatherApi(input.weatherApi);
@@ -3050,21 +3028,6 @@ function mergeSecrets(main, data) {
   if (data.cloudKeys && typeof data.cloudKeys === "object") {
     merged.cloudBackup = data.cloudKeys;
   }
-  /*
-   * 代理：地址只住密钥文件（常带 user:pass@），**勾选表两边都有**。
-   *
-   * 所以这里不能像上面几块那样整块替换 —— 得让 config.json 里那份 `scopes`
-   * 有机会生效：不带密钥的搬家包恢复到新机器上时，密钥文件里没有 proxyKeys，
-   * 而勾选是用户特意配的，那份该留下来。地址取密钥文件的，勾选取两边并集
-   * （密钥文件里那份更新，优先）。
-   */
-  if (data.proxyKeys && typeof data.proxyKeys === "object") {
-    merged.proxy = {
-      ...(main.proxy ?? {}),
-      ...data.proxyKeys,
-      scopes: { ...(main.proxy?.scopes ?? {}), ...(data.proxyKeys.scopes ?? {}) },
-    };
-  }
   return merged;
 }
 
@@ -3119,8 +3082,6 @@ function writeToDisk(normalized) {
   const providerKeys = {};
   for (const p of normalized.providers) providerKeys[p.id] = p.keys;
   // + 云备份那一整块（桶名和仓库名同样不该外流，见 DEFAULT_CONFIG.cloudBackup）
-  // + 代理地址（机场和企业代理的地址常是 http://user:pass@host:port，
-  //   那就是一份凭据；勾选表不敏感，但整块一起走省得两边拆）
   writeJson(SECRET_PATH, {
     providerKeys,
     projects: normalized.projects,
@@ -3129,7 +3090,6 @@ function writeToDisk(normalized) {
     spyKeys: normalized.spyApi,
     ttsKeys: normalized.ttsApi,
     cloudKeys: normalized.cloudBackup,
-    proxyKeys: normalized.proxy,
   });
 
   // data/config.json 只存非密钥的全局项。
@@ -3150,14 +3110,6 @@ function writeToDisk(normalized) {
     ttsApi: {},
     // 云备份整块同理
     cloudBackup: {},
-    /*
-     * 代理**只抹地址**，勾选表留在这儿。
-     *
-     * 和上面那几块不一样：`scopes` 一点不敏感，而它丢了的后果很难查 ——
-     * 用户勾了「链接预览走代理」，重启之后勾选没了、发链接又开始超时，
-     * 而界面上看不出哪里变了。地址才是凭据（常带 user:pass@），只抹它。
-     */
-    proxy: { url: "", scopes: normalized.proxy.scopes },
   });
   delete main.projects;
   // 四类实体各自有文件夹，不重复写进 config.json

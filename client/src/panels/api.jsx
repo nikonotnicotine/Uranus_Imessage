@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   CATEGORY_LABELS,
   IMAGE_RATIOS,
   MODEL_CATEGORIES,
+  PROVIDER_TYPES,
   modelLabel,
   providerLabel,
+  providerTypeOf,
   roleLabel,
+  urlForType,
 } from "../labels.js";
 import { SaveBar, useSection } from "../section.jsx";
 import { api, useConfig } from "../store.jsx";
@@ -32,6 +36,56 @@ import {
   X,
   Zap,
 } from "lucide-react";
+
+/**
+ * API 类型的一排按钮。换类型时地址只在「没动过」的情况下跟着换（见 labels.js:urlForType）。
+ */
+export function ProviderTypeButtons({ value, onChange }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {PROVIDER_TYPES.map((t) => (
+        <Button
+          key={t.id}
+          variant={value === t.id ? "primary" : "outline"}
+          onClick={() => onChange(t.id)}
+        >
+          {t.label}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * 侧栏「新增服务商源」先问一句是哪种，再建。
+ *
+ * 挂到 body 上：它是从侧栏里弹的，移动端那栏是个带 transform 的抽屉，
+ * fixed 定位在 transform 容器里会相对抽屉而不是视口，桌面端那栏收起时又是 hidden。
+ */
+export function NewProviderModal({ onChoose, onClose }) {
+  return createPortal(
+    <Modal
+      title="新增服务商源"
+      desc="选接口类型。中转站、反代一律选「自定义」；建好以后也能在设置里改。"
+      onClose={onClose}
+    >
+      <div className="grid grid-cols-1 gap-2">
+        {PROVIDER_TYPES.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => onChoose(t.id)}
+            className="rounded-item border border-line px-4 py-3 text-left transition-colors duration-150 hover:bg-sunken"
+          >
+            <span className="block text-ui text-ink">{t.label}</span>
+            <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">{t.desc}</span>
+          </button>
+        ))}
+      </div>
+    </Modal>,
+    document.body
+  );
+}
 
 /** 密钥输入框：带小眼睛切换明文。 */
 export function SecretInput({ value, onChange, placeholder }) {
@@ -62,6 +116,7 @@ export function SecretInput({ value, onChange, placeholder }) {
  */
 export function endpointOf(provider, model = "", temperature) {
   return {
+    type: providerTypeOf(provider).id,
     url: provider?.url ?? "",
     key: (provider?.keys ?? []).find((k) => k?.trim()) ?? "",
     model,
@@ -972,6 +1027,7 @@ export function ProviderSettings({ provider }) {
   const { config, updateProvider, addProviderKey, updateProviderKey, removeProviderKey } =
     useConfig();
   const keys = provider.keys ?? [""];
+  const typeMeta = providerTypeOf(provider);
 
   // 引用了这个源的角色 —— 改 ID 会让它们的引用失效，先说清楚
   const users = (config.roles ?? []).filter((r) =>
@@ -1009,12 +1065,21 @@ export function ProviderSettings({ provider }) {
           </p>
         )}
 
-        <Field label="API Base URL" hint="OpenAI 兼容，填到 /v1">
+        <Field label="API 类型" hint={typeMeta.desc}>
+          <ProviderTypeButtons
+            value={typeMeta.id}
+            onChange={(type) =>
+              updateProvider(provider.id, { type, url: urlForType(provider.url, type) })
+            }
+          />
+        </Field>
+
+        <Field label="API Base URL" hint={typeMeta.urlHint}>
           <input
             className={inputCls}
             value={provider.url ?? ""}
             onChange={(e) => updateProvider(provider.id, { url: e.target.value })}
-            placeholder="https://api.openai.com/v1"
+            placeholder={typeMeta.placeholder}
           />
         </Field>
 
@@ -1026,7 +1091,7 @@ export function ProviderSettings({ provider }) {
                   <SecretInput
                     value={k}
                     onChange={(v) => updateProviderKey(provider.id, i, v)}
-                    placeholder="sk-…"
+                    placeholder={typeMeta.keyPlaceholder}
                   />
                 </div>
                 <button

@@ -1,22 +1,9 @@
 /**
- * 真 Instagram 那几个域名的网络出口：代理 + 超时 + 统一的错误话术。
+ * 真 Instagram 那几个域名的网络出口：超时 + 统一的错误话术。
  *
- * ── 代理在哪管 ──
- *
- * 在 **proxy.js**，不在这儿。这个文件原来自己带着一整套 ProxyAgent 缓存和
- * 环境变量解析，后来天气那几个域名也要代理，就整块搬去 proxy.js 做成
- * 「一个地址 + 一张按类别的勾选表」了 —— 两份实现迟早跑偏。
- *
- * 这里只剩「带代理发出去」：`fetchVia("ig", …)`。Meta 的
- * `graph.instagram.com` / `graph.facebook.com` 在国内直连不通（实测 8 秒超时、
- * 一次都没成），所以 `ig` 那一类**出厂就是勾上的**（另一个是联网搜索）。
- * 用户能在控制台的「代理」那节改。
- *
- * `fetchVia` 比裸 `proxyFor` 多做一件事（所以业务代码一律用它）：代理自己坏掉（没开、端口变了、隧道被
- * 掐）时脱开代理直连补一刀。对 Meta 来说那一刀多半也不通，但不要钱。
- *
- * 为什么不给全局挂 dispatcher：那会把用户自己填的中转站地址也拖上代理，
- * 多半更慢、还可能因为代理落地 IP 被中转站风控。按类别决定就是为了避开这个。
+ * Meta 的 `graph.instagram.com` / `graph.facebook.com` 在国内直连不通（实测
+ * 8 秒超时、一次都没成）。要用的话在系统层面开全局代理（Clash 的 TUN 模式）——
+ * Node 的 fetch 不认系统代理，只开「系统代理」那个开关不够。
  *
  * ── 这个文件还管什么 ──
  *
@@ -25,7 +12,7 @@
  * 那一族错误码的识别（`isMediaFetchError`），以及 URL 里 token 的脱敏。
  */
 
-import { fetchVia, maskProxy, proxySettings, usesProxy, whyNetwork } from "./proxy.js";
+import { whyNetwork } from "./net.js";
 
 /**
  * 请求超时。
@@ -35,21 +22,6 @@ import { fetchVia, maskProxy, proxySettings, usesProxy, whyNetwork } from "./pro
  * 卡在这儿超时的话前面生图、转码、上传图床的活儿全白做了。
  */
 export const IG_TIMEOUT = 60_000;
-
-/* ================= 代理 ================= */
-
-/**
- * 现在 IG 走不走代理、走的哪个。
- *
- * 这两个是**转发** —— igreal.js 那边要拿它们回给界面（「代理状态」那一行），
- * 而它本来就 import 这个文件。留个转发比让它多认一个模块省事。
- *
- * 真正的实现在 proxy.js，那边还管着别的八类出网。
- */
-export function proxyUrl() {
-  return usesProxy("ig") ? proxySettings().url : "";
-}
-export { maskProxy };
 
 /* ================= 请求 ================= */
 
@@ -120,7 +92,7 @@ function whyMeta(data, status) {
 /**
  * 打一次 Meta 的接口。
  *
- * 统一在这儿加代理、超时、错误翻译，上层（igapi.js）只管拼 URL 和读结果。
+ * 统一在这儿加超时、错误翻译，上层（igapi.js）只管拼 URL 和读结果。
  *
  * **token 绝不写进日志**。这个函数会把 URL 记进 debug 日志，而 Graph API 的
  * token 是走 query string 的 —— 不脱敏的话日志文件里就躺着一个能发帖删帖的
@@ -134,19 +106,12 @@ function whyMeta(data, status) {
 export async function igFetch(url, init = {}) {
   let res;
   try {
-    /*
-     * 代理挂了会自动脱开代理直连补一刀（fetchVia）。Meta 直连多半还是不通，
-     * 但那一刀不要钱，而且失败时报错里会多带一条「直连也不行」的线索。
-     *
-     * 不传 onRetry：这个文件**刻意不 import logs.js**（它是最底层的网络出口，
-     * 见文件头）。回退这件事会在最终那句报错里体现出来，够了。
-     */
-    res = await fetchVia("ig", url, () => ({
+    res = await fetch(url, {
       ...init,
       signal: AbortSignal.timeout(IG_TIMEOUT),
-    }));
+    });
   } catch (e) {
-    throw new Error(`${maskToken(url)} 请求失败：${whyNetwork(e, "ig", IG_TIMEOUT)}`);
+    throw new Error(`${maskToken(url)} 请求失败：${whyNetwork(e, IG_TIMEOUT)}`);
   }
 
   const raw = await res.text();

@@ -111,20 +111,14 @@ npm start
 角色详情页最上面那行会写「在线 / 未上线」，写着在线就可以去手机上发消息了。
 卡在哪一步就问右下角的 Uranus，或者看 [Niki 写的图文教程](https://docs.qq.com/doc/DVnFncG9Tc05kdFZY)。
 
-### 在国内的话（出网代理）
+### 在国内的话
 
-有几样东西直连不通，去**控制台 · 代理**填一个地址就行，改完当场生效、不用重启：
+程序自己不带代理，所有请求都直连出去。天气、Photon（iMessage 桥接）、音乐、国内的中转站
+直连都通；**Instagram 和 DuckDuckGo 搜索直连不通**，要用的话在这台机器上开全局代理：
 
-- 出厂默认只勾了 **Instagram** 和**联网搜索**，那两类实测直连吃满超时
-- **天气、Photon（iMessage 桥接）、音乐实测直连都通**，不用勾；模型 API 打的是你自己填的
-  中转站，多半也直连通，套上代理反而慢、还可能因为落地 IP 变了被风控
-- 勾了也不怕代理没开：勾上的类别在**代理连不上时会自动脱开代理直连再试一次**，
-  国内本来就通的目标照样能成。反过来不会 —— 没勾的类别绝不会偷偷走代理
-- 只能填 `http://` 或 `https://`，**`socks5://` 用不了**。Clash、v2rayN 那类客户端
-  一般同时开着一个 http 端口（默认 7890 / 10809），用那个
-- 旁边有「测试连通」和「测一下直连」两个按钮 —— 后者用来分清是代理坏了还是这台机器压根出不了网
-- 地址可能带账号密码，所以和 API 密钥一起存在 `data/data.config.json`；界面上只回显
-  脱敏后的样子。也可以改用环境变量 `URANUS_PROXY`（Docker / systemd 里更顺手）
+- Clash 这类客户端请开 **TUN 模式**（虚拟网卡）。只开「系统代理」那个开关不够 ——
+  后台用的 Node 不认系统代理，请求照样直连出去
+- 联网搜索也可以换成 Tavily / Brave，国内直连就通
 
 ## 界面分区
 
@@ -142,7 +136,7 @@ npm start
 | **Instagram** | 角色主页的内容和总设置 |
 | **发送** | 发送节奏（气泡怎么拆、停多久）和防相亲 |
 | **iMessage** | 一个项目 = 一条号码，凭据填在这儿 |
-| **控制台** | 实时日志、登录账号、出网代理、重启服务、清缓存、检查更新、备份 / 恢复、云备份 |
+| **控制台** | 实时日志、登录账号、重启服务、清缓存、检查更新、备份 / 恢复、云备份 |
 
 ## 目录结构
 
@@ -183,7 +177,9 @@ Uranus_Imessage/
 Node.js 20+ / Express 后端，React 18 + Vite 5 + Tailwind 3 前端，npm workspaces 单仓。
 生产环境后端直接 serve 前端产物，只占一个端口。数据全部落在本地文件，没有数据库。
 
-模型接口走 OpenAI 兼容协议（中转站也行），听音那条走 Gemini 原生接口。
+模型接口默认走 OpenAI 兼容协议（服务商源的「自定义」类型，中转站都是这种）；
+新建服务商源时也能直接选 OpenAI、Google Gemini、Anthropic Claude 三家官方接口，
+后两家打的是各自的原生接口。听音那条走 Gemini 原生接口。
 iMessage 走 Photon / Spectrum。
 
 ## 想再深入一点
@@ -198,7 +194,6 @@ iMessage 走 Photon / Spectrum。
 node scripts/test-memory.mjs
 node scripts/test-assistant.mjs
 node scripts/test-auth.mjs
-node scripts/test-proxy.mjs
 ```
 
 ## 协议与免责

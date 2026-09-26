@@ -434,7 +434,7 @@ function PromptSettings() {
  * 前端（igreal.js:realOverview 只回用户名和到期天数）。所以这里没有「显示
  * 当前 token」这种东西，绑好之后能看到的只有「绑的是 @谁」。
  *
- * 绑定会真的打一次 Meta 的接口验证，可能要几秒（还可能过代理），所以按钮
+ * 绑定会真的打一次 Meta 的接口验证，可能要几秒，所以按钮
  * 上写「正在验证…」而不是「保存中…」—— 用户得知道这一下是在联网。
  */
 function AccountRow({ acc, label, hint, busy, onBind, onUnbind }) {
@@ -774,18 +774,9 @@ function RealSettings({ onGoto }) {
             快拍不裁。每个账号一天最多 50 条。
           </p>
           <p>
-            {data.proxy?.configured ? (
-              <>
-                走代理（读的是 <span className="font-mono text-ink-soft">{data.proxy.from}</span>
-                ）。<span className="text-ink-meta">地址不显示在这儿 —— 里面可能带账号密码。</span>
-              </>
-            ) : (
-              <>
-                没配代理。国内直连 <span className="font-mono">graph.instagram.com</span>{" "}
-                大概率不通，可以设环境变量{" "}
-                <span className="font-mono text-ink-soft">URANUS_IG_PROXY</span>。
-              </>
-            )}
+            国内直连 <span className="font-mono">graph.instagram.com</span>{" "}
+            不通，要在这台机器上开全局代理（Clash 用 TUN 模式 —— 只开「系统代理」不够，
+            后台的请求不认它）。
           </p>
         </div>
 
@@ -1030,7 +1021,7 @@ function RealSettings({ onGoto }) {
       >
         <div className="grid gap-4">
           <p className="text-meta leading-relaxed text-ink-faint">
-            这一下可能要十几秒 —— 每个绑了号的角色都要过一遍网络，还可能过代理。
+            这一下可能要十几秒 —— 每个绑了号的角色都要过一遍网络。
           </p>
           <ResultNote state={pollNote.state} message={pollNote.message} />
 

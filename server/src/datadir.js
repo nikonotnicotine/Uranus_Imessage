@@ -104,7 +104,7 @@ export const MAINTENANCE_PATH = path.join(DATA_DIR, "maintenance.json");
  * 最近查到的天气，按「数据源:预警开关:坐标」存。见 env.js。
  *
  * 落盘的理由只有一个：查不到的时候拿上一次查到的顶上。纯内存的话，
- * 代理坏着的时候重启一次进程，连「上一次」都没有了。丢了也不要紧 ——
+ * 网络不通的时候重启一次进程，连「上一次」都没有了。丢了也不要紧 ——
  * 删掉这个文件最多让下一轮多打一次网络。
  */
 export const WEATHER_CACHE_PATH = path.join(DATA_DIR, "weather-cache.json");
