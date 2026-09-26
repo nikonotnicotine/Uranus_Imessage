@@ -655,11 +655,14 @@ export const DEFAULT_CONFIG = {
     playlists: [],
   },
   // 语音合成（TTS）的凭据，同样全局一份（只写 data.config.json）。
-  // 三家都没开 = 角色就算打开了「发语音」也发不出来，退化成文字，见 media.js
+  // 四家都没开 = 角色就算打开了「发语音」也发不出来，退化成文字，见 media.js
   ttsApi: {
-    minimax: { enabled: false, key: "", groupId: "", model: "speech-02-hd", host: "" },
+    // speed 语速 0.5–2，1 = 原速
+    minimax: { enabled: false, key: "", groupId: "", model: "speech-02-hd", host: "", speed: 1 },
     // style（风格夸张度）默认 0 = 关：大于 0 才会发给上游，见 media.js:ttsElevenLabs
     elevenlabs: { enabled: false, key: "", model: "eleven_multilingual_v2", stability: 0.5, similarityBoost: 0.75, style: 0 },
+    // Fish Audio：model 留空 = 用它官方的默认模型；referenceId 是角色没填音色 ID 时的兜底
+    fish: { enabled: false, key: "", model: "", referenceId: "", speed: 1 },
     // 本地部署的 GPT-SoVITS，没有密钥，但地址和参考音频路径也只存密钥文件
     // （地址里可能带内网信息，不该进能分享出去的那份）
     sovits: {
@@ -1245,6 +1248,8 @@ function normalizeInstagram(input) {
   /* 窗口两头反着填不当错，取小的当下限 —— 和 normalizeProactive 一个处理 */
   const lo = clampInt(input?.replyWindow?.minMinutes, 30, 1, 10080);
   const hi = clampInt(input?.replyWindow?.maxMinutes, 120, 1, 10080);
+  const bLo = clampInt(input?.browse?.minMinutes, 60, 10, 10080);
+  const bHi = clampInt(input?.browse?.maxMinutes, 180, 10, 10080);
 
   return {
     enabled: Boolean(input?.enabled),
@@ -1266,6 +1271,21 @@ function normalizeInstagram(input) {
     // 同步到这个角色的**真** Instagram 账号。默认关，见上面那段注释。
     // 只是一道闸 —— 绑哪个账号、token 是什么在 data/instagram/accounts.json
     syncReal: Boolean(input?.syncReal),
+    /*
+     * 定时刷 IG：隔一段随机时间自己打开 Instagram 刷一圈，看到谁的帖子 / 快拍 /
+     * 评论就该赞的赞、该评的评（igrun.js:runBrowse）。和上面那套「有人发了东西
+     * 才排一条任务」是两回事 —— 那套只管「刷到新帖的第一反应」，这套才是
+     * 角色之间真正热闹起来的地方。
+     *
+     * 默认开：开了 IG 的角色本来就该会刷 IG，用户嫌的正是「太安静」。
+     * 每一轮打一次模型；刷到的东西里没有新动静就不打（见 runBrowse）。
+     * 勿扰时段跟着这个角色主动消息那份 focus 走。
+     */
+    browse: {
+      enabled: input?.browse?.enabled === undefined ? true : Boolean(input.browse.enabled),
+      minMinutes: Math.min(bLo, bHi),
+      maxMinutes: Math.max(bLo, bHi),
+    },
   };
 }
 
@@ -2451,11 +2471,12 @@ function normalizeTavilyFields(input) {
  * 和 searchApi 一样整块进 data.config.json —— 角色文件是可以单独分享的，
  * 密钥挂在角色上就会跟着漏出去。角色那边只有开关和音色 ID（voiceSend）。
  *
- * 三家的字段不一样，所以没法像 searchApi 那样一个 one() 套完：
+ * 四家的字段不一样，所以没法像 searchApi 那样一个 one() 套完：
  *  - minimax：key + GroupId（两个都要，缺一个打不通）。国内号和海外号是**两套
  *    互不通用的域名**，填错了上游报的是鉴权错误而不是「你填错站了」，很难猜 ——
  *    所以界面上给的是国内/国外二选一（region），不让用户自己拼域名
  *  - elevenlabs：只要一把 key，音色 ID 在角色上
+ *  - fish：一把 key，音色 ID（reference_id）在角色上，模型走请求头
  *  - sovits：本地部署，没有密钥，但地址（可能是内网 IP）和参考音频的
  *    绝对路径同样不该进能分享的那份配置
  *
@@ -2486,6 +2507,7 @@ function minimaxHost(minimax) {
 function normalizeTtsApi(input) {
   const minimax = input?.minimax ?? {};
   const eleven = input?.elevenlabs ?? {};
+  const fish = input?.fish ?? {};
   const sovits = input?.sovits ?? {};
   return {
     minimax: {
@@ -2494,6 +2516,8 @@ function normalizeTtsApi(input) {
       groupId: str(minimax.groupId).trim(),
       model: str(minimax.model).trim() || "speech-02-hd",
       ...minimaxHost(minimax),
+      // 老配置没有这个字段，缺省 1 = 原速，和加这项之前发的一样
+      speed: clampNum(minimax.speed, 1, 0.5, 2),
     },
     elevenlabs: {
       enabled: Boolean(eleven.enabled),
@@ -2502,6 +2526,14 @@ function normalizeTtsApi(input) {
       stability: clampNum(eleven.stability, 0.5, 0, 1),
       similarityBoost: clampNum(eleven.similarityBoost, 0.75, 0, 1),
       style: clampNum(eleven.style, 0, 0, 1),
+    },
+    fish: {
+      enabled: Boolean(fish.enabled),
+      key: str(fish.key).trim(),
+      // 留空不发 model 头，让 Fish 用它当前的默认模型（见 media.js:ttsFish）
+      model: str(fish.model).trim(),
+      referenceId: str(fish.referenceId).trim(),
+      speed: clampNum(fish.speed, 1, 0.5, 2),
     },
     sovits: {
       enabled: Boolean(sovits.enabled),
@@ -3044,7 +3076,7 @@ function mergeSecrets(main, data) {
   if (data.searchKeys && typeof data.searchKeys === "object") {
     merged.searchApi = data.searchKeys;
   }
-  // TTS 同理（三家的开关也在这块里，一起读回来）
+  // TTS 同理（四家的开关也在这块里，一起读回来）
   if (data.ttsKeys && typeof data.ttsKeys === "object") {
     merged.ttsApi = data.ttsKeys;
   }
@@ -3112,7 +3144,7 @@ function writeToDisk(normalized) {
   // 每个服务商的 key（按 id 索引）+ 整个 projects 数组（Photon 凭据、手机号）
   // + 天气 API 的密钥（和风的 host 也算，见 normalizeWeatherApi）
   // + 联网搜索的密钥（Tavily / Brave）
-  // + TTS 的凭据（minimax 的 key/GroupId、ElevenLabs 的 key、SoVITS 的地址）
+  // + TTS 的凭据（minimax 的 key/GroupId、ElevenLabs / Fish Audio 的 key、SoVITS 的地址）
   const providerKeys = {};
   for (const p of normalized.providers) providerKeys[p.id] = p.keys;
   // + 云备份那一整块（桶名和仓库名同样不该外流，见 DEFAULT_CONFIG.cloudBackup）

@@ -1220,7 +1220,7 @@ export function ConfigProvider({ children }) {
     [updateConfig]
   );
   /**
-   * 语音合成的凭据（MiniMax / ElevenLabs / GPT-SoVITS）。同样**全局一份**。
+   * 语音合成的凭据（MiniMax / ElevenLabs / Fish Audio / GPT-SoVITS）。同样**全局一份**。
    *
    * 角色那边只有 role.voiceSend.enabled 和音色 ID —— 音色 ID 不是密钥，
    * 跟着角色文件一起分享出去也没关系。

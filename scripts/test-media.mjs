@@ -853,14 +853,14 @@ console.log("\n[配置：默认值]");
 {
   const c = normalizeConfig({});
 
-  assert.deepEqual(Object.keys(c.ttsApi).sort(), ["elevenlabs", "minimax", "sovits"]);
+  assert.deepEqual(Object.keys(c.ttsApi).sort(), ["elevenlabs", "fish", "minimax", "sovits"]);
   assert.equal(c.ttsApi.minimax.enabled, false);
   assert.equal(c.ttsApi.minimax.model, "speech-02-hd");
   assert.equal(c.ttsApi.minimax.region, "domestic");
   assert.equal(c.ttsApi.minimax.host, "");
   assert.equal(c.ttsApi.elevenlabs.model, "eleven_multilingual_v2");
   assert.equal(c.ttsApi.sovits.promptLang, "zh");
-  ok("ttsApi 三家默认结构，各自 enabled 独立");
+  ok("ttsApi 四家默认结构，各自 enabled 独立");
 
   /*
    * region 的迁移。
@@ -991,6 +991,7 @@ console.log("\n[配置：密钥不落进能分享的那份]");
     ttsApi: {
       minimax: { enabled: true, key: "SECRET-MM", groupId: "GID", model: "speech-02-hd" },
       elevenlabs: { enabled: true, key: "SECRET-EL" },
+      fish: { enabled: true, key: "SECRET-FA", referenceId: "REF-1" },
       sovits: { enabled: false, url: "http://10.0.0.2:9880" },
     },
     referenceImages: [{ id: "ri-1", name: "小猫", description: "喵" }],
@@ -1012,7 +1013,9 @@ console.log("\n[配置：密钥不落进能分享的那份]");
    * normalizeConfig，所以磁盘上是一份「字段齐全但凭据为空」的壳子。
    * 前端因此不用到处判 undefined，而真凭据一个字符都不在这份文件里。
    */
-  assert.deepEqual(Object.keys(shared.ttsApi).sort(), ["elevenlabs", "minimax", "sovits"]);
+  assert.deepEqual(Object.keys(shared.ttsApi).sort(), ["elevenlabs", "fish", "minimax", "sovits"]);
+  assert.equal(shared.ttsApi.fish.key, "");
+  assert.equal(JSON.stringify(shared).includes("SECRET-FA"), false);
   assert.equal(shared.ttsApi.minimax.key, "");
   assert.equal(shared.ttsApi.minimax.groupId, "");
   assert.equal(shared.ttsApi.elevenlabs.key, "");
@@ -1025,6 +1028,7 @@ console.log("\n[配置：密钥不落进能分享的那份]");
   assert.equal(Boolean(secrets.ttsKeys?.minimax?.key), true);
   assert.equal(secrets.ttsKeys.minimax.enabled, true);
   assert.equal(secrets.ttsKeys.sovits.enabled, false);
+  assert.equal(Boolean(secrets.ttsKeys?.fish?.key), true);
   ok("data.config.json 里 ttsKeys 有值，enabled 跟着密钥一起走");
 
   // 图库不含密钥，留在能分享的那份里（换台机器导入角色还认得出 [小猫]）
@@ -1104,15 +1108,22 @@ console.log("\n[TTS：挑哪一家]");
     pickTtsSource({ ...cfg, sovits: { enabled: true, url: "http://x" } }).name,
     "GPT-SoVITS"
   );
-  ok("三家各自认得出来");
+  assert.equal(pickTtsSource({ ...cfg, fish: { enabled: true, key: "k" } }).name, "Fish Audio");
+  assert.equal(pickTtsSource({ ...cfg, fish: { enabled: true, key: " " } }), null);
+  ok("四家各自认得出来（Fish Audio 密钥空白不算数）");
 
   const all = pickTtsSource({
     minimax: { enabled: true, key: "k" },
     elevenlabs: { enabled: true, key: "k" },
+    fish: { enabled: true, key: "k" },
     sovits: { enabled: true, url: "http://x" },
   });
   assert.equal(all.name, "MiniMax");
-  ok("都开着时按 minimax → elevenlabs → sovits 的顺序");
+  assert.equal(
+    pickTtsSource({ fish: { enabled: true, key: "k" }, sovits: { enabled: true, url: "http://x" } }).name,
+    "Fish Audio"
+  );
+  ok("都开着时按 minimax → elevenlabs → fish → sovits 的顺序");
 
   // 语气标签认不认跟着模型走：[whispers] 这类是 ElevenLabs v3 的功能
   assert.equal(pickTtsSource({ minimax: { enabled: true, key: "k" } }).keepTags, undefined);
@@ -1134,7 +1145,25 @@ console.log("\n[TTS：挑哪一家]");
     pickTtsSource({ elevenlabs: { enabled: true, key: "k", model: "eleven_v3" } }).keepTags,
     true
   );
-  ok("keepTags：只有 ElevenLabs 的 v3 模型留着语气标签");
+  ok("keepTags：ElevenLabs 只有 v3 模型留着语气标签");
+
+  // Fish Audio S2 系列认 [方括号] 标签；s1 用的是 (圆括号)，方括号会被念出来
+  assert.equal(pickTtsSource({ fish: { enabled: true, key: "k" } }).keepTags, true);
+  assert.equal(pickTtsSource({ fish: { enabled: true, key: "k", model: "s2-pro" } }).keepTags, true);
+  assert.equal(pickTtsSource({ fish: { enabled: true, key: "k", model: "s1" } }).keepTags, false);
+  ok("keepTags：Fish Audio 默认（S2）保留，s1 剥掉");
+
+  const n = normalizeConfig({
+    ttsApi: { minimax: { speed: 9 }, fish: { enabled: 1, key: " k ", speed: 0.1, model: " s1 " } },
+  }).ttsApi;
+  assert.equal(n.minimax.speed, 2);
+  assert.equal(n.fish.speed, 0.5);
+  assert.equal(n.fish.key, "k");
+  assert.equal(n.fish.model, "s1");
+  assert.equal(n.fish.enabled, true);
+  assert.equal(normalizeConfig({}).ttsApi.fish.speed, 1);
+  assert.equal(normalizeConfig({}).ttsApi.minimax.speed, 1);
+  ok("语速：MiniMax / Fish 都夹在 0.5–2，默认 1");
 }
 
 console.log("\n[TTS：语气标签剥不剥]");
@@ -1177,6 +1206,16 @@ console.log("\n[TTS：语气标签剥不剥]");
     );
     assert.equal(bodies[2].body.text, "[whispers] 过来");
     ok("ElevenLabs：v2 剥掉、v3 原样保留");
+
+    // MiniMax 语速进 voice_setting.speed
+    await synthesizeVoice(
+      { minimax: { enabled: true, key: "k", groupId: "G", speed: 1.3 } },
+      "v",
+      "你好",
+      "测试"
+    );
+    assert.equal(bodies[3].body.voice_setting.speed, 1.3);
+    ok("MiniMax：语速写进 voice_setting.speed");
 
     // stripToneTags 本体：全角也认；整条都是标签时剥成空串 —— synthesizeVoice
     // 见空会留着原样交给合成那边，这里只验剥的部分
@@ -1351,6 +1390,48 @@ console.log("\n[TTS：三家的响应形状]");
     assert.ok(seen[0].url.includes("/text-to-speech/VOICE-ID"), seen[0].url);
     assert.equal(seen[0].init.headers["xi-api-key"], "k");
     ok("ElevenLabs：音色 ID 在路径、密钥走 xi-api-key、响应是裸二进制");
+
+    // --- Fish Audio：模型走请求头 model，音色是 body.reference_id，语速在 prosody.speed
+    seen.length = 0;
+    globalThis.fetch = async (url, init) => {
+      seen.push({ url: String(url), init });
+      return new Response(PNG_MAGIC, { status: 200 });
+    };
+    out = await synthesizeVoice(
+      { fish: { enabled: true, key: "fk", model: "s2-pro", referenceId: "FALLBACK", speed: 1.2 } },
+      "REF-ID",
+      "[whispers] 你好",
+      "测试"
+    );
+    assert.equal(out.source, "Fish Audio");
+    assert.equal(out.buffer.length, PNG_MAGIC.length);
+    assert.equal(seen[0].url, "https://api.fish.audio/v1/tts");
+    assert.equal(seen[0].init.headers.Authorization, "Bearer fk");
+    assert.equal(seen[0].init.headers.model, "s2-pro");
+    {
+      const body = JSON.parse(seen[0].init.body);
+      assert.equal(body.reference_id, "REF-ID");
+      assert.equal(body.prosody.speed, 1.2);
+      assert.equal(body.format, "mp3");
+      assert.equal(body.text, "[whispers] 你好", "S2 认方括号标签，原样保留");
+    }
+    ok("Fish Audio：Bearer + 头里的 model；角色音色优先于兜底；语速进 prosody");
+
+    // 角色没填音色 → 用兜底 referenceId；模型空 → 不带 model 头（服务端默认）
+    seen.length = 0;
+    await synthesizeVoice({ fish: { enabled: true, key: "fk", referenceId: "FALLBACK" } }, "", "你好", "测试");
+    assert.equal(JSON.parse(seen[0].init.body).reference_id, "FALLBACK");
+    assert.equal("model" in seen[0].init.headers, false);
+    ok("Fish Audio：角色音色空时用兜底 ID；模型空时不带 model 头");
+
+    // 报错是 JSON {status, message}
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ status: 402, message: "Insufficient balance" }), { status: 402 });
+    await assert.rejects(
+      () => synthesizeVoice({ fish: { enabled: true, key: "fk" } }, "", "你好", "测试"),
+      /402|Insufficient/
+    );
+    ok("Fish Audio：非 2xx → 抛错并带上服务端的 message");
 
     // --- SoVITS：没有密钥，但 ref_audio_path 每次都要传
     seen.length = 0;

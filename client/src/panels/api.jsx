@@ -1124,7 +1124,7 @@ export function ProviderSettings({ provider }) {
 /**
  * 「语音合成（TTS）」那张卡。
  *
- * 放在「连接」面板而不是角色面板，理由是三家 × 各自好几个字段实在太长 ——
+ * 放在「连接」面板而不是角色面板，理由是四家 × 各自好几个字段实在太长 ——
  * 角色那边只有开关和音色 ID（见 role.jsx:RoleVoiceFields，它链到这里来）。
  * 密钥和搜索、天气一样**全局一份**：backup.js 把 roles 原样拷进不含密钥的备份，
  * 挂在角色上会从那儿漏出去。
@@ -1136,6 +1136,7 @@ export function TtsSection() {
   const tts = config.ttsApi ?? {};
   const mm = tts.minimax ?? {};
   const el = tts.elevenlabs ?? {};
+  const fa = tts.fish ?? {};
   const sv = tts.sovits ?? {};
 
   const [testState, setTestState] = useState("idle");
@@ -1153,6 +1154,8 @@ export function TtsSection() {
     ? "MiniMax"
     : !blank(el.key) && el.enabled
     ? "ElevenLabs"
+    : !blank(fa.key) && fa.enabled
+    ? "Fish Audio"
     : !blank(sv.url) && sv.enabled
     ? "GPT-SoVITS"
     : "";
@@ -1162,6 +1165,7 @@ export function TtsSection() {
     String(mm.key ?? "") !== String(saved.minimax?.key ?? "") ||
     String(mm.groupId ?? "") !== String(saved.minimax?.groupId ?? "") ||
     String(el.key ?? "") !== String(saved.elevenlabs?.key ?? "") ||
+    String(fa.key ?? "") !== String(saved.fish?.key ?? "") ||
     String(sv.url ?? "") !== String(saved.sovits?.url ?? "");
 
   /**
@@ -1188,7 +1192,7 @@ export function TtsSection() {
   return (
     <Card title="语音合成（TTS）" desc="角色发语音条用的。全局一份，所有角色共用">
       <Fold
-        title="三家 TTS"
+        title="四家 TTS"
         badge={source || "未启用"}
         desc={
           source
@@ -1198,14 +1202,14 @@ export function TtsSection() {
       >
         <div className="grid grid-cols-1 gap-6">
           <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">
-            三家都开着时按
-            <strong className="text-ink-soft"> MiniMax → ElevenLabs → GPT-SoVITS </strong>
+            几家都开着时按
+            <strong className="text-ink-soft"> MiniMax → ElevenLabs → Fish Audio → GPT-SoVITS </strong>
             挑第一个凭据填齐的。角色那边只填
             <strong className="text-ink-soft">音色 ID</strong>
             （不是密钥，跟着角色文件分享出去也没关系），提示词的措辞在「预设 →
             消息格式与功能」里改。
             <br />
-            iMessage 的语音条只吃 m4a，而三家出的是 mp3 / wav —— 转码走项目自带的
+            iMessage 的语音条只吃 m4a，而这几家出的是 mp3 / wav —— 转码走项目自带的
             ffmpeg-static，<strong className="text-ink-soft">你不用自己装 ffmpeg</strong>。
           </p>
 
@@ -1250,6 +1254,15 @@ export function TtsSection() {
                   placeholder="speech-02-hd"
                 />
               </Field>
+              <ParamSlider
+                label="语速"
+                hint="1 是原速，往下调更慢、往上调更快。范围 0.5–2。"
+                min={0.5}
+                max={2}
+                step={0.05}
+                value={mm.speed ?? 1}
+                onChange={(v) => updateTtsApi({ minimax: { ...mm, speed: v } })}
+              />
               {/*
                 * 国内号和海外号是两套互不通用的域名，密钥也不通用。
                 * 填错站了上游报的是鉴权失败，不会说「你填错站了」——
@@ -1356,6 +1369,60 @@ export function TtsSection() {
             </div>
           )}
 
+          {/* ---------- Fish Audio ---------- */}
+          <label className="flex items-start justify-between gap-4 border-t border-line pt-5">
+            <span className="min-w-0">
+              <span className="block text-ui text-ink">Fish Audio</span>
+              <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                中英日都自然，社区音色多，也能克隆。音色 ID 填音色页地址里那串 32 位的
+                reference_id。S2 系模型认
+                <code className="mx-1 bg-sunken px-1">[whisper]</code>
+                这类方括号语气标签，会原样交给它念。
+              </span>
+            </span>
+            <Switch
+              checked={Boolean(fa.enabled)}
+              onChange={(v) => updateTtsApi({ fish: { ...fa, enabled: v } })}
+              label="启用 Fish Audio"
+            />
+          </label>
+          {fa.enabled && (
+            <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+              <Field label="API Key">
+                <SecretInput
+                  value={fa.key}
+                  onChange={(v) => updateTtsApi({ fish: { ...fa, key: v } })}
+                  placeholder="填你自己的 API Key"
+                />
+              </Field>
+              <Field label="模型" hint="留空用官方默认（目前是 s2.1-pro）。可填 s1 / s2-pro / s2.1-pro">
+                <input
+                  className={inputCls}
+                  value={fa.model ?? ""}
+                  onChange={(e) => updateTtsApi({ fish: { ...fa, model: e.target.value } })}
+                  placeholder="s2.1-pro"
+                />
+              </Field>
+              <Field label="兜底音色 ID" hint="角色没填音色 ID 时用这个。两处都空就用 Fish 的默认音色">
+                <input
+                  className={inputCls}
+                  value={fa.referenceId ?? ""}
+                  onChange={(e) => updateTtsApi({ fish: { ...fa, referenceId: e.target.value } })}
+                  placeholder="reference_id"
+                />
+              </Field>
+              <ParamSlider
+                label="语速"
+                hint="1 是原速，往下调更慢、往上调更快。范围 0.5–2。"
+                min={0.5}
+                max={2}
+                step={0.05}
+                value={fa.speed ?? 1}
+                onChange={(v) => updateTtsApi({ fish: { ...fa, speed: v } })}
+              />
+            </div>
+          )}
+
           {/* ---------- GPT-SoVITS ---------- */}
           <label className="flex items-start justify-between gap-4 border-t border-line pt-5">
             <span className="min-w-0">
@@ -1437,6 +1504,8 @@ export function TtsSection() {
                     ? "/path/to/ref.wav"
                     : source === "ElevenLabs"
                     ? "21m00Tcm4TlvDq8ikWAM"
+                    : source === "Fish Audio"
+                    ? "reference_id"
                     : "male-qn-qingse"
                 }
               />

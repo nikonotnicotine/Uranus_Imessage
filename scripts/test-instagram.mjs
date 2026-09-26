@@ -440,9 +440,9 @@ const igprompt = await import("../server/src/igprompt.js");
 
 // 模板键名要和 igstore 的默认设置一一对上，少一个就等于永远读不到用户改的那份
 check(
-  "IG_SCENES + 三条指令 = promptTemplates 的键",
+  "IG_SCENES + 三条指令 + 刷 IG 两条 = promptTemplates 的键",
   Object.keys(store.defaultSettings().promptTemplates).sort(),
-  [...igprompt.IG_SCENES, "action", "peerAction", "compose"].sort()
+  [...igprompt.IG_SCENES, "action", "peerAction", "compose", "browse", "browseAction"].sort()
 );
 checkThat(
   "每个场景都有代码默认值",
@@ -1274,6 +1274,121 @@ check(
   run.igComposeNote({ chat: { separator: "$" }, roles: [] }, noteRole({ enabled: true, autoPublish: true })).includes("不是发给 用户 的私信"),
   true
 );
+
+console.log("\n=== 32b. 定时刷 IG ===");
+{
+  // ── 标签解析 ──
+  const b1 = tags.splitBrowse("[like:P1]\n[点赞：s2]\n[like:P1]\n[comment:P1-2:哈哈$你也是]\n[评论：P3 好看]\n[reply:p1:x]", "$");
+  check("赞去重、编号统一大写", b1.likes, ["P1", "S2"]);
+  check("评论带编号、括号里的分隔符换逗号", b1.comments, [
+    { ref: "P1-2", text: "哈哈，你也是" },
+    { ref: "P3", text: "好看" },
+    { ref: "P1", text: "x" },
+  ]);
+  check("[pass] 认得", tags.splitBrowse("[pass]", "$").pass, true);
+  check("<thinking> 里的不算", tags.splitBrowse("<thinking>[like:P1]</thinking>", "$").likes, []);
+
+  // ── 配置默认值 ──
+  const { normalizeConfig } = await import("../server/src/config.js");
+  const nb = normalizeConfig({ roles: [{ id: "r-z", name: "Z", instagram: { enabled: true } }] }).roles[0].instagram.browse;
+  check("默认开、60–180 分钟", [nb.enabled, nb.minMinutes, nb.maxMinutes], [true, 60, 180]);
+  const nb2 = normalizeConfig({ roles: [{ id: "r-z", name: "Z", instagram: { browse: { enabled: false, minMinutes: 500, maxMinutes: 5 } } }] }).roles[0].instagram.browse;
+  check("填反了按小的当下限、最少 10 分钟", [nb2.enabled, nb2.minMinutes, nb2.maxMinutes], [false, 10, 500]);
+
+  // ── 搭场景：一个月后，前面几节留下的帖子都出了回看窗口 ──
+  const TB = TQ + 30 * 24 * 3600e3;
+  const iso = (ms) => new Date(TB - ms).toISOString();
+  store.writeQueue([]);
+  const chatModel = { provider: "pv", modelId: "m1" };
+  const igB = (peers, extra = {}) => ({
+    enabled: true, peers, maxChain: 2, likeChance: 45, replyChance: 60, recordPeer: true,
+    replyWindow: { minMinutes: 10, maxMinutes: 10 }, browse: { enabled: true, minMinutes: 60, maxMinutes: 60 }, ...extra,
+  });
+  const mem = { memory: {}, memo: {}, diary: {} };
+  const bCfg = {
+    chat: { separator: "$" }, presets: [], worldBooks: [],
+    providers: [{ id: "pv", name: "假服务商", url: `http://127.0.0.1:${llmPort}/v1`, keys: ["k"], models: [{ id: "m1", model: "fake", enabled: true, categories: ["chat"] }] }],
+    roles: [
+      { id: "r-b1", name: "刷甲", description: "", chatModel, memories: mem, instagram: igB(["r-b2"]) },
+      { id: "r-b2", name: "刷乙", description: "", chatModel, memories: mem, instagram: igB(["r-b1"]) },
+      { id: "r-b3", name: "刷丙", description: "", chatModel, memories: mem, instagram: igB([], { browse: { enabled: false } }) },
+    ],
+    users: [{ id: "u1", name: "小满", enabled: true, scope: "global", description: "" }],
+  };
+  const up = store.addPost("user", { caption: "今天的晚霞", createdAt: iso(2 * 3600e3), comments: [{ id: "c-b1", owner: "刷乙", text: "好美", at: iso(3600e3) }] });
+  const bp = store.addPost("刷乙", { caption: "新豆子", createdAt: iso(3 * 3600e3) });
+  store.addPost("刷丙", { caption: "甲不该刷到", createdAt: iso(600e3) });
+  store.addPost("刷甲", { caption: "自己的、没人理", createdAt: iso(600e3) });
+  const bs = store.addStory("刷乙", { caption: "开门了", createdAt: iso(3600e3) });
+
+  const role1 = bCfg.roles[0];
+  const feed = run.buildBrowseFeed(bCfg, role1, TB, 24);
+  check(
+    "刷得到：用户、白名单里的角色；刷不到：名单外的、自己没人理的",
+    feed.map((e) => `${e.ref}:${e.owner}`),
+    ["P1:user", "P2:刷乙", "S1:刷乙"]
+  );
+  const text = igpromptBrowse(feed, TB);
+  function igpromptBrowse(f, now) {
+    return igprompt.browseFeedText(f, { user: "小满", char: "刷甲" }, "刷甲", now, now - 24 * 3600e3);
+  }
+  checkThat("feed 里有编号和主人", text.includes("【P1】小满的帖子") && text.includes("【S1】刷乙的快拍"), text);
+  checkThat("评论带全局编号和「新」", text.includes("P1-1 刷乙：好美（新）"), text);
+  checkThat("feed 头标「新」", /【P2】刷乙的帖子（3 小时前）（新）/.test(text), text);
+
+  // ── 跑一轮 ──
+  const commits = [];
+  const bSession = async () => ({ history: [], commit: (o) => { commits.push(o); } });
+  const hitsBefore = llmHits.length;
+  nextReply = "[like:P2]\n[like:S1]\n[like:P9]\n[comment:P1-1:你也看到啦]\n[comment:P2:好香]";
+  const out = await run.runBrowse(bCfg, { id: "q-b", roleId: "r-b1", kind: "browse", since: TB - 24 * 3600e3 }, { now: TB, roll: zero, session: bSession });
+  check("打了一次模型", llmHits.length - hitsBefore, 1);
+  checkThat("提示词里是 browseAction", llmHits.at(-1).body.includes("[like:P1]"));
+  check("乙的帖子被赞了", store.readPosts("刷乙").find((p) => p.id === bp.id).likes, ["刷甲"]);
+  check("乙的快拍被赞了", store.readStories("刷乙").find((s) => s.id === bs.id).likes, ["刷甲"]);
+  const upAfter = store.readPosts("user").find((p) => p.id === up.id);
+  check("在你帖子下回了乙那条", upAfter.comments.map((c) => [c.owner, c.text, c.replyTo]).at(-1), ["刷甲", "你也看到啦", "c-b1"]);
+  check("乙帖子下留了顶层评论", store.readPosts("刷乙").find((p) => p.id === bp.id).comments.map((c) => [c.owner, c.text, c.replyTo]), [["刷甲", "好香", ""]]);
+  check("不存在的编号不动", out.done.length, 4);
+  const q = store.readQueue();
+  check("被回的乙排上了两条接话任务", q.filter((t) => t.roleId === "r-b2" && t.kind === "charComment").length, 2);
+  const next = q.filter((t) => t.kind === "browse" && t.roleId === "r-b1");
+  check("自己排好了下一次，since = 这次", next.map((t) => [t.at, t.since]), [[TB + 3600e3, TB]]);
+  check("不在真 IG 上发（本地评论没有 remote 痕迹）", upAfter.comments.at(-1).remote?.mediaId ?? "", "");
+  check("交给 commit 写上下文", commits.length, 1);
+  checkThat("mark 里看得到别人的互动", /刷乙 说「好美」/.test(out.mark), out.mark);
+  checkThat("commentLine 是这轮做了什么", out.commentLine.startsWith("[Instagram] 你赞了刷乙的帖子") && out.commentLine.includes("回复 刷乙：「你也看到啦」"), out.commentLine);
+  check("牵扯到用户，记上下文", out.record, true);
+  checkThat(
+    "你帖子下的回复进爱心页",
+    store.readActivity().some((a) => a.kind === "reply" && a.actor === "刷甲" && a.text === "你也看到啦")
+  );
+
+  // ── 没新动静就不打模型 ──
+  const h2 = llmHits.length;
+  const quiet = await run.runBrowse(bCfg, { id: "q-b2", roleId: "r-b1", kind: "browse", since: TB }, { now: TB + 60e3, roll: zero, session: bSession });
+  check("自己的动作不算新动静 → 不打模型", [llmHits.length - h2, quiet.reason], [0, "上次刷完之后没有新动静，这一轮不打模型"]);
+
+  // ── 事件那条路：已经回过的评论不再回 ──
+  const dup = await run.runIgTask(bCfg, { id: "q-d", roleId: "r-b1", kind: "charComment", postOwner: "user", postId: up.id, storyId: "", commentId: "c-b1", chain: 0 }, { now: TB, roll: zero, session: bSession });
+  check("已经回过的评论不再回", [dup.action, dup.reason], ["none", "这条已经回过了"]);
+
+  // ── 勿扰时段 ──
+  const focusCfg = { ...bCfg, roles: [{ ...role1, proactive: { focus: { enabled: true, start: "00:00", end: "23:59" } } }, ...bCfg.roles.slice(1)] };
+  const h3 = llmHits.length;
+  store.writeQueue([]);
+  const nap = await run.runBrowse(focusCfg, { id: "q-f", roleId: "r-b1", kind: "browse", since: 0 }, { now: new Date(2026, 8, 27, 12, 0).getTime(), roll: zero, session: bSession });
+  check("勿扰里不刷、不打模型", [nap.reason, llmHits.length - h3], ["勿扰时段，晚点再刷", 0]);
+  check("推到勿扰之后再排一条", store.readQueue().filter((t) => t.kind === "browse").length, 1);
+
+  // ── ensureBrowseTasks ──
+  store.writeQueue([]);
+  run.ensureBrowseTasks(bCfg, TB, zero);
+  check("开着的每人一条，关着的没有", store.readQueue().map((t) => t.roleId).sort(), ["r-b1", "r-b2"]);
+  run.ensureBrowseTasks(bCfg, TB, zero);
+  check("再补一次不重复", store.readQueue().length, 2);
+  store.writeQueue([]);
+}
 
 fakeLlm.closeAllConnections?.();
 fakeLlm.close();

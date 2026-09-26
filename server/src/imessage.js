@@ -1,4 +1,4 @@
-import { readBytes } from "./attachread.js";
+import { readBytes, settleWithin } from "./attachread.js";
 import {
   cardHintFor,
   embeddedKindOf,
@@ -158,6 +158,21 @@ import { parseSearchQueries, runSearch, stripSearchTags } from "./websearch.js";
  * `spyphone.js` 收图早就是 20MB —— 同一个仓库里同一件事只有这里卡在 8。
  */
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 一张图最多让这一轮等多久（毫秒）。
+ *
+ * 等不到就不等了：先往队列里塞一句「图还在加载」，让这一轮带着文字走；图在
+ * 后台接着下，下完了再单独进队列、补一轮（见消息循环里读图那段）。
+ *
+ * 实机撞到过：一张 6.4MB 的截图下了 321 秒。那期间合并窗口被 holdPending
+ * 占着、消息循环停在 await 上，对方紧跟着打的两句话也进不了队列 —— 最后
+ * 图、字一起发出去，对方从发图到收到回复等了快十分钟。
+ *
+ * 20 秒：正常一张手机照片一两秒就下完，这个数碰不到；真卡住的那种，二十秒
+ * 之后多等也只是让对方干等。
+ */
+const IMAGE_PATIENCE_MS = 20_000;
 
 /**
  * 单条语音最大 20MB。
@@ -916,6 +931,56 @@ function handleUserUnsend(getConfig, runner, space, spaceId, message, peer) {
 }
 
 /**
+ * 一张图 IMAGE_PATIENCE_MS 内没下完：这一轮先不等它了，图下完再补一轮。
+ *
+ * 两件事：
+ *
+ * 1. **现在**往队列里塞一句「图还在加载」。模型得知道这儿本来有张图 ——
+ *    和读崩了那句一个道理（见消息循环里读图失败那段），不说的话角色答得像
+ *    对方只发了字。
+ * 2. **下完了**把图连同一句「刚才那张图加载出来了」一起进队列。这时候前一轮
+ *    多半已经发走了，于是开一个新的合并窗口，照常识图、打模型 —— 角色是在
+ *    「补看了一眼」，不是把前面的话重说一遍。
+ *
+ * 后来还是没下下来就只记一条日志、不再打扰模型：那句「还在加载」已经让
+ * 角色有过反应了，再来一轮「图没了」只是多花一次钱。
+ *
+ * 这一路**不占合并窗口**（不 holdPending）：占着就又回到了「字等图」。
+ */
+function holdLateImage(getConfig, runner, space, spaceId, message, peer, job, scope) {
+  logInfo(
+    scope,
+    `图片 ${IMAGE_PATIENCE_MS / 1000}s 还没下完，这一轮先不等它（先告诉模型图还在加载），下完了再单独补一轮`
+  );
+  enqueue(
+    getConfig,
+    runner,
+    space,
+    spaceId,
+    {
+      text: "[{{user}}发来一张图片，还在加载，你暂时看不到内容。别猜图里是什么，图加载出来会再告诉你。]",
+      message,
+    },
+    peer
+  );
+  job.then(
+    (image) => {
+      if (runner.stopped) return;
+      logInfo(scope, `刚才没等到的那张图下完了${image.name ? `「${image.name}」` : ""}，补一轮给模型看`);
+      enqueue(
+        getConfig,
+        runner,
+        space,
+        spaceId,
+        { text: "[刚才{{user}}发的那张图片现在加载出来了，就是下面这张。]", image, message },
+        peer
+      );
+    },
+    (e) => logError(scope, "刚才没等到的那张图最后也没下下来（不再打扰模型）", e)
+  );
+}
+
+/**
  * 把 attachment 读成 base64。
  * SDK 的 read() 是懒加载的（云端要回源下载），所以这里才是真正拿字节的地方。
  */
@@ -1169,8 +1234,9 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
      * slot 留在 runner.pending 里**不动**，最后一个附件落地时由 releasePending
      * 补上这一次引爆。
      *
-     * 不额外加兜底计时器：hold 的寿命就是 readBytes 的寿命（重试到头 17.8 秒，
-     * 见 attachread.js），而且释放写在调用方的 finally 里，读崩了照样放。
+     * 不额外加兜底计时器：hold 的寿命就是拆附件的寿命 —— 图片最多等
+     * IMAGE_PATIENCE_MS 就放行，其它附件是 readBytes 的寿命（见 attachread.js），
+     * 而且释放写在调用方的 finally 里，读崩了照样放。
      *
      * `wait === 0`（用户把合并关了）那条路走不到这儿的挂起分支：那时候 slot
      * 压根没进 runner.pending，挂起就等于把这一轮丢掉。判据写成「表里那个
@@ -7008,11 +7074,20 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             let imagesSent = 0;
             // 读崩了的图有几张。它也算「这轮收到东西了」—— 见下面 gotSomething
             let failedImages = 0;
+            // 下太久、先放行了的图有几张。这一轮也算收到东西了（队列里塞了那句「还在加载」）
+            let lateImages = 0;
             for (const part of imageParts) {
               // 读附件要回源下载（断流会自己重试，见 attachread.js）。
               // 试完还是不行才当没收到这张图
               try {
-                const image = await readImage(part, scope);
+                const job = readImage(part, scope);
+                const got = await settleWithin(job, IMAGE_PATIENCE_MS);
+                if (!got.done) {
+                  lateImages += 1;
+                  holdLateImage(getConfig, runner, space, spaceId, message, peer, job, scope);
+                  continue;
+                }
+                const image = got.value;
                 logInfo(
                   scope,
                   `收到图片附件${image.name ? `「${image.name}」` : ""}，进队列等识别`
@@ -7293,7 +7368,7 @@ async function startRunner(getConfig, project, meta, retries = 0) {
              * 攒着的背景变更和 tapback 提示就白等这一轮了。
              */
             const gotSomething = Boolean(
-              imagesSent || failedImages || voicesSent || videosSent || docsSent || userText
+              imagesSent || failedImages || lateImages || voicesSent || videosSent || docsSent || userText
             );
 
             /*

@@ -156,8 +156,9 @@ const SETTINGS_PATH = path.join(INSTAGRAM_DIR, "settings.json");
  * `promptTemplates` 留空字符串 = 用代码里的默认值（见 igprompt.js）。
  * 存空串而不是存默认文案，是为了让「改了默认值」能自动同步到没自定义的用户身上。
  *
- * 八个键分两类：前五个是**场景**（这一轮是因为什么被叫起来的），`action` /
- * `peerAction` 是压在最底下那句**行动指令**，`compose` 是主动发帖那一轮的。
+ * 十个键分两类：前五个是**场景**（这一轮是因为什么被叫起来的），`action` /
+ * `peerAction` 是压在最底下那句**行动指令**，`compose` 是主动发帖那一轮的，
+ * `browse` / `browseAction` 是「定时刷 IG」那一轮的场景和行动指令。
  * 行动指令分两条是因为对人和对角色的输出形态不一样：对着 {{user}} 的帖子
  * 可以「评论 + 私聊」，对着别的角色只能留评论 —— 角色间互动按用户定的规矩
  * 不触发 iMessage 回复。
@@ -176,6 +177,8 @@ export function defaultSettings() {
       action: "",
       peerAction: "",
       compose: "",
+      browse: "",
+      browseAction: "",
     },
   };
 }
@@ -648,7 +651,11 @@ const QUEUE_PATH = path.join(INSTAGRAM_DIR, "queue.json");
 
 /**
  * 排着的互动任务：
- * { id, at: 毫秒时间戳, roleId, kind, postOwner, postId, storyId, commentId, chain }
+ * { id, at: 毫秒时间戳, roleId, kind, postOwner, postId, storyId, commentId, chain, since }
+ *
+ * `kind: "browse"` 是「定时刷 IG」那一轮（igrun.js:runBrowse），每个角色队列里
+ * 常驻一条，跑完自己排下一条。`since` 只有它用：上一次刷是几点，用来标
+ * 「这条是新的」、以及一点新动静都没有时不打模型。
  *
  * **落盘**而不是只放内存里（主动消息那套是纯内存的）：等待窗口是 30–120 分钟，
  * 大概率跨一次重启。静默丢掉的话用户发了帖等半天没人理，还查不出原因。
@@ -672,6 +679,7 @@ export function readQueue() {
       storyId: String(t.storyId ?? ""),
       commentId: String(t.commentId ?? ""),
       chain: Number(t.chain) || 0,
+      since: Number(t.since) || 0,
     }));
 }
 

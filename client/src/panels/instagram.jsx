@@ -234,7 +234,7 @@ function GlobalSettings() {
 /* ================================================================== */
 
 /**
- * 八条模板的标签和说明。
+ * 十条模板的标签和说明。
  *
  * **只有标签和说明，没有正文** —— 正文的唯一出处是服务端
  * （server/src/igprompt.js:DEFAULT_TEMPLATES），经 `/api/ig/settings` 的
@@ -278,6 +278,16 @@ const PROMPT_META = {
     label: "自己想发点东西的时候",
     hint: "[post:配文] / [story:配文] / [image:图里有什么] 的格式在这儿教。开了「主动发布帖子 / 快拍」的角色，这段会缀在它主动消息那一轮的提示词末尾。",
   },
+  browse: {
+    group: "scene",
+    label: "定时刷 IG",
+    hint: "角色隔一段随机时间自己刷一圈（时间窗口在角色设置里）。这句下面程序会摆出整张 feed：最近的帖子、快拍，每条带编号、谁赞了、评论区。",
+  },
+  browseAction: {
+    group: "action",
+    label: "刷 IG 的时候",
+    hint: "[like:P1] / [comment:P1:…] / [comment:P1-2:…] / [pass] 的格式在这儿教。一轮可以赞好几条、评好几条（程序兜底：最多 12 赞 5 评）。",
+  },
 };
 
 /** <Instagram> 那一轮，模型收到的段落顺序。和 igprompt.js 顶上那段注释同源。 */
@@ -290,7 +300,7 @@ const PROMPT_ORDER = [
   ["<过往回忆>", "向量检索回来的"],
   ["<备忘录>", ""],
   ["<Chat_History>", "当前所有上下文"],
-  ["行动指令", "下面那三条之一", "最底下"],
+  ["行动指令", "按这一轮是哪种场景挑一条", "最底下"],
 ];
 
 function PromptOrder() {

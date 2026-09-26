@@ -650,6 +650,129 @@ console.log("\n[8. 打字指示器不许拖累正事]");
   });
 }
 
+/* ================= 9. 图下太久不许拖住整条线路 ================= */
+console.log("\n[9. 图下太久不许拖住整条线路]");
+{
+  /*
+   * 实机：一张 6.4MB 的截图 content.read() 了 321 秒，一次重试都没触发。
+   * 那期间消息循环停在 await 上、合并窗口被占着，对方紧跟着打的两句话进不了
+   * 队列 —— 从发图到收到回复快十分钟。
+   */
+  const { readBytes, settleWithin } = await import("../server/src/attachread.js");
+
+  /** 假附件：按给的节奏一块块吐字节。`gaps[i]` 是第 i 块之前等多少毫秒，null = 永远不来。 */
+  const fakeStream = (gaps, piece = 4) => {
+    let opened = 0;
+    let cancelled = 0;
+    const content = {
+      size: gaps.length * piece,
+      get opened() {
+        return opened;
+      },
+      get cancelled() {
+        return cancelled;
+      },
+      read: async () => {
+        throw new Error("有 stream() 就不该走 read()");
+      },
+      stream: async () => {
+        opened += 1;
+        let i = 0;
+        return new ReadableStream({
+          pull(controller) {
+            if (i >= gaps.length) {
+              controller.close();
+              return;
+            }
+            const gap = gaps[i++];
+            if (gap === null) return new Promise(() => {});
+            return new Promise((r) => setTimeout(r, gap)).then(() =>
+              controller.enqueue(new Uint8Array(piece).fill(i))
+            );
+          },
+          cancel() {
+            cancelled += 1;
+          },
+        });
+      },
+    };
+    return content;
+  };
+
+  await okAsync("有 stream() 就一块块读，拼出来的字节一个不差", async () => {
+    const c = fakeStream([0, 5, 5]);
+    const buf = await readBytes(c, "测试", "图片", { firstByteMs: 500, stallMs: 500 });
+    assert.equal(buf.length, 12);
+    assert.deepEqual([...buf.subarray(0, 5)], [1, 1, 1, 1, 2]);
+  });
+
+  await okAsync("没有 stream() 的老附件照旧走 read()", async () => {
+    const buf = await readBytes({ read: async () => Buffer.from("abc") }, "测试", "图片");
+    assert.equal(buf.toString(), "abc");
+  });
+
+  await okAsync("中途卡住会被掐掉、重开一条流再下（不是一直干等）", async () => {
+    // 第一条流：第一块来了之后再也不动；第二条流：正常
+    let round = 0;
+    const stuck = fakeStream([0, null]);
+    const fine = fakeStream([0, 0]);
+    const c = {
+      size: 8,
+      read: async () => Buffer.alloc(0),
+      stream: async () => (round++ === 0 ? stuck.stream() : fine.stream()),
+    };
+    const t0 = Date.now();
+    const buf = await readBytes(c, "测试", "图片", { firstByteMs: 200, stallMs: 100 });
+    assert.equal(buf.length, 8);
+    assert.equal(round, 2, "卡住之后没有重开");
+    assert.equal(stuck.cancelled, 1, "卡住那条流没掐，会在后台接着占着");
+    assert.ok(Date.now() - t0 < 3000, "等太久了");
+  });
+
+  await okAsync("第一个字节一直不来也会超时重试", async () => {
+    let round = 0;
+    const c = {
+      size: 4,
+      read: async () => Buffer.alloc(0),
+      stream: async () => (round++ === 0 ? fakeStream([null]).stream() : fakeStream([0]).stream()),
+    };
+    const buf = await readBytes(c, "测试", "图片", { firstByteMs: 100, stallMs: 100 });
+    assert.equal(buf.length, 4);
+    assert.equal(round, 2);
+  });
+
+  await okAsync("settleWithin：等到了给值，没等到不取消原来那个", async () => {
+    assert.deepEqual(await settleWithin(Promise.resolve(7), 50), { done: true, value: 7 });
+    let finished = false;
+    const slow = new Promise((r) => setTimeout(() => r("晚到"), 80)).then((v) => {
+      finished = true;
+      return v;
+    });
+    assert.deepEqual(await settleWithin(slow, 10), { done: false });
+    assert.equal(await slow, "晚到");
+    assert.ok(finished);
+    await assert.rejects(settleWithin(Promise.reject(new Error("坏了")), 50), /坏了/);
+  });
+
+  okWith("读图那段用 settleWithin 限时，没等到就放行", () => {
+    assert.match(IM_SRC, /const IMAGE_PATIENCE_MS = \d/);
+    assert.match(IM_SRC, /await settleWithin\(job, IMAGE_PATIENCE_MS\)/);
+    // 不许再有「在循环里直接 await readImage」—— 那就是这次的 bug
+    assert.ok(!/await readImage\(part, scope\)/.test(IM_SRC), "又直接 await readImage 了");
+    assert.match(IM_SRC, /lateImages \|\|/, "放行的图没算进 gotSomething");
+  });
+
+  okWith("没等到的图：先说一句还在加载，下完了再单独进队列", () => {
+    const fn = extractFn("holdLateImage");
+    assert.match(fn, /还在加载/);
+    assert.match(fn, /job\.then\(/);
+    assert.match(fn, /\{ text: "\[刚才\{\{user\}\}发的那张图片现在加载出来了[^"]*", image, message \}/);
+    assert.match(fn, /runner\.stopped/, "桥接停了还往队列里塞");
+    // 不占合并窗口：占着就又回到了「字等图」
+    assert.ok(!/holdPending/.test(fn.replace(/\/\*[\s\S]*?\*\//g, "")), "放行的图又去占窗口了");
+  });
+}
+
 fs.rmSync(TMP, { recursive: true, force: true });
 
 console.log(

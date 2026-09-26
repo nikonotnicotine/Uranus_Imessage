@@ -121,6 +121,25 @@ const DEFAULT_TEMPLATES = {
     "  - 一次只发一条。配文按 {{char}} 平时打字的样子写，短，别写成文案。",
     "  - 这是发给所有人看的，不是发给 {{user}} 的私信。",
   ].join("\n"),
+
+  browse: "你打开 Instagram 刷了一会儿。下面是你刷到的东西，每条前面是它的编号。",
+
+  browseAction: [
+    "现在照你平时刷 IG 的样子互动 —— 想赞就赞、想说就说，也可以只看不动：",
+    "",
+    "  - 点赞：[like:编号]，比如 [like:P1]、[like:S2]；给某条评论点赞写 [like:P1-3]。",
+    "  - 评论帖子 / 回快拍：[comment:编号:要说的话]，比如 [comment:P1:这是哪儿]。",
+    "  - 回复某条评论：[comment:评论编号:要说的话]，比如 [comment:P2-1:你也去了？]。",
+    "  - 可以写好几条，一条一行。一条都不想动就只写 [pass]。",
+    "",
+    "几条硬规矩：",
+    "  - 只能用上面列出来的编号，别自己编。",
+    "  - 方括号**里面**不能出现 {{sep}}，要断句就用标点。",
+    "  - 标了「你赞过了」的别再赞；标了「你回过了」的别再回同样的话。",
+    "  - 这一轮不发帖、不发快拍、不发短信 —— 方括号之外一个字都不要写。",
+    "  - 评论按 {{char}} 平时打字的样子写：短、随口。别写读后感，别复述图里有什么，",
+    "    别用任何旁白或动作描写。不用每条都评，挑你真有话说的。",
+  ].join("\n"),
 };
 
 /** 某个模板的代码默认值（没这个键就返回空串）。 */
@@ -129,10 +148,11 @@ export function defaultTemplate(key) {
 }
 
 /**
- * 八条模板的键名，也就是 settings.promptTemplates 里的全部字段。
+ * 十条模板的键名，也就是 settings.promptTemplates 里的全部字段。
  *
- * 前五条是场景（IG_SCENES），后三条是行动指令（action / peerAction / compose）。
- * 控制台照这个顺序排那八个输入框，所以这里的顺序有意义 —— 是 DEFAULT_TEMPLATES
+ * 前五条是场景（IG_SCENES），接着三条行动指令（action / peerAction / compose），
+ * 最后两条是「定时刷 IG」那一轮的场景和行动指令（browse / browseAction）。
+ * 控制台照这个顺序排那十个输入框，所以这里的顺序有意义 —— 是 DEFAULT_TEMPLATES
  * 的字面量顺序，别改成排序后的。
  */
 export const IG_PROMPT_KEYS = Object.keys(DEFAULT_TEMPLATES);
@@ -196,7 +216,7 @@ function mediaText(images, visionNote) {
  * `targetId` 是这一轮要回的那条，标出来；不标的话模型会挑列表里最后一条回，
  * 而队列任务指的未必是最后一条（30–120 分钟的窗口里可能又来了别的评论）。
  */
-function commentText(list, vars, selfOwner, targetId, noun) {
+function commentText(list, vars, selfOwner, targetId, noun, opts = {}) {
   const all = (Array.isArray(list) ? list : []).filter(Boolean);
   if (!all.length) return `这条${noun}还没有人评论。`;
 
@@ -206,9 +226,89 @@ function commentText(list, vars, selfOwner, targetId, noun) {
     const to = c.replyTo ? byId.get(c.replyTo) : null;
     const head = to ? `${who} 回复 ${ownerLabel(to.owner, vars)}` : who;
     const mark = targetId && c.id === targetId ? "   ← 你要回的就是这条" : "";
-    return `  ${i + 1}. ${head}：${String(c.text ?? "").trim()}${mark}`;
+    // 编号：刷 IG 那一轮要用「P1-2」这种全局编号，单条快照里就是 1、2、3
+    const num = opts.prefix ? `${opts.prefix}-${i + 1}` : `${i + 1}.`;
+    return `  ${num} ${head}：${String(c.text ?? "").trim()}${commentFlags(c, all, selfOwner, vars, opts)}${mark}`;
   });
   return [`已有的评论（按时间正序）：`, ...rows].join("\n");
+}
+
+/**
+ * 一条评论后面缀的那几个小标记：谁赞了它、你回没回过它、是不是上次刷完之后新来的。
+ *
+ * 「你回过了」是给刷 IG 那一轮防重复用的：同一条评论可能既排了一条 charComment
+ * 任务、又在下一次刷 IG 时被刷到，不标出来模型会对同一句话回两遍。
+ */
+function commentFlags(c, all, selfOwner, vars, opts) {
+  const flags = [];
+  const likes = (Array.isArray(c.likes) ? c.likes : []).filter(Boolean);
+  if (likes.length) {
+    const names = likes.map((o) => (o === selfOwner ? "你" : ownerLabel(o, vars)));
+    flags.push(`${names.join("、")} 赞了`);
+  }
+  if (c.owner !== selfOwner && all.some((x) => x.replyTo === c.id && x.owner === selfOwner)) {
+    flags.push("你回过了");
+  }
+  const at = Date.parse(c.at ?? "");
+  if (opts.since && Number.isFinite(at) && at > opts.since && c.owner !== selfOwner) flags.push("新");
+  return flags.length ? `（${flags.join("，")}）` : "";
+}
+
+/**
+ * 点赞那一行：**谁**赞了，不只是几个。
+ *
+ * 以前只写「点赞：3 个」—— 模型不知道是谁赞的，也就没法接「你也赞了他这条」
+ * 这种话；角色之间谁跟谁互动，全靠这一行才看得出来。人名太多就截到前 8 个。
+ */
+function likesText(list, vars, selfOwner) {
+  const likes = [...new Set((Array.isArray(list) ? list : []).filter(Boolean))];
+  if (!likes.length) return "";
+  const names = likes.map((o) => (o === selfOwner ? "你" : ownerLabel(o, vars)));
+  const shown = names.length > 8 ? `${names.slice(0, 8).join("、")} 等 ${names.length} 人` : names.join("、");
+  return `点赞：${shown}${likes.includes(selfOwner) ? "（你赞过了）" : ""}`;
+}
+
+/**
+ * 「刷 IG」那一轮的整张 feed。
+ *
+ * 每条内容一个编号（帖子 P1、P2…，快拍 S1、S2…），评论跟着内容编（P1-1、P1-2…），
+ * 模型输出里引用的就是这些编号（igtags.js:splitBrowse）。编号是**这一轮临时的**，
+ * 调用方拿同一份 feed 数组把编号翻回真正的 id（igrun.js:runBrowse）。
+ *
+ * 每条都用和单条快照同一套写法（配文 / 画面 / 点赞 / 评论），多出来的只有
+ * 编号和「新」标记 —— 上次刷完之后才冒出来的东西标一下，模型才知道该看哪儿，
+ * 不会对着一条三天前的帖子重新热情一遍。
+ *
+ * @param {{ref:string,isStory:boolean,owner:string,item:object}[]} feed
+ */
+export function browseFeedText(feed, vars, selfOwner, now, since = 0) {
+  const list = Array.isArray(feed) ? feed : [];
+  if (!list.length) return "什么新东西都没刷到。";
+
+  const blocks = list.map(({ ref, isStory, owner, item }) => {
+    const noun = isStory ? "快拍" : "帖子";
+    const whose = owner === selfOwner ? "你" : ownerLabel(owner, vars);
+    const ago = agoText(item.createdAt, now);
+    const created = Date.parse(item.createdAt ?? "");
+    const fresh = since && Number.isFinite(created) && created > since && owner !== selfOwner;
+    const lines = [`【${ref}】${whose}的${noun}${ago ? `（${ago}）` : ""}${fresh ? "（新）" : ""}`];
+
+    const caption = String(item.caption ?? "").trim();
+    lines.push(caption ? `配文：${caption}` : "配文：（没写字）");
+    const media = mediaText(isStory ? (item.image ? [item.image] : []) : item.images, item.visionNote);
+    if (media) lines.push(media);
+    const likes = likesText(item.likes, vars, selfOwner);
+    if (likes) lines.push(likes);
+    const comments = isStory ? item.replies : item.comments;
+    lines.push(
+      commentText(comments, vars, selfOwner, "", noun, { prefix: ref, since }).replace(
+        "已有的评论（按时间正序）：",
+        isStory ? "快拍回复（按时间正序）：" : "评论（按时间正序）："
+      )
+    );
+    return lines.join("\n");
+  });
+  return blocks.join("\n\n");
 }
 
 /**
@@ -239,10 +339,8 @@ export function snapshot(scene, vars, selfOwner, now) {
   const media = mediaText(images, item.visionNote);
   if (media) lines.push(media);
 
-  const likes = (Array.isArray(item.likes) ? item.likes : []).filter(Boolean);
-  if (likes.length) {
-    lines.push(`点赞：${likes.length} 个${likes.includes(selfOwner) ? "，你已经赞过了" : ""}`);
-  }
+  const likes = likesText(item.likes, vars, selfOwner);
+  if (likes) lines.push(likes);
 
   /*
    * 被点名了就说一句。
@@ -282,7 +380,12 @@ export function sceneBlock(scene, vars, selfOwner, now, templates) {
     .replace(/\{\{\s*对方\s*\}\}/g, peer)
     .trim();
 
-  return [head, snapshot(scene, vars, selfOwner, now)].filter(Boolean).join("\n\n");
+  // 刷 IG 那一轮没有「那一条」，下面摆的是整张 feed
+  const body =
+    kind === "browse"
+      ? browseFeedText(scene?.feed, vars, selfOwner, now, scene?.since)
+      : snapshot(scene, vars, selfOwner, now);
+  return [head, body].filter(Boolean).join("\n\n");
 }
 
 /* ================= 拼提示词 ================= */
@@ -297,6 +400,7 @@ export function sceneBlock(scene, vars, selfOwner, now, templates) {
  * @param {object} config 完整配置
  * @param {object} role 要说话的那个角色
  * @param {object} scene {kind, owner, post?, story?, commentId?, peerName?, mentioned?}
+ *   kind 是 "browse"（刷 IG 那一轮）时不看 post/story，看 {feed, since}（见 browseFeedText）
  * @param {object} [opts] {user?, history?, now?, templates?, tag?, block?, action?}
  *   tag / block / action 是给小红书那一轮借壳用的（xhsrun.js）：同一套人设 /
  *   世界书 / 记忆 / 上文的结构，只换最顶上的场景块和最底下的行动指令。
@@ -417,7 +521,8 @@ export async function buildIgPrompt(config, role, scene, opts = {}) {
    * llm.js:moveModelTail 那边也补了同一条口径（跳过尾部 system 再找 assistant），
    * 两层都有：这里从源头不产出这种形状，那里给所有链路兜底。
    */
-  const actionKey = PEER_SCENES.has(scene?.kind) ? "peerAction" : "action";
+  const actionKey =
+    scene?.kind === "browse" ? "browseAction" : PEER_SCENES.has(scene?.kind) ? "peerAction" : "action";
   const action =
     typeof opts.action === "string"
       ? opts.action

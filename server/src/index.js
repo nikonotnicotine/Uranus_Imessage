@@ -1434,7 +1434,7 @@ app.post("/api/tts/test", async (req, res) => {
   if (!source) {
     return res.status(400).json({
       ok: false,
-      error: "三家 TTS 都没开，或者凭据没填全（填完记得先保存）。",
+      error: "四家 TTS 都没开，或者凭据没填全（填完记得先保存）。",
     });
   }
 
@@ -3451,7 +3451,7 @@ app.post("/api/offline/:roleKey/summary/manual", (req, res) => {
  * 念一句「」里的台词。
  *
  * 音色和服务都是借来的：`role.voiceSend.voiceId` 是线上发语音那套音色，
- * `config.ttsApi` 是全局三家 TTS —— 线下不另存一份配置，改一处两边都变。
+ * `config.ttsApi` 是全局四家 TTS —— 线下不另存一份配置，改一处两边都变。
  * 注意**不看 `voiceSend.enabled`**：那个开关管的是线上要不要把回复转成语音条，
  * 线下这边是用户手点播放键，跟它没关系。
  *

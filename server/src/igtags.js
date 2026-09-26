@@ -214,3 +214,70 @@ export function stripIgTags(text) {
   out += src.slice(cursor);
   return out.trim();
 }
+
+/* ================= 刷 IG 那一轮 ================= */
+
+/**
+ * 「刷 IG」那一轮（igrun.js:runBrowse）的输出长这样：
+ *
+ *   [like:P1]              给帖子 P1 点赞（快拍是 S1，评论是 P1-2）
+ *   [comment:P1:好看]       在帖子 P1 下面留一条顶层评论
+ *   [comment:P1-2:哈哈哈]   回复 P1 下面第 2 条评论
+ *   [comment:S2:在哪儿]     回复快拍 S2
+ *   [pass]                 这一圈什么都不做
+ *
+ * 编号是提示词里程序给的（igprompt.js:browseFeedText），模型只负责挑。
+ * 和 splitIg 分开写：那边的 `[comment:…]` 体里没有编号，同一个标签在两轮里
+ * 语义不一样，混在一个正则里只会让两边互相误认。
+ *
+ * `[reply:…]` / 中文写法（点赞 / 评论 / 回复）也认，理由同文件头。
+ * 编号和正文之间冒号、空格都认 —— 模型写成 `[comment:P1 好看]` 的情况实测会有。
+ */
+const REF = String.raw`[PpSs]\s*\d{1,2}(?:\s*-\s*\d{1,3})?`;
+const BROWSE_TAG = new RegExp(
+  [
+    String.raw`[[［]\s*(?:like|点赞|赞)\s*[:：]\s*(?<ref>${REF})\s*[\]］]`,
+    String.raw`[[［]\s*(?:comment|reply|评论|回复)\s*[:：]\s*(?<cref>${REF})\s*(?:[:：]|\s)\s*(?<text>[^\]］]{1,300}?)\s*[\]］]`,
+    String.raw`[[［]\s*(?<pass>pass|跳过|不互动)\s*[\]］]`,
+  ].join("|"),
+  "gi"
+);
+
+/** "p 1 - 2" → "P1-2"。 */
+export function normalizeRef(ref) {
+  return String(ref ?? "").replace(/\s+/g, "").toUpperCase();
+}
+
+/**
+ * 刷 IG 那一轮的输出 → { likes: string[], comments: {ref, text}[], pass }。
+ *
+ * 同一个编号赞两次只算一次；评论不去重（同一条帖子下说两句是允许的，
+ * 条数上限由调用方管）。标签体内的分隔符照旧换成逗号。
+ */
+export function splitBrowse(text, sep) {
+  const src = String(text ?? "");
+  const likes = [];
+  const comments = [];
+  let pass = false;
+  if (!src.trim()) return { likes, comments, pass };
+
+  const ranges = xmlBlockRanges(src);
+  for (const m of src.matchAll(BROWSE_TAG)) {
+    if (ranges.some(([a, b]) => m.index >= a && m.index < b)) continue;
+    const g = m.groups ?? {};
+    if (g.pass) {
+      pass = true;
+      continue;
+    }
+    if (g.ref) {
+      const ref = normalizeRef(g.ref);
+      if (!likes.includes(ref)) likes.push(ref);
+      continue;
+    }
+    if (g.cref) {
+      const t = commaSeparators(g.text, sep);
+      if (t) comments.push({ ref: normalizeRef(g.cref), text: t });
+    }
+  }
+  return { likes, comments, pass };
+}

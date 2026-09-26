@@ -1060,6 +1060,8 @@ function RoleVoiceFields({ role, onGoto }) {
     ? "MiniMax"
     : !blank(tts.elevenlabs?.key) && tts.elevenlabs?.enabled
     ? "ElevenLabs"
+    : !blank(tts.fish?.key) && tts.fish?.enabled
+    ? "Fish Audio"
     : !blank(tts.sovits?.url) && tts.sovits?.enabled
     ? "GPT-SoVITS"
     : "";
@@ -1095,7 +1097,7 @@ function RoleVoiceFields({ role, onGoto }) {
               </>
             ) : (
               <strong className="text-warn">
-                三家 TTS 一家都没开，这个开关现在不起作用 ——
+                四家 TTS 一家都没开，这个开关现在不起作用 ——
                 模型写的语音标记会退化成普通文字发出去。
               </strong>
             )}
@@ -1137,6 +1139,8 @@ function RoleVoiceFields({ role, onGoto }) {
               placeholder={
                 source === "ElevenLabs"
                   ? "21m00Tcm4TlvDq8ikWAM"
+                  : source === "Fish Audio"
+                  ? "音色页地址里那串 32 位 ID"
                   : source === "GPT-SoVITS"
                   ? "/path/to/ref.wav"
                   : "male-qn-qingse"
@@ -2029,6 +2033,8 @@ function RoleInstagramFields({ role, onGoto }) {
   // updateRole 是浅合并，每次都得把整个 instagram 摊开重写
   const patch = (part) => updateRole(role.id, { instagram: { ...ig, ...part } });
   const patchWin = (part) => patch({ replyWindow: { ...win, ...part } });
+  const browse = ig.browse ?? {};
+  const patchBrowse = (part) => patch({ browse: { ...browse, ...part } });
 
   // 能互动的对象只能是**别的也开了 IG 的角色** —— 没开的那个连主页都没有
   const others = (config.roles ?? []).filter((r) => r.id !== role.id && r.instagram?.enabled);
@@ -2111,6 +2117,50 @@ function RoleInstagramFields({ role, onGoto }) {
               <strong className="text-ink-soft">跨重启有效</strong>
               （排在 data/instagram/queue.json 里），和主动消息那个只在内存里的计时不一样。
             </p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 border-l-2 border-line pl-4">
+            <label className="flex items-start justify-between gap-4">
+              <span className="min-w-0">
+                <span className="block text-ui text-ink">定时刷 IG</span>
+                <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
+                  隔一段随机时间自己打开 Instagram 刷一圈：你的、它自己的、下面勾了的角色的帖子和快拍，
+                  <strong className="text-ink-soft">谁赞了谁评了什么</strong>
+                  都摆给它看，它自己挑着点赞、评论、回别人的评论。刷到的东西会写进它的上下文。
+                  <br />
+                  上次刷完之后
+                  <strong className="text-ink-soft">没有任何新动静</strong>
+                  就不打模型；勿扰时段不刷（跟「角色主动消息」那份勿扰时段）。
+                </span>
+              </span>
+              <Switch
+                checked={browse.enabled !== false}
+                onChange={(v) => patchBrowse({ enabled: v })}
+                label="定时刷 IG"
+              />
+            </label>
+            {browse.enabled !== false && (
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <NumberField
+                  label="最快多久刷一次"
+                  value={browse.minMinutes ?? 60}
+                  min={10}
+                  max={10080}
+                  step={1}
+                  onChange={(v) => patchBrowse({ minMinutes: v })}
+                  suffix="分钟"
+                />
+                <NumberField
+                  label="最慢多久刷一次"
+                  value={browse.maxMinutes ?? 180}
+                  min={10}
+                  max={10080}
+                  step={1}
+                  onChange={(v) => patchBrowse({ maxMinutes: v })}
+                  suffix="分钟"
+                />
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 gap-6 border-l-2 border-line pl-4">
@@ -5470,6 +5520,9 @@ export function RoleDetail({ role, onBack, onGoto, bridge }) {
         igCfg.autoPublish ? "自己发帖" : "只点赞评论",
         `${igWin.minMinutes ?? 30}-${igWin.maxMinutes ?? 120} 分钟`,
         igPeers ? `联动 ${igPeers} 个角色` : null,
+        igCfg.browse?.enabled !== false
+          ? `每 ${igCfg.browse?.minMinutes ?? 60}-${igCfg.browse?.maxMinutes ?? 180} 分钟刷一次`
+          : null,
       ]
         .filter(Boolean)
         .join(" · ")

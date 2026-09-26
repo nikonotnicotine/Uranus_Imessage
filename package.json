@@ -1,7 +1,7 @@
 {
   "name": "uranus-imessage",
   "private": true,
-  "version": "1.5.1",
+  "version": "1.6.0",
   "workspaces": [
     "server",
     "client"

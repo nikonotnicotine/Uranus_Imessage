@@ -39,6 +39,7 @@ import { buildIgPrompt, defaultTemplate } from "./igprompt.js";
 import {
   DEFAULT_STORY_HOURS,
   USER_OWNER,
+  activeStories,
   addActivity,
   addPost,
   addStory,
@@ -56,11 +57,12 @@ import {
   updatePost,
   updateStory,
 } from "./igstore.js";
-import { hasIgPublishTag, hasImageTag, splitIg } from "./igtags.js";
+import { hasIgPublishTag, hasImageTag, splitBrowse, splitIg } from "./igtags.js";
 import { canChain, igOwners, peerAllowed, roleFor } from "./instagram.js";
 import { chatWithFallback, describeImage } from "./llm.js";
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import { generateImage, mimeForExt } from "./media.js";
+import { inFocus, msUntilFocusEnd } from "./proactive.js";
 
 const SCOPE = "Instagram";
 
@@ -161,6 +163,7 @@ export function audienceFor(config, owner) {
  * **角色发的快拍不触发任何人**：场景模板里压根没有 charStory 这一条
  * （igprompt.js:IG_SCENES）。快拍在 IG 上本来就是「看过就算」的东西，
  * 让角色之间互相追着对方的快拍评论，只会把上下文撑爆。
+ * 角色的快拍靠「定时刷 IG」（runBrowse）被刷到 —— 那一轮一次看一整圈，不是一条快拍叫一次。
  *
  * @returns {object[]} 排进去的任务
  */
@@ -717,6 +720,9 @@ async function commentToReal(config, owner, actor, item, comment, target, isStor
  * @returns {Promise<object>} 见 `nothing` 的字段表
  */
 export async function runIgTask(config, task, opts = {}) {
+  // 刷 IG 那一轮是另一套流程（整张 feed、多个动作），见下面 runBrowse
+  if (task?.kind === "browse") return runBrowse(config, task, opts);
+
   const now = Number.isFinite(opts.now) ? opts.now : Date.now();
   const roll = opts.roll ?? Math.random;
   const settings = readSettings();
@@ -744,6 +750,10 @@ export async function runIgTask(config, task, opts = {}) {
   if (isReply) {
     target = list.find((c) => c.id === task.commentId);
     if (!target) return nothing(task, role, "那条评论已经被删了");
+    // 同一条评论可能既排了这条任务、又在刷 IG 时被刷到回过了 —— 回过就不再回
+    if (list.some((c) => c.replyTo === target.id && c.owner === self)) {
+      return nothing(task, role, "这条已经回过了");
+    }
     if (task.kind === "userComment" && !hit(ig.replyChance ?? 60, roll)) {
       /*
        * 掷 replyChance 没中 —— 语义是「**看到了，没回**」，不是「没看到」。
@@ -934,6 +944,457 @@ export async function runIgTask(config, task, opts = {}) {
   return outcome;
 }
 
+/* ================= 刷 IG ================= */
+
+/*
+ * 「刷 IG」：每个开了 IG 的角色隔一段随机时间自己打开 Instagram 刷一圈。
+ *
+ * ── 为什么要有这一路 ──
+ *
+ * 上面那套任务全是**事件触发**的：有人发了帖 → 每个刷得到的角色排一条；
+ * 有人评论了谁 → 被说话的那个排一条。一条任务只看一条内容、只留一句评论，
+ * 而且目标是用户的评论压根不排（scheduleComment 里那句 `targetOwner === USER_OWNER`）。
+ * 后果就是用户报的「角色间的互动太少」：A 在你帖子下面评论了一句，B 永远
+ * 不会看见 —— 没有任何事件会把 B 叫到那条帖子底下去。
+ *
+ * 这一路补的就是「刷」这个动作：到点了，把最近的帖子、活着的快拍、每条下面
+ * 谁赞了谁说了什么，整张摆给它，让它自己挑着赞、评、回。回了谁，谁就照旧
+ * 被 scheduleComment 叫起来接话 —— 两路是接得上的。
+ *
+ * ── 怎么定时 ──
+ *
+ * 不另起定时器，**挂在互动队列上**：每个角色队列里常驻一条 `kind: "browse"`，
+ * 跑完自己排下一条（ensureBrowseTasks 负责「没有就补一条」）。好处是跨重启
+ * 自然有效（队列是落盘的），`/立即触发评论` 也顺带能让大家马上刷一次。
+ *
+ * ── 省钱的三道闸 ──
+ *
+ *   1. 勿扰时段不刷（跟这个角色主动消息那份 focus），推到勿扰结束之后。
+ *   2. 上次刷完之后**一点新动静都没有**（没有别人的新帖、新快拍、新评论）就
+ *      不打模型，直接排下一次。
+ *   3. 一轮最多 12 个赞、5 条评论，同一条内容下最多 2 条 —— 模型再兴奋也刷不了屏。
+ *
+ * **不碰真 IG**：这一轮的赞和评论只落在本地（data/instagram/）。
+ */
+
+/** 回看多久以内的帖子。更早的帖子就算有新评论也不摆出来 —— 那是翻旧账了。 */
+const BROWSE_LOOKBACK_MS = 3 * 24 * 3600_000;
+const BROWSE_MAX_POSTS = 8;
+const BROWSE_MAX_STORIES = 5;
+const BROWSE_MAX_LIKES = 12;
+const BROWSE_MAX_COMMENTS = 5;
+const BROWSE_MAX_PER_ITEM = 2;
+/** 一轮最多给几张图补识图。识图有缓存（visionNote），但第一次还是要花钱。 */
+const BROWSE_MAX_VISION = 3;
+
+function browseOn(role) {
+  return igOn(role) && role?.instagram?.browse?.enabled !== false;
+}
+
+/** 下一次刷在什么时候：刷 IG 那个窗口里随机挑一个点。 */
+export function browseDelay(role, now = Date.now(), roll = Math.random) {
+  const w = role?.instagram?.browse ?? {};
+  const a = Number(w.minMinutes) > 0 ? Number(w.minMinutes) : 60;
+  const b = Number(w.maxMinutes) > 0 ? Number(w.maxMinutes) : 180;
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  return now + Math.round((lo + roll() * (hi - lo)) * 60_000);
+}
+
+function pushBrowse(role, at, since) {
+  return pushQueue({
+    at,
+    roleId: String(role.id ?? ""),
+    kind: "browse",
+    postOwner: "",
+    postId: "",
+    storyId: "",
+    commentId: "",
+    chain: 0,
+    since: Number(since) || 0,
+  });
+}
+
+/**
+ * 每个该刷 IG 的角色，队列里都得有且只有一条 browse 任务。缺的补上。
+ *
+ * 第一次排的那条 `since` 记成一天前：刚开这个功能时，最近一天里的东西都算「新」，
+ * 角色第一次刷就有东西可看，而不是先空跑一轮。
+ */
+export function ensureBrowseTasks(config, now = Date.now(), roll = Math.random) {
+  const has = new Set(readQueue().filter((t) => t.kind === "browse").map((t) => t.roleId));
+  const out = [];
+  for (const role of config?.roles ?? []) {
+    if (!browseOn(role) || has.has(String(role.id ?? ""))) continue;
+    out.push(pushBrowse(role, browseDelay(role, now, roll), now - 24 * 3600_000));
+  }
+  return out;
+}
+
+/** 一条内容最近一次有动静是什么时候（发出来 / 最后一条评论）。 */
+function lastActivity(item, isStory) {
+  const list = (isStory ? item.replies : item.comments) ?? [];
+  let at = Date.parse(item.createdAt ?? "") || 0;
+  for (const c of list) at = Math.max(at, Date.parse(c?.at ?? "") || 0);
+  return at;
+}
+
+/** 这条内容下面有没有**别人**说的话（自己的帖子只有这种才值得摆出来）。 */
+function othersTalked(item, isStory, self) {
+  return ((isStory ? item.replies : item.comments) ?? []).some((c) => c?.owner && c.owner !== self);
+}
+
+/**
+ * 这个角色这一圈刷得到什么。
+ *
+ * 看得到谁：用户（主角，不受白名单管）、自己（回自己帖子下的评论）、以及自己
+ * 互动名单里的角色 —— 和 audienceFor 同一个单向口径。
+ *
+ * 帖子按「最近一次有动静」倒序，不按发帖时间：一条两天前的帖子刚有人评论，
+ * 比一条昨天发的、谁都没理的帖子更该被刷到。
+ *
+ * @returns {{ref:string,isStory:boolean,owner:string,item:object}[]}
+ */
+export function buildBrowseFeed(config, role, now = Date.now(), hours = DEFAULT_STORY_HOURS) {
+  const self = String(role?.name ?? "");
+  const owners = [USER_OWNER, self];
+  for (const r of config?.roles ?? []) {
+    const name = String(r?.name ?? "");
+    if (!igOn(r) || !name || name === self) continue;
+    if (peerAllowed(config, role, name)) owners.push(name);
+  }
+
+  const posts = [];
+  const stories = [];
+  for (const owner of owners) {
+    for (const p of readPosts(owner)) {
+      const at = lastActivity(p, false);
+      if (now - at > BROWSE_LOOKBACK_MS) continue;
+      if (owner === self && !othersTalked(p, false, self)) continue;
+      posts.push({ owner, item: p, at });
+    }
+    for (const s of activeStories(owner, hours, now)) {
+      if (owner === self && !othersTalked(s, true, self)) continue;
+      stories.push({ owner, item: s, at: lastActivity(s, true) });
+    }
+  }
+  posts.sort((a, b) => b.at - a.at);
+  stories.sort((a, b) => b.at - a.at);
+
+  return [
+    ...posts.slice(0, BROWSE_MAX_POSTS).map((p, i) => ({ ref: `P${i + 1}`, isStory: false, owner: p.owner, item: p.item })),
+    ...stories
+      .slice(0, BROWSE_MAX_STORIES)
+      .map((s, i) => ({ ref: `S${i + 1}`, isStory: true, owner: s.owner, item: s.item })),
+  ];
+}
+
+/** 这条内容里，`since` 之后**别人**弄出来的新东西：它本身是新的，或者有新评论。 */
+function newsOf(entry, since, self) {
+  const { item, isStory, owner } = entry;
+  const created = Date.parse(item.createdAt ?? "") || 0;
+  const list = (isStory ? item.replies : item.comments) ?? [];
+  return {
+    fresh: owner !== self && created > since,
+    comments: list.filter((c) => c?.owner !== self && (Date.parse(c?.at ?? "") || 0) > since),
+  };
+}
+
+/** 上次刷完之后有没有任何新动静。一点都没有就不打模型。 */
+export function feedHasNews(feed, since, self) {
+  return (feed ?? []).some((e) => {
+    const n = newsOf(e, since, self);
+    return n.fresh || n.comments.length > 0;
+  });
+}
+
+/** 「Dante 的帖子」「你的快拍」「{{user}} 的帖子」。 */
+function itemLabel(entry, vars, self) {
+  const who =
+    entry.owner === self
+      ? "你"
+      : entry.owner === USER_OWNER
+        ? String(vars?.user ?? "") || "用户"
+        : entry.owner;
+  return `${who}的${entry.isStory ? "快拍" : "帖子"}`;
+}
+
+function nameOf(owner, vars, self) {
+  if (owner === self) return "你";
+  if (owner === USER_OWNER) return String(vars?.user ?? "") || "用户";
+  return String(owner ?? "");
+}
+
+/**
+ * 刷完这一圈之后，写进上下文 user 那侧的一句旁白：**别人**这段时间在 IG 上干了什么。
+ *
+ * 这是用户要的「上下文也要有他们互动的显示」—— 以前角色之间的来往只在
+ * 各自那一条评论里留痕，第三个角色的上下文里一个字都没有。
+ *
+ * 只写新的（since 之后的），每条内容最多 4 条评论、最多 5 条内容；
+ * 这句话每轮都跟着上下文走，太长会挤掉真正的对话。
+ */
+export function browseMark(feed, since, vars, self) {
+  const rows = [];
+  for (const e of feed ?? []) {
+    const n = newsOf(e, since, self);
+    const touched = new Set(e.touched ?? []);
+    if (!n.fresh && !n.comments.length && !touched.size) continue;
+    const list = (e.isStory ? e.item.replies : e.item.comments) ?? [];
+    const byId = new Map(list.map((c) => [c.id, c]));
+    const bits = [];
+    if (n.fresh || touched.has("item")) bits.push(contentOf(e.item));
+    for (const c of n.comments.slice(-4)) {
+      const to = c.replyTo ? byId.get(c.replyTo) : null;
+      const head = to
+        ? `${nameOf(c.owner, vars, self)} 回复 ${nameOf(to.owner, vars, self)}`
+        : `${nameOf(c.owner, vars, self)} 说`;
+      bits.push(`${head}「${clip(c.text, 40)}」`);
+    }
+    const likes = (e.item.likes ?? []).filter((o) => o && o !== self);
+    if (likes.length) bits.push(`${likes.map((o) => nameOf(o, vars, self)).join("、")} 赞了`);
+    rows.push(`· ${itemLabel(e, vars, self)}：${bits.join("；") || "没什么新的"}`);
+    if (rows.length >= 5) break;
+  }
+  if (!rows.length) return "[Instagram] 你刷了会儿 Instagram，没什么新动静";
+  return ["[Instagram] 你刷了会儿 Instagram，看到：", ...rows].join("\n");
+}
+
+/**
+ * 编号 → 这一轮 feed 里的哪条内容 / 哪条评论。对不上返回 null。
+ * 评论编号是 1 起的，和 igprompt.js:commentText 印出来的一致。
+ */
+function resolveRef(feed, ref) {
+  const [head, sub] = String(ref ?? "").split("-");
+  const entry = (feed ?? []).find((e) => e.ref === head);
+  if (!entry) return null;
+  if (!sub) return { entry, comment: null };
+  const list = (entry.isStory ? entry.item.replies : entry.item.comments) ?? [];
+  const comment = list[Number(sub) - 1];
+  return comment ? { entry, comment } : null;
+}
+
+/** 重读一遍这条内容（同一轮里前一个动作可能已经改过它）。 */
+function reread(entry) {
+  const fresh = entry.isStory
+    ? readStories(entry.owner).find((s) => s.id === entry.item.id)
+    : readPosts(entry.owner).find((p) => p.id === entry.item.id);
+  return fresh ?? null;
+}
+
+/**
+ * 跑一轮刷 IG。runIgTask 看到 `kind: "browse"` 就转到这里。
+ *
+ * 不管这一轮做没做事，**最后都排下一次**（除非这个角色把刷 IG 关了 ——
+ * 那就让这条链断掉，重新打开时 ensureBrowseTasks 会补上）。
+ */
+export async function runBrowse(config, task, opts = {}) {
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const roll = opts.roll ?? Math.random;
+  const settings = readSettings();
+  const hours = settings.storyHours ?? DEFAULT_STORY_HOURS;
+
+  const role = roleById(config, task?.roleId);
+  if (!browseOn(role)) return nothing(task, role, "这个角色没开 Instagram 或者没开刷 IG");
+
+  const since = Number(task.since) || now - 24 * 3600_000;
+  const self = String(role.name ?? "");
+
+  // 勿扰：推到勿扰结束之后再随机等一小会儿，since 不动（这段时间的新东西留到那时候看）
+  const focus = role?.proactive?.focus;
+  if (inFocus(focus, new Date(now))) {
+    const at = now + msUntilFocusEnd(focus, new Date(now)) + Math.round(roll() * 30 * 60_000);
+    pushBrowse(role, at, since);
+    return nothing(task, role, "勿扰时段，晚点再刷");
+  }
+
+  let feed = buildBrowseFeed(config, role, now, hours);
+  if (!feedHasNews(feed, since, self)) {
+    pushBrowse(role, browseDelay(role, now, roll), now);
+    return nothing(task, role, "上次刷完之后没有新动静，这一轮不打模型");
+  }
+
+  // 排下一次放在打模型之前：模型那一步挂了也不能让这条链断掉
+  pushBrowse(role, browseDelay(role, now, roll), now);
+
+  // 新内容补一次识图（有缓存，同一张图全局只识一次）
+  let vision = 0;
+  for (const e of feed) {
+    if (vision >= BROWSE_MAX_VISION) break;
+    if (e.item.visionNote || !newsOf(e, since, self).fresh) continue;
+    const hasFile = e.isStory ? e.item.image?.file : (e.item.images ?? []).some((im) => im.file);
+    if (!hasFile) continue;
+    vision += 1;
+    await ensureVisionNote(config, role, e.owner, e.item, e.isStory);
+  }
+  if (vision) feed = feed.map((e) => ({ ...e, item: reread(e) ?? e.item }));
+
+  const session = opts.session ? await opts.session(role) : null;
+  const built = await buildIgPrompt(
+    config,
+    role,
+    { kind: "browse", owner: "", feed, since },
+    { history: session?.history ?? [], now, templates: settings.promptTemplates }
+  );
+  const vars = built.vars;
+
+  const eps = resolveRoleEndpoints(config, role);
+  const { content } = await chatWithFallback(eps.chat, eps.fallback, built.messages, built.params);
+  const parsed = splitBrowse(content, config?.chat?.separator ?? "");
+
+  const done = []; // 给 commentLine 用的人话
+  const at = new Date(now).toISOString();
+  let involvesUser = feed.some((e) => {
+    const n = newsOf(e, since, self);
+    return (n.fresh || n.comments.length) && (e.owner === USER_OWNER || n.comments.some((c) => c.owner === USER_OWNER));
+  });
+
+  // ── 点赞 ──
+  for (const ref of parsed.likes.slice(0, BROWSE_MAX_LIKES)) {
+    const hitRef = resolveRef(feed, ref);
+    if (!hitRef) {
+      logInfo(SCOPE, `${self} 刷 IG 时点赞了一个不存在的编号 ${ref}，跳过`);
+      continue;
+    }
+    const { entry, comment } = hitRef;
+    const item = reread(entry);
+    if (!item) continue;
+    if (!comment) {
+      if (entry.owner === self || (item.likes ?? []).includes(self)) continue;
+      like(entry.owner, item, entry.isStory, self);
+      if (entry.owner === USER_OWNER) {
+        involvesUser = true;
+        addActivity({
+          kind: entry.isStory ? "storyLike" : "like",
+          actor: self,
+          target: { owner: entry.owner, postId: entry.isStory ? "" : item.id, storyId: entry.isStory ? item.id : "" },
+          at,
+        });
+      }
+      done.push(`赞了${itemLabel(entry, vars, self)}`);
+      continue;
+    }
+    // 给评论点赞
+    const listKey = entry.isStory ? "replies" : "comments";
+    const list = item[listKey] ?? [];
+    const c = list.find((x) => x.id === comment.id);
+    if (!c || c.owner === self || (c.likes ?? []).includes(self)) continue;
+    const next = list.map((x) => (x.id === c.id ? { ...x, likes: [...(x.likes ?? []), self] } : x));
+    if (entry.isStory) updateStory(entry.owner, item.id, { replies: next });
+    else updatePost(entry.owner, item.id, { comments: next });
+    if (c.owner === USER_OWNER) {
+      involvesUser = true;
+      addActivity({
+        kind: "commentLike",
+        actor: self,
+        target: {
+          owner: entry.owner,
+          postId: entry.isStory ? "" : item.id,
+          storyId: entry.isStory ? item.id : "",
+          commentId: c.id,
+        },
+        at,
+      });
+    }
+    done.push(`赞了 ${nameOf(c.owner, vars, self)} 在${itemLabel(entry, vars, self)}下的评论`);
+  }
+
+  // ── 评论 / 回复 ──
+  const perItem = new Map();
+  let commented = 0;
+  for (const { ref, text } of parsed.comments) {
+    if (commented >= BROWSE_MAX_COMMENTS) break;
+    const hitRef = resolveRef(feed, ref);
+    if (!hitRef) {
+      logInfo(SCOPE, `${self} 刷 IG 时评论了一个不存在的编号 ${ref}，跳过`);
+      continue;
+    }
+    const { entry, comment: target } = hitRef;
+    const key = `${entry.owner}/${entry.item.id}`;
+    if ((perItem.get(key) ?? 0) >= BROWSE_MAX_PER_ITEM) continue;
+    if (target && target.owner === self) continue; // 不回自己
+
+    const item = reread(entry);
+    if (!item) continue;
+    const listKey = entry.isStory ? "replies" : "comments";
+    const list = item[listKey] ?? [];
+
+    // 回的是另一个角色的评论 → 守帖主的线程上限，和 scheduleComment 同一个口径
+    const targetIsRole = target && target.owner !== USER_OWNER && roleFor(config, target.owner);
+    if (targetIsRole && !entry.isStory) {
+      const max = (roleFor(config, entry.owner) ?? role)?.instagram?.maxChain;
+      if (!canChain(item, rootOf(list, target.id), max)) {
+        logInfo(SCOPE, `${self} 想回 ${target.owner}，但那条线程已经聊够了`);
+        continue;
+      }
+    }
+
+    const entryRow = { owner: self, text, at, replyTo: target ? String(target.id) : "" };
+    const after = entry.isStory
+      ? updateStory(entry.owner, item.id, { replies: [...list, entryRow] })
+      : updatePost(entry.owner, item.id, { comments: [...list, entryRow] });
+    const saved = (after?.[listKey] ?? []).at(-1) ?? null;
+    if (!saved) continue;
+    commented += 1;
+    perItem.set(key, (perItem.get(key) ?? 0) + 1);
+
+    if (entry.owner === USER_OWNER || target?.owner === USER_OWNER) {
+      involvesUser = true;
+      addActivity({
+        kind: entry.isStory ? "storyReply" : target ? "reply" : "comment",
+        actor: self,
+        target: {
+          owner: entry.owner,
+          postId: entry.isStory ? "" : item.id,
+          storyId: entry.isStory ? item.id : "",
+          commentId: saved.id,
+        },
+        text,
+        at,
+      });
+    }
+
+    // 被回的那个角色（或帖主）照旧会被叫起来接话
+    scheduleComment(config, entry.owner, after, saved, { isStory: entry.isStory, now, roll, chain: 0 });
+
+    const where = itemLabel(entry, vars, self);
+    done.push(
+      target
+        ? `在${where}下回复 ${nameOf(target.owner, vars, self)}：「${clip(text, 60)}」`
+        : entry.isStory
+          ? `回了${where}：「${clip(text, 60)}」`
+          : `在${where}下评论：「${clip(text, 60)}」`
+    );
+  }
+
+  if (!done.length && !parsed.pass) {
+    logInfo(SCOPE, `${self} 刷 IG 这一轮没写出能用的标签`, clip(content, 200));
+  }
+
+  const outcome = {
+    ...nothing(task, role, ""),
+    action: done.length ? "browse" : "none",
+    reason: done.length ? "" : "刷了一圈，没动",
+    mark: browseMark(feed, since, vars, self),
+    commentLine: done.length
+      ? `[Instagram] 你${done.join("；")}`
+      : "[Instagram] 你看了看，这次没点赞也没评论",
+    done,
+    // 牵扯到用户的一律记；纯角色之间的照 recordPeer 那道闸走
+    record: involvesUser || role.instagram?.recordPeer !== false,
+  };
+
+  if (outcome.record && session?.commit) {
+    try {
+      await session.commit(outcome);
+    } catch (e) {
+      logError(SCOPE, `${self} 刷 IG 这一轮的上下文没落下去（IG 上的赞和评论已经在了）`, e);
+    }
+  }
+  if (done.length) logInfo(SCOPE, `${self} 刷了一圈 IG：${done.join("；")}`);
+  return outcome;
+}
+
 /* ================= 定时器 ================= */
 
 /** 多久看一眼队列。和记忆库那个日记定时器同一个节奏。 */
@@ -962,6 +1423,13 @@ export async function tickIgQueue(config, opts = {}) {
     );
   } catch (e) {
     logWarn(SCOPE, "清识图缓存时出错（不影响别的）", e);
+  }
+
+  // 每个开着「定时刷 IG」的角色，队列里常驻一条 browse（没有就补上）
+  try {
+    ensureBrowseTasks(config, now);
+  } catch (e) {
+    logWarn(SCOPE, "补刷 IG 任务时出错（不影响别的）", e);
   }
 
   const tasks = opts.all ? readQueue().sort((a, b) => a.at - b.at) : dueTasks(now);

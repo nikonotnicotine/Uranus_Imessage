@@ -1352,7 +1352,8 @@ async function ttsMinimax(cfg, text, voiceId) {
       // 音色 ID 留空时用官方的系统音色，让「没填也能出声」
       voice_setting: {
         voice_id: voiceId || "male-qn-qingse",
-        speed: 1,
+        // 语速 0.5–2，1 是原速。config.js:normalizeTtsApi 已经夹过范围
+        speed: clampSpeed(cfg?.speed),
         vol: 1,
         pitch: 0,
       },
@@ -1379,6 +1380,13 @@ async function ttsMinimax(cfg, text, voiceId) {
     throw new Error(`MiniMax 没返回音频：${clipBody(body)}`);
   }
   return { buffer: Buffer.from(hex, "hex"), mimeType: "audio/mpeg", ext: "mp3" };
+}
+
+/** 语速夹到 0.5–2。MiniMax 和 Fish Audio 认的都是这个范围，超了上游直接 400。 */
+function clampSpeed(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  return Math.min(2, Math.max(0.5, n));
 }
 
 /**
@@ -1428,6 +1436,47 @@ async function ttsElevenLabs(cfg, text, voiceId) {
 }
 
 /**
+ * Fish Audio。音色 ID = 它的 `reference_id`（音色页地址里那串 32 位十六进制）。
+ *
+ * 两个坑：
+ *   1. 模型走**请求头** `model`，不在请求体里。留空就不发这个头，让它用官方
+ *      默认的那个（目前是 s2.1-pro）—— 填错了它也是静默回落到默认，不报错。
+ *   2. 语速在 `prosody.speed` 里（0.5–2），不是顶层字段。
+ *
+ * 响应直接是二进制 mp3，出错时才是 JSON（`{status, message}`）。
+ */
+async function ttsFish(cfg, text, voiceId) {
+  const model = String(cfg?.model ?? "").trim();
+  const ref = String(voiceId || cfg?.referenceId || "").trim();
+
+  const res = await fetch("https://api.fish.audio/v1/tts", {
+    method: "POST",
+    signal: AbortSignal.timeout(TTS_TIMEOUT),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${String(cfg?.key ?? "").trim()}`,
+      ...(model ? { model } : {}),
+    },
+    body: JSON.stringify({
+      text,
+      // 两处都没填就不传，它会用默认音色 —— 至少能出声
+      ...(ref ? { reference_id: ref } : {}),
+      format: "mp3",
+      mp3_bitrate: 128,
+      latency: "normal",
+      prosody: { speed: clampSpeed(cfg?.speed) },
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Fish Audio 返回 ${res.status}：${clipBody(await res.text())}`);
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (!buffer.length) throw new Error("Fish Audio 返回了空音频");
+  return { buffer, mimeType: "audio/mpeg", ext: "mp3" };
+}
+
+/**
  * 本地部署的 GPT-SoVITS（api_v2.py）。没有密钥。
  *
  * `ref_audio_path` **每次都要传**，即使事先调过 /set_refer_audio —— 那个接口
@@ -1466,14 +1515,15 @@ async function ttsSovits(cfg, text, voiceId) {
 }
 
 /**
- * 挑一家 TTS。顺序：minimax → elevenlabs → sovits，取第一个**开着且凭据齐**的。
+ * 挑一家 TTS。顺序：minimax → elevenlabs → fish → sovits，取第一个**开着且凭据齐**的。
  *
  * 和 websearch.js:pickSource 一个写法，区别是这里没有「不要密钥的兜底源」——
- * 三家都没配就返回 null，调用方据此退化成文字。
+ * 四家都没配就返回 null，调用方据此退化成文字。
  *
  * `keepTags` 是给 synthesizeVoice 看的：这一家的**这个模型**认不认方括号的
- * 语气标签。ElevenLabs 只有 eleven_v3 认（[whispers] 这类是 v3 的功能），
- * v2 和另外两家都会把它们当正文念出来 —— 那种情况下不如剥掉。
+ * 语气标签。ElevenLabs 只有 eleven_v3 认（[whispers] 这类是 v3 的功能）；
+ * Fish Audio 的 S2 系（含留空时的默认模型）认方括号，老的 s1 只认圆括号。
+ * 认不了的都会把它们当正文念出来 —— 那种情况下不如剥掉。
  *
  * @returns {{name: string, keepTags?: boolean,
  *            run: (text: string, voiceId: string) => Promise<object>}|null}
@@ -1489,6 +1539,14 @@ export function pickTtsSource(api) {
       name: "ElevenLabs",
       keepTags: /v3/i.test(String(el?.model ?? "")),
       run: (t, v) => ttsElevenLabs(el, t, v),
+    };
+  }
+  const fa = api?.fish;
+  if (fa?.enabled && String(fa.key ?? "").trim()) {
+    return {
+      name: "Fish Audio",
+      keepTags: !/^s1\b/i.test(String(fa?.model ?? "").trim()),
+      run: (t, v) => ttsFish(fa, t, v),
     };
   }
   const sv = api?.sovits;
@@ -1533,7 +1591,7 @@ export function stripToneTags(text) {
 export async function synthesizeVoice(api, voiceId, text, scope = "语音") {
   const source = pickTtsSource(api);
   if (!source) {
-    throw new Error("没有可用的语音合成服务（「连接」面板里三家 TTS 都没开，或者凭据没填全）");
+    throw new Error("没有可用的语音合成服务（「连接」面板里四家 TTS 都没开，或者凭据没填全）");
   }
 
   let clean = String(text ?? "").trim();

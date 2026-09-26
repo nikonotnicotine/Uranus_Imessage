@@ -140,6 +140,7 @@ function Activity({ items, onClose }) {
     reply: "回复了你的评论",
     storyLike: "赞了你的快拍",
     storyReply: "回复了你的快拍",
+    commentLike: "赞了你的评论",
   };
   return (
     <div>
