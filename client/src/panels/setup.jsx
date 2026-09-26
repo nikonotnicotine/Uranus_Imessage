@@ -1161,7 +1161,7 @@ function StepPace() {
           max={60}
           step={1}
           onChange={(v) => updateChat({ queueWait: v })}
-          hint="从你第一句起算，这段时间里连发的几句拼成一轮一起回。最多等这么久"
+          hint="你每发一句都重新倒计时，停手这么久没再发，就把连发的几句拼成一轮一起回"
           suffix="秒"
         />
 

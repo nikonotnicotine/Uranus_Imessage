@@ -31,7 +31,7 @@ export function ChatPanel() {
             max={60}
             step={1}
             onChange={(v) => updateChat({ queueWait: v })}
-            hint="从对方第一条消息起算，这段时间里连发的拼成一轮一起回。最多等这么久"
+            hint="对方每发一条都重新倒计时，停手这么久没再发，就把连发的拼成一轮一起回"
             suffix="秒"
           />
         </div>

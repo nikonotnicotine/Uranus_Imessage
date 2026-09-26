@@ -7,8 +7,7 @@
  * 「它怎么回了两遍」或者「图片过了好一会儿才发出去」，而从日志里看每一步
  * 都很正常。这套盯的就是这些「每一步都对、合起来错了」的情形：
  *
- *  1. **每来一条重新倒计时，但有总上限**。对方停手 queueWait 秒才结算；一直
- *     断断续续地打，也最多从第一条起等 mergeCapMs，到了照常结算。
+ *  1. **每来一条重新倒计时**。对方停手 queueWait 秒才结算，没有别的总上限。
  *  2. **附件还在拆的时候到点了要等**。用户报过的 bug：字在前、图在后，
  *     窗口到点时图还在下载，于是那一轮只带着文字去打模型，图落进了下一轮。
  *     表现是「LLM 先回了文字，图片过了好一会儿才发出去」。
@@ -92,7 +91,6 @@ function harness() {
   const fired = [];
 
   const code = `
-    ${extractFn("mergeCapMs")}
     return {
       enqueue: ${extractFn("enqueue")},
       flushPending: ${extractFn("flushPending")},
@@ -120,8 +118,8 @@ const cfg = (waitSec = 0.06) => () => ({ chat: { queueWait: waitSec } });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SPACE = { id: "sp" };
 
-/* ================= 1. 每来一条重新倒计时，有总上限 ================= */
-console.log("\n[1. 每来一条重新倒计时，有总上限]");
+/* ================= 1. 每来一条重新倒计时 ================= */
+console.log("\n[1. 每来一条重新倒计时]");
 {
   await okAsync("两条文本攒成一轮，只引爆一次", async () => {
     const H = harness();
@@ -151,27 +149,6 @@ console.log("\n[1. 每来一条重新倒计时，有总上限]");
     await sleep(130);
     assert.equal(H.fired.length, 1, "停手 150ms 了还没结算");
     assert.equal(H.fired[0].merged.split("\n").length, 5, "5 条要在同一轮里");
-  });
-
-  await okAsync("一直打也有总上限，到了照常结算", async () => {
-    const H = harness();
-    const started = Date.now();
-    H.enqueue(cfg(0.1), H.runner, SPACE, "sp", { text: "a" });
-    // 真的上限最少 60 秒，测试里把这一轮的上限直接拨到 250ms
-    H.runner.pending.get("sp").deadline = started + 250;
-    for (let i = 0; i < 8; i += 1) {
-      await sleep(50);
-      H.enqueue(cfg(0.1), H.runner, SPACE, "sp", { text: `b${i}` });
-    }
-    // 走到这儿 400ms 往上，每条都在窗口内，没有上限的话一轮都不会结算
-    assert.ok(H.fired.length >= 1, "到了上限还没结算");
-    assert.ok(H.fired[0].merged.startsWith("a\n"), "上限前的那几条要一起走");
-  });
-
-  okWith("上限：至少 60 秒，窗口很大时给两个窗口", () => {
-    const cap = new Function(`${extractFn("mergeCapMs")}; return mergeCapMs;`)();
-    assert.equal(cap(8), 60_000);
-    assert.equal(cap(45), 90_000);
   });
 
   await okAsync("窗口关了之后来的消息开新一轮（不是并进上一轮）", async () => {

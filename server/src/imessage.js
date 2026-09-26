@@ -1113,7 +1113,7 @@ function chain(runner, spaceId, task, what) {
  * 把一条消息放进这条会话的合并队列。
  * 导出仅为便于单独测试合并逻辑。
  *
- * ── 每来一条重新倒计时，但有个总上限 ──
+ * ── 每来一条重新倒计时 ──
  *
  * 每条消息进来都把计时器重设成 queueWait 秒（debounce）：对方停手 queueWait 秒
  * 才算说完，一次性全带上交给 handleTurn()。这是用户要的语义 ——「我发一次倒计时
@@ -1123,8 +1123,8 @@ function chain(runner, spaceId, task, what) {
  * 两三轮，已读回执也跟着落在中间那条上（用户原话：发了六条，合并了两次，读到
  * 第二条）。
  *
- * debounce 的老毛病是没有上界：对方一直断断续续地打，这一轮就一直不结算。所以
- * 从第一条算起最多等 mergeCapMs(wait)，到了就不再往后推，照常结算。
+ * **没有总上限**，也是用户明说的：设的是 8 秒，就是「停手 8 秒就回」，不另外
+ * 掐一个从第一条算起的时长。
  *
  * @param {{text?: string, image?: object, voice?: object}} item
  *   文本、图片附件、或语音附件（三选一）
@@ -1241,20 +1241,14 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
     ((slot.videos ?? []).length ? ` / ${slot.videos.length} 段视频` : "");
 
   /*
-   * 窗口已经开着：重新倒计时 queueWait 秒，但不越过开窗时定下的总上限
-   * （slot.deadline）。判据用 `slot.timer` 而不是「texts 是不是空的」：只发了
+   * 窗口已经开着：从这一条起重新倒计时 queueWait 秒。判据用 `slot.timer` 而不是「texts 是不是空的」：只发了
    * 一张图、一条语音那轮一个字都没有，但窗口一样已经开着了。
    */
   if (slot.timer) {
-    const at = Math.min(Date.now() + wait * 1000, slot.deadline ?? Infinity);
-    if (at > slot.firesAt) {
-      clearTimeout(slot.timer);
-      slot.firesAt = at;
-      slot.timer = setTimeout(fire, Math.max(0, at - Date.now()));
-    }
-    const left = Math.max(0, Math.round((slot.firesAt - Date.now()) / 100) / 10);
-    const capped = slot.firesAt >= (slot.deadline ?? Infinity) ? "（到总上限了，不再往后推）" : "";
-    logDebug(scopeOf(runner, "桥接"), `又攒一条：${counts}，重新倒计时，还有 ${left}s 就发${capped}`);
+    clearTimeout(slot.timer);
+    slot.firesAt = Date.now() + wait * 1000;
+    slot.timer = setTimeout(fire, wait * 1000);
+    logDebug(scopeOf(runner, "桥接"), `又攒一条：${counts}，重新倒计时，${wait}s 内没有新消息就发`);
     return;
   }
 
@@ -1272,18 +1266,7 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
 
   logDebug(scopeOf(runner, "桥接"), `攒消息中：${counts}，${wait}s 后把这期间的一起发`);
   slot.firesAt = Date.now() + wait * 1000;
-  slot.deadline = Date.now() + mergeCapMs(wait);
   slot.timer = setTimeout(fire, wait * 1000);
-}
-
-/**
- * 一轮合并从第一条算起最多等多久（毫秒）。
- *
- * 60 秒：够打完五六句话，又不至于让人说完了干等一分多钟。queueWait 本身设得
- * 很大（≥30 秒）的，至少给它两个窗口，不然上限比单个窗口还短，等于没有 debounce。
- */
-export function mergeCapMs(wait) {
-  return Math.max(60, wait * 2) * 1000;
 }
 
 /**
