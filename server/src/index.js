@@ -211,7 +211,12 @@ import { bindAccount } from "./igapi.js";
 import { pollOnce, realOverview, startIgPolling, syncOut } from "./igreal.js";
 import { pollXhsReplies, startXhsPolling } from "./xhsrun.js";
 import { loginStatus as xhsLoginStatus } from "./xhsapi.js";
-import { hasToken as hasXhsToken, roleState as xhsRoleState, saveToken as saveXhsToken } from "./xhsstore.js";
+import {
+  hasToken as hasXhsToken,
+  roleState as xhsRoleState,
+  saveToken as saveXhsToken,
+  sharedFile as xhsSharedFile,
+} from "./xhsstore.js";
 import { checkUpdate } from "./update.js";
 import {
   deleteSession,
@@ -3615,6 +3620,18 @@ function onIgPort(req) {
 function entryFor(req) {
   return onIgPort(req) && fs.existsSync(IG_HTML) ? IG_HTML : CONSOLE_HTML;
 }
+
+/*
+ * 小红书配图的一次性链接：xiaohongshu-mcp 不在这台机器上时，它从这里取图
+ * （见 xhsstore.js:shareStaged）。不走登录 —— MCP 带不了登录态，凭的是
+ * 32 位随机令牌，发完就作废。不在 /api/ 下，所以鉴权中间件本来就不拦它。
+ */
+app.get(/^\/xhs-img\/([0-9a-f]{32})(\.[a-z0-9]{1,5})?$/i, (req, res) => {
+  const file = xhsSharedFile(req.params[0].toLowerCase());
+  if (!file) return res.status(404).end();
+  logInfo("小红书", `xiaohongshu-mcp 来取配图了（来源 ${req.ip || "未知"}）`);
+  res.sendFile(file);
+});
 
 // ---- 生产：serve 前端静态产物 ----
 // 这一层必须排在 express.static **前面**：static 看见 "/" 会直接把 index.html

@@ -1113,18 +1113,18 @@ function chain(runner, spaceId, task, what) {
  * 把一条消息放进这条会话的合并队列。
  * 导出仅为便于单独测试合并逻辑。
  *
- * ── 窗口以**第一条**消息为基准 ──
+ * ── 每来一条重新倒计时，但有个总上限 ──
  *
- * 第一条消息开一个 queueWait 秒的窗口，窗口内后来的消息只是往里加，**不会**
- * 把计时器推后。到点一次性全带上交给 handleTurn()。
+ * 每条消息进来都把计时器重设成 queueWait 秒（debounce）：对方停手 queueWait 秒
+ * 才算说完，一次性全带上交给 handleTurn()。这是用户要的语义 ——「我发一次倒计时
+ * 八秒，再发一次再倒计时八秒」。
  *
- * 以前是每来一条就清零重算（debounce）。那样最坏情况没有上界 —— 对方一直断断
- * 续续地打，每条都在计时器到点前落地，这一轮就一直不结算，人已经说完三句了还
- * 在等。现在最多等 queueWait 秒，从第一条算起。
+ * 之前一版是「以第一条为基准、后来的不推后」，结果打字慢一点的人一句话被拆成
+ * 两三轮，已读回执也跟着落在中间那条上（用户原话：发了六条，合并了两次，读到
+ * 第二条）。
  *
- * 代价是对方要是打得慢，第五句可能落在窗口外、被分到下一轮去。这是刻意换的：
- * 「偶尔分两轮回」比「说完了还在干等」体感好，而且下一轮的上下文里前一轮就在
- * 上面，接得上。
+ * debounce 的老毛病是没有上界：对方一直断断续续地打，这一轮就一直不结算。所以
+ * 从第一条算起最多等 mergeCapMs(wait)，到了就不再往后推，照常结算。
  *
  * @param {{text?: string, image?: object, voice?: object}} item
  *   文本、图片附件、或语音附件（三选一）
@@ -1241,13 +1241,20 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
     ((slot.videos ?? []).length ? ` / ${slot.videos.length} 段视频` : "");
 
   /*
-   * 计时器只在**开窗那一下**装，后来的消息一律不碰它 —— 这就是「以第一条为
-   * 基准」的全部实现。判据用 `slot.timer` 而不是「texts 是不是空的」：只发了
+   * 窗口已经开着：重新倒计时 queueWait 秒，但不越过开窗时定下的总上限
+   * （slot.deadline）。判据用 `slot.timer` 而不是「texts 是不是空的」：只发了
    * 一张图、一条语音那轮一个字都没有，但窗口一样已经开着了。
    */
   if (slot.timer) {
+    const at = Math.min(Date.now() + wait * 1000, slot.deadline ?? Infinity);
+    if (at > slot.firesAt) {
+      clearTimeout(slot.timer);
+      slot.firesAt = at;
+      slot.timer = setTimeout(fire, Math.max(0, at - Date.now()));
+    }
     const left = Math.max(0, Math.round((slot.firesAt - Date.now()) / 100) / 10);
-    logDebug(scopeOf(runner, "桥接"), `又攒一条：${counts}，还有 ${left}s 就发`);
+    const capped = slot.firesAt >= (slot.deadline ?? Infinity) ? "（到总上限了，不再往后推）" : "";
+    logDebug(scopeOf(runner, "桥接"), `又攒一条：${counts}，重新倒计时，还有 ${left}s 就发${capped}`);
     return;
   }
 
@@ -1265,7 +1272,18 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
 
   logDebug(scopeOf(runner, "桥接"), `攒消息中：${counts}，${wait}s 后把这期间的一起发`);
   slot.firesAt = Date.now() + wait * 1000;
+  slot.deadline = Date.now() + mergeCapMs(wait);
   slot.timer = setTimeout(fire, wait * 1000);
+}
+
+/**
+ * 一轮合并从第一条算起最多等多久（毫秒）。
+ *
+ * 60 秒：够打完五六句话，又不至于让人说完了干等一分多钟。queueWait 本身设得
+ * 很大（≥30 秒）的，至少给它两个窗口，不然上限比单个窗口还短，等于没有 debounce。
+ */
+export function mergeCapMs(wait) {
+  return Math.max(60, wait * 2) * 1000;
 }
 
 /**
@@ -1737,7 +1755,7 @@ function flushPending(runner, spaceId) {
  * 用户报的原话：「发了图 + 字，LLM 先回了文字，图片过了好一会儿才发出去」。
  * 根因是两件独立正确的事撞在一起：
  *
- *  - 合并窗口以**第一条**消息为基准，后来的不推后计时器（见 enqueue 的注释）；
+ *  - 合并窗口只在**消息进队列时**重新倒计时（见 enqueue 的注释），拆附件那几秒不算；
  *  - 附件字节是在消息循环里**同步**读的，断流还要重试，最多 17.8 秒
  *    （见 attachread.js 的 RETRY_MS）。
  *
@@ -1754,8 +1772,8 @@ function flushPending(runner, spaceId) {
  *
  * ── 为什么不是「下载时把计时器推后」 ──
  *
- * 推后就等于把 debounce 请回来了（那是上一版刻意换掉的东西，见 enqueue）：
- * 一直有附件在传，这一轮就一直不结算。这里的语义严格得多 —— 窗口该到点就到点，
+ * 拆附件的时长和对方打没打完无关，拿它推后计时器没有道理；再说一直有附件在传，
+ * 这一轮就一直不结算。这里的语义严格得多 —— 窗口该到点就到点，
  * 只是**兑现推迟到手上的东西拆完**，而拆附件的时长本来就有上界。
  *
  * 计数不是布尔：一条消息可以同时带图、语音、视频、文件。而消息循环是串行的，

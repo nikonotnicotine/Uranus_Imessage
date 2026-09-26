@@ -1282,6 +1282,7 @@ function normalizeInstagram(input) {
  */
 function normalizeXiaohongshu(input) {
   const base = str(input?.baseUrl).trim().replace(/\/+$/, "");
+  const imageBase = str(input?.imageBase).trim().replace(/\/+$/, "");
   return {
     enabled: Boolean(input?.enabled),
     // 主动发笔记。和 IG 的 autoPublish 一样并进主动消息轮次，依赖 proactive.enabled
@@ -1293,6 +1294,11 @@ function normalizeXiaohongshu(input) {
     // 多久看一次新评论（分钟）
     pollMinutes: clampInt(input?.pollMinutes, 30, 5, 1440),
     baseUrl: /^https?:\/\//i.test(base) ? base : "http://localhost:18060",
+    /*
+     * MCP 不在这台机器上时，它从哪个地址回来取配图（比如 Tailscale 的
+     * http://100.x.x.x:8787）。MCP 在本机就用不上，留空。
+     */
+    imageBase: /^https?:\/\//i.test(imageBase) ? imageBase : "",
   };
 }
 

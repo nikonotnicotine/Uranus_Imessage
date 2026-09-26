@@ -36,6 +36,8 @@
  * 两边共用那套 commit）。
  */
 
+import path from "node:path";
+
 import { applyVars, resolveImageEndpoint, resolveRoleEndpoints, resolveUser } from "./config.js";
 import { buildIgPrompt } from "./igprompt.js";
 import { readSettings } from "./igstore.js";
@@ -43,7 +45,7 @@ import { chatWithFallback } from "./llm.js";
 import { logError, logInfo, logWarn } from "./logs.js";
 import { generateImage } from "./media.js";
 import { XhsError, listMentions, loginStatus, publishNote, replyComment } from "./xhsapi.js";
-import { recordNote, roleState, stageImage, unstage, updateRoleState } from "./xhsstore.js";
+import { recordNote, roleState, shareStaged, stageImage, unstage, updateRoleState } from "./xhsstore.js";
 import { hasXhsTag, parseReplies } from "./xhstags.js";
 
 const SCOPE = "小红书";
@@ -61,6 +63,30 @@ export function xhsRouteFor(role, text) {
 
 function baseOf(role) {
   return String(role?.xiaohongshu?.baseUrl || "http://localhost:18060").replace(/\/+$/, "");
+}
+
+/**
+ * MCP 是不是跑在这台机器上。只看地址写的是不是回环：写了局域网 / Tailscale
+ * 地址的，一律当它在别的机器上 —— 就算其实是同一台，走链接也照样能取到图，
+ * 反过来当成本机、交过去一个它那头不存在的路径，才是真发不出去。
+ */
+export function isLocalMcp(base) {
+  let host = "";
+  try {
+    host = new URL(base).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return true;
+  }
+  return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\./.test(host);
+}
+
+/**
+ * 交给 MCP 的配图：本机就给绝对路径（上游推荐这么用），不在本机就给
+ * <Uranus 地址>/xhs-img/<令牌>.<后缀> 这种一次性链接，由它回来取。
+ */
+export function imageRefs(files, base, imageBase) {
+  if (isLocalMcp(base)) return files;
+  return files.map((f) => `${imageBase}/xhs-img/${shareStaged(f)}${path.extname(f)}`);
 }
 
 function clip(text, n) {
@@ -101,6 +127,13 @@ export async function publishOne(config, role, note) {
     ? note.images.map((im) => im.alt)
     : [`小红书笔记配图：${note.title}。${clip(note.body, 120)}`];
 
+  const imageBase = String(role?.xiaohongshu?.imageBase ?? "").replace(/\/+$/, "");
+  if (!isLocalMcp(base) && !imageBase) {
+    throw new XhsError(
+      `xiaohongshu-mcp 不在这台机器上（${base}），它拿不到这边的配图文件。` +
+        "在角色的「小红书」设置里填上「Uranus 地址」（MCP 那台电脑能打开的地址，比如 Tailscale 的 http://100.x.x.x:8787）"
+    );
+  }
   if (!resolveImageEndpoint(config)) {
     throw new XhsError("小红书的笔记必须带图，但还没配生图模型（设置 → 生图），这篇发不了");
   }
@@ -116,7 +149,7 @@ export async function publishOne(config, role, note) {
     await publishNote(base, {
       title: note.title || clip(note.body, 10) || "分享",
       content: note.body || note.title,
-      images: files,
+      images: imageRefs(files, base, imageBase),
       tags: note.topics,
     });
     return { images: files.length };

@@ -7,8 +7,8 @@
  * 「它怎么回了两遍」或者「图片过了好一会儿才发出去」，而从日志里看每一步
  * 都很正常。这套盯的就是这些「每一步都对、合起来错了」的情形：
  *
- *  1. **窗口以第一条为基准**。后来的消息只往里加，不推后计时器。推后就是
- *     debounce —— 对方一直打字，这一轮就一直不结算，那是上一版刻意换掉的。
+ *  1. **每来一条重新倒计时，但有总上限**。对方停手 queueWait 秒才结算；一直
+ *     断断续续地打，也最多从第一条起等 mergeCapMs，到了照常结算。
  *  2. **附件还在拆的时候到点了要等**。用户报过的 bug：字在前、图在后，
  *     窗口到点时图还在下载，于是那一轮只带着文字去打模型，图落进了下一轮。
  *     表现是「LLM 先回了文字，图片过了好一会儿才发出去」。
@@ -16,7 +16,7 @@
  *     挂起了 —— 后面的消息全进同一个 slot，表现是「这个号从此不说话了」。
  *     这是比原 bug 严重得多的坏法，所以放的每一条路径都单独钉一遍。
  *  4. **挂起期间不许重开窗口**。附件每拆完一件就把这一轮往后推一次的话，
- *     那又是 debounce，只是换了个地方。
+ *     拆附件的时长就被算成了「对方还在打」。
  *  5. **硬引爆要能穿过挂起**。指令 / 协助模式 / 线下模式那三处要的是
  *     「排在前面的那一轮先跑完」，它们不能被附件下载卡住。
  *
@@ -92,6 +92,7 @@ function harness() {
   const fired = [];
 
   const code = `
+    ${extractFn("mergeCapMs")}
     return {
       enqueue: ${extractFn("enqueue")},
       flushPending: ${extractFn("flushPending")},
@@ -119,8 +120,8 @@ const cfg = (waitSec = 0.06) => () => ({ chat: { queueWait: waitSec } });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SPACE = { id: "sp" };
 
-/* ================= 1. 窗口以第一条为基准 ================= */
-console.log("\n[1. 窗口以第一条为基准]");
+/* ================= 1. 每来一条重新倒计时，有总上限 ================= */
+console.log("\n[1. 每来一条重新倒计时，有总上限]");
 {
   await okAsync("两条文本攒成一轮，只引爆一次", async () => {
     const H = harness();
@@ -133,26 +134,44 @@ console.log("\n[1. 窗口以第一条为基准]");
     assert.equal(H.fired[0].peer, "peer1");
   });
 
-  await okAsync("后来的消息不推后计时器（不是 debounce）", async () => {
+  await okAsync("每来一条重新倒计时（停手 queueWait 才结算）", async () => {
     /*
-     * 窗口开 300ms，然后每 25ms 来一条，一共 8 条 —— 全都落在窗口里面。
-     * debounce 的话最后一条之后还要再等 300ms（总共 500ms 往上）；
-     * 以第一条为基准的话，到 300ms 就该结算，那 8 条一起走。
+     * 窗口 150ms，每 100ms 来一条，一共 5 条 —— 每条都落在上一条的窗口里。
+     * 以第一条为基准的话 150ms 就结算了；现在要等最后一条之后再过 150ms。
      */
     const H = harness();
-    const started = Date.now();
-    H.enqueue(cfg(0.3), H.runner, SPACE, "sp", { text: "a" });
-    for (let i = 0; i < 8; i += 1) {
-      await sleep(25);
-      H.enqueue(cfg(0.3), H.runner, SPACE, "sp", { text: `b${i}` });
+    H.enqueue(cfg(0.15), H.runner, SPACE, "sp", { text: "a" });
+    for (let i = 0; i < 4; i += 1) {
+      await sleep(100);
+      H.enqueue(cfg(0.15), H.runner, SPACE, "sp", { text: `b${i}` });
     }
-    // 这会儿走了 200ms 出头，窗口还没到点
-    assert.equal(H.fired.length, 0, "窗口还没到点就发了");
-    await sleep(160);
-    assert.equal(H.fired.length, 1, "应该已经引爆了");
-    assert.equal(H.fired[0].merged.split("\n").length, 9, "9 条要在同一轮里");
-    // 300ms 的窗口，就算算上调度抖动也不该拖到 debounce 那个量级
-    assert.ok(Date.now() - started < 450, `等了 ${Date.now() - started}ms，像是被推后了`);
+    assert.equal(H.fired.length, 0, "对方还在打就结算了");
+    await sleep(90);
+    assert.equal(H.fired.length, 0, "离最后一条还不到 150ms 就结算了");
+    await sleep(130);
+    assert.equal(H.fired.length, 1, "停手 150ms 了还没结算");
+    assert.equal(H.fired[0].merged.split("\n").length, 5, "5 条要在同一轮里");
+  });
+
+  await okAsync("一直打也有总上限，到了照常结算", async () => {
+    const H = harness();
+    const started = Date.now();
+    H.enqueue(cfg(0.1), H.runner, SPACE, "sp", { text: "a" });
+    // 真的上限最少 60 秒，测试里把这一轮的上限直接拨到 250ms
+    H.runner.pending.get("sp").deadline = started + 250;
+    for (let i = 0; i < 8; i += 1) {
+      await sleep(50);
+      H.enqueue(cfg(0.1), H.runner, SPACE, "sp", { text: `b${i}` });
+    }
+    // 走到这儿 400ms 往上，每条都在窗口内，没有上限的话一轮都不会结算
+    assert.ok(H.fired.length >= 1, "到了上限还没结算");
+    assert.ok(H.fired[0].merged.startsWith("a\n"), "上限前的那几条要一起走");
+  });
+
+  okWith("上限：至少 60 秒，窗口很大时给两个窗口", () => {
+    const cap = new Function(`${extractFn("mergeCapMs")}; return mergeCapMs;`)();
+    assert.equal(cap(8), 60_000);
+    assert.equal(cap(45), 90_000);
   });
 
   await okAsync("窗口关了之后来的消息开新一轮（不是并进上一轮）", async () => {

@@ -10,6 +10,7 @@
  * 笔记 id，这份流水也就只是给界面看、给日志查的，不参与任何逻辑。
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -131,8 +132,43 @@ export function stageImage(buffer, ext = "png") {
   return file;
 }
 
-/** 发完删掉。删不掉无所谓 —— 临时目录系统会收。 */
+/* ================= MCP 不在本机：借它一个限时链接取图 ================= */
+
+/**
+ * Uranus 跑在 VPS、xiaohongshu-mcp 跑在自己电脑上（中间走 Tailscale 之类）时，
+ * 暂存图的路径在 MCP 那头是不存在的。好在它的 images 也收 http 链接、自己去下，
+ * 所以给每张图发一个随机令牌，挂在 /xhs-img/<令牌> 下让它来取。
+ *
+ * 只存在内存里：进程重启就全失效，本来也只该活一次发布那么久。15 分钟是给
+ * 慢网络留的余量；发完（unstage）立刻作废，不等到点。
+ */
+const SHARE_TTL = 15 * 60 * 1000;
+const shares = new Map(); // 令牌 -> { file, until }
+
+/** 给一张暂存图发令牌，返回令牌（32 位十六进制，猜不到）。 */
+export function shareStaged(file) {
+  const now = Date.now();
+  for (const [k, v] of shares) if (v.until < now) shares.delete(k);
+  const token = crypto.randomBytes(16).toString("hex");
+  shares.set(token, { file, until: now + SHARE_TTL });
+  return token;
+}
+
+/** 令牌换文件路径。过期、作废、文件没了都回空串。 */
+export function sharedFile(token) {
+  const s = shares.get(String(token ?? ""));
+  if (!s) return "";
+  if (s.until < Date.now()) {
+    shares.delete(token);
+    return "";
+  }
+  return fs.existsSync(s.file) ? s.file : "";
+}
+
+/** 发完删掉，借出去的链接一并作废。删不掉无所谓 —— 临时目录系统会收。 */
 export function unstage(files) {
+  const gone = new Set(files ?? []);
+  for (const [k, v] of shares) if (gone.has(v.file)) shares.delete(k);
   for (const f of files ?? []) {
     try {
       fs.unlinkSync(f);

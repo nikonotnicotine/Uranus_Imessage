@@ -292,6 +292,24 @@ console.log("\n=== 8. 发笔记 ===");
   for (let i = 0; i < 50 && !store.roleState("r-x").notes.length; i += 1) await new Promise((r) => setTimeout(r, 50));
   check("后台发完记了流水", store.roleState("r-x").notes.at(-1)?.ok, true);
 
+  // MCP 不在本机
+  check("回环才算本机", ["http://localhost:18060", "http://127.0.0.1:1", "http://[::1]:1", "http://100.64.0.2:18060", "http://pc.tail1234.ts.net:18060"].map(run.isLocalMcp), [true, true, true, false, false]);
+  const remote = { ...role, xiaohongshu: { ...role.xiaohongshu, baseUrl: "http://100.64.0.2:18060" } };
+  err = null;
+  try { await run.publishOne({ ...baseCfg(true), roles: [remote] }, remote, note); } catch (e) { err = e; }
+  checkThat("MCP 在别处、没填 Uranus 地址 → 说清楚", /Uranus 地址/.test(err?.message ?? ""), err?.message);
+
+  const staged = store.stageImage(PNG, "png");
+  check("本机给路径", run.imageRefs([staged], BASE, ""), [staged]);
+  const [link] = run.imageRefs([staged], "http://100.64.0.2:18060", "http://100.64.0.1:8787");
+  const m = /^http:\/\/100\.64\.0\.1:8787\/xhs-img\/([0-9a-f]{32})\.png$/.exec(link);
+  checkThat("别处给一次性链接", Boolean(m), link);
+  check("令牌换得回文件", store.sharedFile(m?.[1]), staged);
+  check("瞎编的令牌不行", store.sharedFile("0".repeat(32)), "");
+  store.unstage([staged]);
+  check("发完就作废", store.sharedFile(m?.[1]), "");
+  checkThat("配置里留着 imageBase", normalizeConfig({ roles: [{ id: "r", name: "A", xiaohongshu: { imageBase: "http://100.64.0.1:8787/" } }] }).roles[0].xiaohongshu.imageBase === "http://100.64.0.1:8787");
+
   check("composeNote 两道闸", [
     Boolean(run.xhsComposeNote(baseCfg(false), role)),
     run.xhsComposeNote(baseCfg(false), { ...role, xiaohongshu: { ...role.xiaohongshu, autoPublish: false } }),

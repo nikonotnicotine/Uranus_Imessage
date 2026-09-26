@@ -1758,6 +1758,17 @@ function RoleUndoSendFields({ role, onGoto }) {
  * 访问令牌不走 PUT /api/config —— 角色对象会跟着导出 / 云备份出去。它单独存在
  * data/xiaohongshu/secrets.json，界面上只知道「有没有」。
  */
+/** 和 server/src/xhsrun.js:isLocalMcp 同一个判据：只有回环地址才算本机。 */
+function isLocalXhs(base) {
+  let host = "";
+  try {
+    host = new URL(base).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return true;
+  }
+  return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\./.test(host);
+}
+
 function RoleXiaohongshuFields({ role }) {
   const { updateRole } = useConfig();
   const openGate = usePresetGate(role);
@@ -1870,6 +1881,20 @@ function RoleXiaohongshuFields({ role }) {
               placeholder="http://localhost:18060"
             />
           </Field>
+
+          {!isLocalXhs(baseUrl) && (
+            <Field
+              label="Uranus 地址（给 MCP 取配图）"
+              hint="MCP 不在跑 Uranus 的这台机器上时要填：填 MCP 那台电脑能打开的 Uranus 地址，比如 Tailscale 的 http://100.x.x.x:8787。配图会做成一次性链接交给 MCP，发完就失效。不填的话发不了笔记（回评论不受影响）"
+            >
+              <input
+                className={inputCls}
+                value={x.imageBase ?? ""}
+                onChange={(e) => patch({ imageBase: e.target.value })}
+                placeholder="http://100.x.x.x:8787"
+              />
+            </Field>
+          )}
 
           <Field
             label="访问令牌"
