@@ -30,8 +30,8 @@
  *
  * 按 data/ 下的实际目录切成三块，界面上分别勾（见 SCOPES）：
  *   config  配置（角色、人设、预设、世界书、壁纸设置）  ~50KB
- *   chats   聊天与记忆（存档、记忆库、Instagram）        ~31MB
- *   images  表情包与参考图                              ~91MB
+ *   chats   聊天与记忆（存档、记忆库、Instagram 文字）    ~31MB
+ *   images  表情包、参考图与 IG 图片                     ~91MB
  *
  * images 默认**不勾**：它比另外两块加起来大两倍，而且是用户自己往里放的图
  * （丢了能再放一遍），不像记忆库那样是聊出来的、独一无二的东西。
@@ -94,10 +94,21 @@ export const SCOPES = {
     paths: ["sessions", "memories", "instagram", "xiaohongshu/state.json"],
   },
   images: {
-    label: "表情包与参考图",
-    paths: ["images"],
+    label: "表情包、参考图与 IG 图片",
+    // instagram/media 是贴文、快拍、头像的图片原件，二十几 MB 起步，和
+    // images/ 一个量级 —— 跟着「聊天与记忆」上网，那一块就不再是「几十 MB
+    // 的文字」了。所以从 instagram/ 里抠出来挪到这边，见 CARVED_OUT。
+    paths: ["images", "instagram/media"],
   },
 };
+
+/**
+ * 被「挖走」的子路径：上面某一块显式列了它，而它同时又落在另一块的目录里。
+ *
+ * 走目录的时候遇到这些名字一律不进去 —— 不然勾了「聊天与记忆」会从
+ * `instagram/` 顺手把 media 带上（本该归 images），两块都勾还会打两遍。
+ */
+const CARVED_OUT = new Set(["instagram/media"]);
 
 /** 勾了密钥才带的那一个文件。 */
 const SECRET_REL = "data.config.json";
@@ -239,7 +250,9 @@ export function collectEntries(scopes, { includeSecrets = false } = {}) {
       // 空目录也算「存在」，只是没东西可打包
       for (const name of names) {
         if (skipped(name)) continue;
-        walk(path.posix.join(rel, name));
+        const child = path.posix.join(rel, name);
+        if (CARVED_OUT.has(child)) continue; // 归另一块管，勾了那块自会单独走
+        walk(child);
       }
       return true;
     }

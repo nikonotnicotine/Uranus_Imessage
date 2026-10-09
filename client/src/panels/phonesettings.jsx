@@ -107,14 +107,43 @@ function Toggle({ on, onChange, label }) {
   );
 }
 
-function Stepper({ value, min, max, step = 1, onChange, suffix }) {
+/**
+ * `edit`：数字本身也能点进去直接敲。
+ *
+ * 量程跨好几个数量级的那种（「每轮最多带」最大 99999 字）光靠加减按钮没法用 ——
+ * 一步 50 字，从默认值点到头要两千下。草稿存在本地 state 里，敲的中途不往上报，
+ * 失焦/回车才 clamp 提交：不然打「1200」会在输入到「1」的那一刻被 min 顶成 50。
+ */
+function Stepper({ value, min, max, step = 1, onChange, suffix, edit = false }) {
   const set = (v) => onChange(Math.min(max, Math.max(min, v)));
+  const [draft, setDraft] = useState(null);
+  const commit = () => {
+    const n = Number(String(draft ?? "").replace(/[^\d]/g, ""));
+    setDraft(null);
+    if (draft !== null && Number.isFinite(n) && n > 0) set(n);
+  };
   return (
     <span className="flex items-center gap-2">
-      <span className="min-w-[56px] text-right text-[17px] text-[#8e8e93]">
-        {value}
-        {suffix}
-      </span>
+      {edit ? (
+        <span className="text-right text-[17px] text-[#8e8e93]">
+          <input
+            className="w-[72px] bg-transparent text-right outline-none"
+            inputMode="numeric"
+            value={draft ?? String(value)}
+            onChange={(e) => setDraft(e.target.value.replace(/[^\d]/g, "").slice(0, 6))}
+            onFocus={(e) => e.target.select()}
+            onBlur={commit}
+            onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+            aria-label="直接输入"
+          />
+          {suffix}
+        </span>
+      ) : (
+        <span className="min-w-[56px] text-right text-[17px] text-[#8e8e93]">
+          {value}
+          {suffix}
+        </span>
+      )}
       <span className="flex h-[32px] overflow-hidden rounded-[9px] bg-[#767680]/[0.12]">
         <button type="button" onClick={() => set(value - step)} className="flex w-[46px] items-center justify-center border-r border-[#c6c6c8]/60" aria-label="减">
           <Minus size={18} />
@@ -260,11 +289,11 @@ export function SettingsApp({ close, role, data, apps, running, onGenerate, onBo
   if (page === "sync") {
     return (
       <Page title="同步与指令" onBack={back}>
-        <Section foot="之后聊天时把最近一次查手机压成几行摘要告诉角色。只进当轮请求、不进存档，每轮固定多下面这么多字，过了时效就不再带。">
+        <Section foot="之后聊天时把最近一次查手机压成几行摘要告诉角色。只进当轮请求、不进存档，每轮固定多下面这么多字（数字能直接点进去敲），过了时效就不再带。">
           <SetRow label="同步到私聊" right={<Toggle on={Boolean(p.injectChat)} onChange={(v) => patchRole({ injectChat: v })} label="同步到私聊" />} last={!p.injectChat} />
           {p.injectChat && (
             <>
-              <SetRow label="每轮最多带" right={<Stepper value={p.injectChars ?? 300} min={50} max={3000} step={50} suffix="字" onChange={(v) => patchRole({ injectChars: v })} />} />
+              <SetRow label="每轮最多带" right={<Stepper edit value={p.injectChars ?? 3000} min={50} max={99999} step={50} suffix="字" onChange={(v) => patchRole({ injectChars: v })} />} />
               <SetRow label="生成后多久内带" last right={<Stepper value={p.injectHours ?? 24} min={1} max={720} step={1} suffix="时" onChange={(v) => patchRole({ injectHours: v })} />} />
             </>
           )}

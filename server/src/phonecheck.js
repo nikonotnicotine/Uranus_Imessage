@@ -55,6 +55,16 @@ const SCOPE = "查手机";
 const KEEP_PER_APP = 40;
 
 /**
+ * 一次调模型最多生成几个 App，多了拆成几轮（runGenerate 里分组）。
+ *
+ * 一个 App 四条中文记录就一千多 token，而大多数家默认的输出上限只有
+ * 四千到八千（apitype.js:ANTHROPIC_DEFAULT_MAX_TOKENS）—— 一键生成勾了
+ * 十一个 App 的时候，回答写到一半就被掐断，整批 JSON 解析不了，界面上
+ * 只剩一句「模型回的不是 JSON」。拆开之后每一轮都稳稳在上限里面。
+ */
+const APPS_PER_CALL = 4;
+
+/**
  * 内置 App。`spec` 是告诉模型这个 App 每条记录长什么样 —— title / detail / value / time
  * 四个字段各自装什么。界面按 id 选样式（client/src/panels/phone.jsx）。
  */
@@ -207,7 +217,7 @@ export function normalizeRolePhone(input) {
   return {
     // 同步到私聊：之后每轮注入一小段摘要
     injectChat: Boolean(input?.injectChat),
-    injectChars: clamp(input?.injectChars, 300, 50, 3000),
+    injectChars: clamp(input?.injectChars, 3000, 50, 99999),
     // 生成后多久之内注入（小时）。过了就不再注入，token 也就不再花了
     injectHours: clamp(input?.injectHours, 24, 1, 720),
     // 同步到日记待总结
@@ -430,16 +440,64 @@ function buildMessages(config, role, apps, bookIds, mode = "append") {
   ];
 }
 
+/**
+ * 把**被截断**的 JSON 补成能解析的：砍到最后一个完整的值，再按括号栈补上收尾。
+ *
+ * 回答写到一半被 max_tokens 掐掉是常事（见 runGenerate 的分批注释）。掐掉的
+ * 那一条记录没救，但前面几十条是好的 —— 与其整批报错，不如把完整的那部分留下。
+ *
+ * 做法：从头扫一遍，记住「每次一个值收尾时」的位置和当时的括号栈；扫完如果
+ * 栈没空（说明确实断了），就回到最后那个位置、把栈倒着闭上。
+ */
+function closeTruncated(s) {
+  const stack = [];
+  let inStr = false;
+  let esc = false;
+  let cut = -1; // 最后一个完整值的结束位置（不含）
+  let cutStack = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') {
+        inStr = false;
+        cut = i + 1;
+        cutStack = stack.join("");
+      }
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{" || c === "[") stack.push(c === "{" ? "}" : "]");
+    else if (c === "}" || c === "]") {
+      stack.pop();
+      cut = i + 1;
+      cutStack = stack.join("");
+    }
+    // 逗号和冒号后面跟的是下一个值的开头，不算收尾点，略过
+  }
+  if (!stack.length || cut <= 0) return null; // 没断，或者一个完整值都没有
+  // 砍点落在键名那个字符串上（`"wallet": ` 写了一半）的时候，连那个键一起去掉
+  let head = s.slice(0, cut).replace(/,\s*$/, "");
+  if (/"\s*$/.test(head) && /[{,]\s*"[^"]*"\s*$/.test(head)) head = head.replace(/[,]?\s*"[^"]*"\s*$/, "");
+  head = head.replace(/[,:]\s*$/, "");
+  return head + [...cutStack].reverse().join("");
+}
+
 /** 从模型回复里抠出 JSON 对象：剥代码块、取第一个 { 到最后一个 }，再把尾逗号去掉。 */
 export function extractJson(text) {
   let t = String(text ?? "").replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, "");
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(t);
+  // 回答被截断的时候收尾那个 ``` 不会有，上面那条匹配不上 —— 单独把开头那行剥掉
   if (fence) t = fence[1];
+  else t = t.replace(/^[\s\S]*?```(?:json)?[ \t]*\r?\n/i, "");
   const a = t.indexOf("{");
+  if (a === -1) return null;
   const b = t.lastIndexOf("}");
-  if (a === -1 || b <= a) return null;
-  const body = t.slice(a, b + 1);
-  for (const candidate of [body, body.replace(/,\s*([}\]])/g, "$1")]) {
+  const body = b > a ? t.slice(a, b + 1) : "";
+  const rest = t.slice(a);
+  for (const candidate of [body, body.replace(/,\s*([}\]])/g, "$1"), closeTruncated(rest)]) {
+    if (!candidate) continue;
     try {
       const v = JSON.parse(candidate);
       if (v && typeof v === "object" && !Array.isArray(v)) return v;
@@ -497,7 +555,8 @@ function summarize(config, batch, maxChars, detailChars) {
  *
  * **只在这一轮请求里注入、不进存档**（和天气同一个道理），所以 token 花费是
  * 「每轮固定多这几百字」，不会越攒越多：
- *  - 字数上限 injectChars（默认 300，中文约 300 token）
+ *  - 字数上限 injectChars（默认 3000，中文约 3000 token；最大 99999，那就是
+ *    「整台手机都带上」的意思了，token 花费自己心里有数）
  *  - 时效 injectHours（默认 24 小时）：生成超过这个时间就不再注入，花费归零
  * 长期的记忆交给日记那条路（toDiary）。
  *
@@ -513,7 +572,12 @@ export function phoneNote(config, role) {
     return "";
   }
   if (!state.last?.at || Date.now() - state.last.at > p.injectHours * 3600_000) return "";
-  const body = summarize(config, state.last.items, p.injectChars, 24);
+  /*
+   * 每条正文截多长跟着总字数走：总共只给 300 字的时候每条 24 字正好能多塞几条，
+   * 但给到几千字还只截 24 字就白瞎 —— 条数早列完了，省下的字数没人用。
+   */
+  const detail = Math.min(120, Math.max(24, Math.round(p.injectChars / 40)));
+  const body = summarize(config, state.last.items, p.injectChars, detail);
   if (!body) return "";
   return (
     `<Phone>\n这是你自己手机里最近的东西（只是让你知道自己的近况，别主动念出来，被问到时对得上就行）：\n${body}\n</Phone>`
@@ -543,54 +607,87 @@ export async function runGenerate(config, role, appIds, opts = {}) {
   const reset = opts.mode === "reset";
 
   logInfo(SCOPE, `${reset ? "重置并重新生成" : "开始翻"} ${role.name} 的手机：${apps.map((a) => a.name).join("、")}`);
-  const reply = await callModel(config, role, buildMessages(config, role, apps, bookIds, reset ? "reset" : "append"));
-  const json = extractJson(reply);
-  if (!json) throw new Error(`模型回的不是 JSON，没法解析：${String(reply).slice(0, 120)}`);
 
   const otherNames = new Set((config.roles ?? []).filter((r) => r.id !== role.id).map((r) => r.name?.trim()).filter(Boolean));
-  const now = Date.now();
   const batch = {};
-  /*
-   * 重置：整台手机换成这一批 —— 但要等**生成成功之后**才清。前面任何一步抛错
-   * （模型没回、回的不是 JSON），旧内容都还在，不会落得一台空手机。
-   */
-  if (reset) {
-    state.apps = {};
-    state.updatedAt = {};
-    state.walletBalance = "";
-  }
-  for (const app of apps) {
-    const raw = Array.isArray(json[app.id]) ? json[app.id] : [];
-    const items = raw
-      .filter((x) => x && typeof x === "object")
-      .map((x) => ({
-        id: newId(),
-        title: asText(x.title) || "（无标题）",
-        detail: asText(x.detail),
-        value: asText(x.value),
-        time: asText(x.time),
-        at: now,
-        ...(app.id === "contacts" || app.id === "chat" ? { real: otherNames.has(asText(x.title).replace(/[（(].*?[）)]/g, "").trim()) } : {}),
-      }));
-    if (!items.length) continue;
-    batch[app.id] = items;
-    if (app.id === "track") {
-      // 活动轨迹按时间先后排、只算今天：今天已经有的就接在后面，跨天了就整个换掉
-      const today = (state.apps.track ?? []).filter((x) => sameDay(x.at, now));
-      state.apps.track = [...today, ...items].slice(-KEEP_PER_APP);
-    } else {
-      // 其余的新的排前面，旧的往后挤
-      state.apps[app.id] = [...items, ...(state.apps[app.id] ?? [])].slice(0, KEEP_PER_APP);
-    }
-    state.updatedAt[app.id] = now;
-  }
-  if (json.walletBalance) state.walletBalance = asText(json.walletBalance);
-  if (!Object.keys(batch).length) throw new Error("模型回了 JSON，但里面一条能用的记录都没有");
-  // ↑ 这一句在 reset 清空 state 之后，但 state 还没落盘 —— 抛出去旧文件照样完好
+  const groups = [];
+  for (let i = 0; i < apps.length; i += APPS_PER_CALL) groups.push(apps.slice(i, i + APPS_PER_CALL));
+  let cleared = false;
+  let firstError = null;
 
-  state.bookIds = bookIds;
-  state.last = { at: now, items: batch };
-  saveState(role.id, state);
+  for (const group of groups) {
+    // reset 只对第一组成立：清过之后，后面几组要看得见前面刚生成的，才接得上
+    const fresh = reset && !cleared;
+    let json;
+    try {
+      const reply = await callModel(config, role, buildMessages(config, role, group, bookIds, fresh ? "reset" : "append"));
+      json = extractJson(reply);
+      if (!json) throw new Error(`模型回的不是 JSON，没法解析：${String(reply).slice(0, 120)}`);
+    } catch (e) {
+      // 一组没成不拖累别组：记下来接着跑，全军覆没才往外抛（见循环后面）
+      firstError ??= e;
+      if (groups.length > 1) logWarn(SCOPE, `这一组没生成出来：${group.map((a) => a.name).join("、")}`, String(e?.message ?? e));
+      continue;
+    }
+
+    /*
+     * 重置：整台手机换成这一批 —— 但要等**生成成功之后**才清。前面任何一步抛错
+     * （模型没回、回的不是 JSON），旧内容都还在，不会落得一台空手机。
+     */
+    if (fresh) {
+      state.apps = {};
+      state.updatedAt = {};
+      state.walletBalance = "";
+      cleared = true;
+    }
+
+    const now = Date.now();
+    const got = {};
+    for (const app of group) {
+      const raw = Array.isArray(json[app.id]) ? json[app.id] : [];
+      const items = raw
+        // 四个字段全空的丢掉：回答被截断时补出来的最后那半条就长这样
+        .filter((x) => x && typeof x === "object" && [x.title, x.detail, x.value, x.time].some((v) => asText(v)))
+        .map((x) => ({
+          id: newId(),
+          title: asText(x.title) || "（无标题）",
+          detail: asText(x.detail),
+          value: asText(x.value),
+          time: asText(x.time),
+          at: now,
+          ...(app.id === "contacts" || app.id === "chat" ? { real: otherNames.has(asText(x.title).replace(/[（(].*?[）)]/g, "").trim()) } : {}),
+        }));
+      if (!items.length) continue;
+      got[app.id] = items;
+      batch[app.id] = items;
+      if (app.id === "track") {
+        // 活动轨迹按时间先后排、只算今天：今天已经有的就接在后面，跨天了就整个换掉
+        const today = (state.apps.track ?? []).filter((x) => sameDay(x.at, now));
+        state.apps.track = [...today, ...items].slice(-KEEP_PER_APP);
+      } else {
+        // 其余的新的排前面，旧的往后挤
+        state.apps[app.id] = [...items, ...(state.apps[app.id] ?? [])].slice(0, KEEP_PER_APP);
+      }
+      state.updatedAt[app.id] = now;
+    }
+    if (json.walletBalance) state.walletBalance = asText(json.walletBalance);
+    if (!Object.keys(got).length) {
+      firstError ??= new Error("模型回了 JSON，但里面一条能用的记录都没有");
+      continue;
+    }
+
+    /*
+     * 每组落一次盘：下一组的 buildMessages 自己 loadState()，读的是盘上的 ——
+     * 不存就看不见刚生成的那几个 App，会重复写同样的情节。顺带，中途断了
+     * 已经生成的那几组也保住了。
+     */
+    state.bookIds = bookIds;
+    state.last = { at: now, items: batch };
+    saveState(role.id, state);
+  }
+
+  // 一条都没落下来才算失败：reset 时 state 还没清过，旧文件完好
+  if (!Object.keys(batch).length) throw firstError ?? new Error("模型回了 JSON，但里面一条能用的记录都没有");
 
   const total = Object.values(batch).reduce((n, l) => n + l.length, 0);
   logInfo(SCOPE, `${role.name} 的手机生成好了：${total} 条`, summarize(config, batch, 4000, 60));
