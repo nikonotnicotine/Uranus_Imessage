@@ -2758,7 +2758,7 @@ function DollCalibrateButton({ doll, updateDollApi }) {
  * 每 3 秒刷一次：这东西是**边抱边看**的 —— 抱一下，看这行数字动没动，
  * 比什么说明都直观。只在这一栏展开着的时候转，收起来就停。
  */
-function DollPushStatus() {
+function DollPushStatus({ onFill }) {
   const [st, setSt] = useState(null);
   const [err, setErr] = useState("");
 
@@ -2816,18 +2816,101 @@ function DollPushStatus() {
           {last.why}
         </p>
       )}
-      {st.addresses?.length > 0 && (
-        <p className="text-meta leading-relaxed text-ink-faint">
-          这台机器自己看到的局域网地址：
-          {st.addresses.map((a) => (
+      {/*
+        整块牌子里最要紧的一段：地址到底该填什么。
+
+        曾经这里写的是「填这台机器自己看到的局域网地址」—— 那只在后端跑在
+        自己电脑上时成立。**后端在 VPS 上时那句话是错的**：机器自己看到的是
+        机房内网地址（172.x / 10.x 那种），手机永远连不上，照着填只会继续
+        一点反应都没有。实机上就这么把人带沟里过。
+
+        现在改成从**浏览器这头**回答：你此刻正用哪个地址访问控制台，手机要连的
+        就填哪个 —— 手机浏览器打得开控制台的地址，就是手机推得到的地址。
+        这条对本机、局域网、VPS、隧道一律成立，不用先问「你部署在哪」。
+      */}
+      <DollAddressHint port={st.port} addresses={st.addresses} onFill={onFill} />
+    </div>
+  );
+}
+
+/** 这个地址是内网/保留段吗（手机从外面连不上的那种）。 */
+function isPrivateHost(host) {
+  const m = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(String(host ?? ""));
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a === 10 || a === 127) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  // 100.64/10 是运营商级 NAT，Tailscale 也用这一段
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+/**
+ * 「手机要连的地址该填什么」。
+ *
+ * 答案从浏览器这头来：`location.origin` 就是**当前这台设备能打开控制台的
+ * 地址**。推送要的正是「手机能打到的地址」，两者是同一个问题。
+ */
+function DollAddressHint({ port, addresses, onFill }) {
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  const host = typeof window === "undefined" ? "" : window.location.hostname;
+  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
+
+  return (
+    <div className="grid grid-cols-1 gap-2 text-meta leading-relaxed text-ink-faint">
+      {isLocal ? (
+        <p>
+          <strong className="text-warn">你现在是用 localhost 打开控制台的</strong>
+          ，所以这儿替你断定不了该填什么 ——
+          <code className="mx-1 bg-sunken px-1">localhost</code>
+          是「这台机器自己」，手机连不上它。
+          <br />
+          办法：先在<strong className="text-ink-soft">手机浏览器</strong>
+          里打开你的控制台（本机部署就用局域网 IP，VPS 就用公网地址）， 打得开的那个地址
+          <strong className="text-ink-soft">原样填到上面</strong>
+          —— 手机打得开控制台，就说明手机推得到这儿。
+        </p>
+      ) : (
+        <>
+          <p>
+            <strong className="text-ink-soft">你现在正用这个地址访问控制台：</strong>
+            <code className="mx-1 bg-sunken px-1">{origin}</code>
+            <br />
+            手机要连的地址就填它。判据很简单：
+            <strong className="text-ink-soft">手机浏览器打得开控制台的地址，就是手机推得到的地址。</strong>
+          </p>
+          <div>
+            <Button variant="outline" onClick={() => onFill?.(origin)}>
+              照这个填
+            </Button>
+          </div>
+        </>
+      )}
+      {addresses?.length > 0 && (
+        <p>
+          （参考）后端这台机器自己看到的网卡地址：
+          {addresses.map((a) => (
             <code key={a} className="mx-1 bg-sunken px-1">
-              {a}:{st.port}
+              {a}:{port}
             </code>
           ))}
           <br />
-          手机在同一个 WiFi 下的话，上面「手机要连的地址」就该是其中一个。
-          <strong className="text-ink-soft">别填 localhost</strong>
-          ——那是这台机器自己，手机连不上。
+          后端跑在<strong className="text-ink-soft">你自己电脑</strong>上、手机连同一个 WiFi 时，
+          填的就该是这里面那个 <code className="mx-1 bg-sunken px-1">192.168.*</code> 之类的地址。
+          {addresses.every(isPrivateHost) && (
+            <>
+              <br />
+              <strong className="text-warn">但要注意：上面这些全是内网地址。</strong>
+              后端要是跑在 <strong className="text-ink-soft">VPS</strong> 上，这里看到的是机房内网
+              （<code className="mx-1 bg-sunken px-1">172.*</code>、
+              <code className="mx-1 bg-sunken px-1">10.*</code> 那种），
+              <strong className="text-ink-soft">手机永远连不上</strong>
+              —— 这种情况要填的是 VPS 的<strong className="text-ink-soft">公网地址</strong>，
+              也就是上面那条「你现在正用的地址」。
+            </>
+          )}
         </p>
       )}
     </div>
@@ -2843,7 +2926,7 @@ function DollPushFields({ doll, updateDollApi }) {
 
   return (
     <>
-      <DollPushStatus />
+      <DollPushStatus onFill={(u) => updateDollApi({ pushUrl: u })} />
       <div>
         <p className="text-ui text-ink">手机那头（所有角色共用）</p>
         <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
