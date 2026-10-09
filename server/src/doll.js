@@ -909,24 +909,8 @@ export function feedDollSamples(state, page, opts = DOLL_DEFAULTS) {
        * 可能只是一个毛刺（高采样率下一次真实的拥抱会有成百上千个活跃样本，
        * 这里只要求 3 个，纯粹是挡单点跳变）。
        */
-      if (heldMs >= o.minHoldMs && state.activeHits >= 3) {
-        out.push({ durationMs: Math.round(heldMs), peak: state.peak });
-      } else {
-        /*
-         * **用人话说，而且是 logInfo。** 以前这里是 debug 级别、一串术语：
-         * 用户只看到一行「抱起来了」，之后再也没下文，以为是卡住了 ——
-         * 其实那一下早就结束了，只是被判成「碰了一下」。实机上就这么卡过。
-         */
-        const sec = (heldMs / 1000).toFixed(1);
-        const need = (o.minHoldMs / 1000).toFixed(1);
-        logInfo(
-          "共感娃娃",
-          `刚才那一下不算抱：只持续了 ${sec} 秒（要 ${need} 秒以上才算），多半是拿起放下或者碰了一下。` +
-            `要是你确实抱了却被这样判掉，去控制台「共感娃娃」里做一下两步校准`
-        );
-      }
-      const session = state.session;
-      resetDoll(state, session);
+      const hug = settleHold(state, o);
+      if (hug) out.push(hug);
       state.since = s.t;
     }
   }
@@ -935,6 +919,67 @@ export function feedDollSamples(state, page, opts = DOLL_DEFAULTS) {
   const lastT = samples[samples.length - 1].t;
   if (state.since == null || lastT > state.since) state.since = lastT;
   return out;
+}
+
+/**
+ * 结算一次「抱着」：够格就返回那次拥抱，不够格就用人话说一声。两种都把状态清掉。
+ *
+ * 两处会走到这儿：样本里看到「安静够久了」（feedDollSamples），以及推送模式下
+ * **手机不再发数据了**（flushSilentHold）。逻辑必须是同一份，不然两条路判出来
+ * 的结果会不一样。
+ *
+ * @returns {{durationMs:number, peak:number} | null}
+ */
+function settleHold(state, o) {
+  const heldMs = (state.activeT - state.startT) * 1000;
+  let hug = null;
+  /*
+   * 太短的不算。两道闸：**抱着的时长**不到 minHoldMs，或者活跃样本少到
+   * 可能只是一个毛刺（高采样率下一次真实的拥抱会有成百上千个活跃样本，
+   * 这里只要求 3 个，纯粹是挡单点跳变）。
+   */
+  if (heldMs >= o.minHoldMs && state.activeHits >= 3) {
+    hug = { durationMs: Math.round(heldMs), peak: state.peak };
+  } else {
+    /*
+     * **用人话说，而且是 logInfo。** 以前这里是 debug 级别、一串术语：
+     * 用户只看到一行「抱起来了」，之后再也没下文，以为是卡住了 ——
+     * 其实那一下早就结束了，只是被判成「碰了一下」。实机上就这么卡过。
+     */
+    const sec = (heldMs / 1000).toFixed(1);
+    const need = (o.minHoldMs / 1000).toFixed(1);
+    logInfo(
+      "共感娃娃",
+      `刚才那一下不算抱：只持续了 ${sec} 秒（要 ${need} 秒以上才算），多半是拿起放下或者碰了一下。` +
+        `要是你确实抱了却被这样判掉，去控制台「共感娃娃」里做一下两步校准`
+    );
+  }
+  const keep = state.since;
+  resetDoll(state, state.session);
+  state.since = keep;
+  return hug;
+}
+
+/**
+ * 推送模式下，手机**不再发数据**了，但状态还停在「抱着」—— 就地结算。
+ *
+ * 判「放下了」靠的是**收到**几秒安静的样本。可用户抱完顺手点了 phyphox 的
+ * 停止键、或者切了后台，后面就一包都不来了，于是那次拥抱永远等不到结算。
+ * 实机上就是「抱完点右上角的停止，也还是没有反应」。
+ *
+ * 所以按墙上的钟算：最后一包是 `silentMs` 之前到的、而且还在「抱着」，
+ * 就当是放下了。结算规则和平常完全一样（settleHold）。
+ *
+ * @param {number} lastPushAt 最后一包到达的时刻（Date.now() 口径）
+ * @param {number} silentMs 多久没收到算「手机不发了」
+ * @returns {{durationMs:number, peak:number} | null}
+ */
+export function flushSilentHold(state, opts, lastPushAt, silentMs, now = Date.now()) {
+  if (!state.holding || !lastPushAt) return null;
+  if (now - lastPushAt < silentMs) return null;
+  const o = { ...DOLL_DEFAULTS, ...opts };
+  logInfo("共感娃娃", "手机那边停了（不再发数据），把刚才那次当成已经放下来结算");
+  return settleHold(state, o);
 }
 
 /**

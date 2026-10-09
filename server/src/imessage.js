@@ -138,6 +138,7 @@ import {
   createDollState,
   feedDollSamples,
   fetchDollSamples,
+  flushSilentHold,
   renderHugLine,
   shouldTryStart,
   startDollMeasuring,
@@ -5319,6 +5320,7 @@ const dollWatcher = {
   busy: false,
   state: createDollState(), // 状态机，见 doll.js:feedDollSamples
   err: { why: "", at: 0 }, // 连不上时的日志节流
+  lastPushAt: 0, // 推送模式下最后一包到的时刻，判「手机不发了」用（见 hugTick）
 };
 
 /** 整个进程的娃娃轮询日志都走这个分类（不属于哪条线路）。 */
@@ -5354,14 +5356,13 @@ function armHug(getConfig) {
       logError(HUG_SCOPE, "娃娃心跳出错，下一跳再看", e);
     }
     /*
-     * 所有连接都停了就别再排下一跳 —— 否则 Ctrl+C 之后这条定时器还在，
-     * 而它是 unref 过的，进程该退还是能退，但日志会继续刷。下次有连接
-     * 起来时 armHug 会重新把它开起来，所以这里得把标志放掉。
+     * 停没停只看 running 标志（stopAllBridges → stopDollWatcher 会放掉它）。
+     *
+     * 以前还加了一条「一条连接都没有就停」。推送模式下这不对：推送口不依赖
+     * iMessage 连接，连接还没起来、或者在本地起后端做自测时，手机照样在推，
+     * 「手机不发了就结算」这件事照样得有人盯。定时器是 unref 过的，不挡进程退出。
      */
-    if (!dollWatcher.running || !runners.size) {
-      dollWatcher.running = false;
-      return;
-    }
+    if (!dollWatcher.running) return;
     dollWatcher.timer = setTimeout(() => void loop(), wait);
     dollWatcher.timer.unref?.();
   };
@@ -5399,7 +5400,28 @@ async function hugTick(getConfig) {
    * 中间那段时间的 `since` 还留着，第一跳会把这段时间里积的几万个样本一口气
    * 读回来，变成一次「抱了二十分钟」。
    */
-  if (!api.enabled || !api.host || !listeners.length || api.mode === "push") {
+  /*
+   * **推送模式下这条循环绝对不能碰状态机。**
+   *
+   * 两种模式共用 dollWatcher.state。这里原先把 `mode === "push"` 也算进
+   * 「闸没过」那一堆，顺手把状态清掉 —— 于是推送模式下每 5 秒状态就被抹一次：
+   * 刚认出「有动静了」，没等到「放下」就被清空，永远结算不了。实机日志就是
+   * 一串「有动静了」，每行隔 5~6 秒，后面既没有「被抱了一下」也没有「不算抱」。
+   *
+   * 推送模式下这条循环只干一件事：手机不发数据了、状态还停在「抱着」，
+   * 就地结算（见 doll.js:flushSilentHold）。
+   */
+  if (api.mode === "push") {
+    // 没人在听也照样结算（和推送口一个规矩），分发那边会说「没人在听」
+    if (api.enabled) {
+      const silentMs = Math.max(api.quietMs ?? 4000, 2000) + (api.pushInterval ?? 2) * 1000 * 2;
+      const hug = flushSilentHold(dollWatcher.state, api, dollWatcher.lastPushAt, silentMs);
+      if (hug) dispatchHugs(getConfig, [hug], listeners);
+    }
+    return 1_000;
+  }
+
+  if (!api.enabled || !api.host || !listeners.length) {
     if (dollWatcher.state.since != null) dollWatcher.state = createDollState();
     return HUG_IDLE_MS;
   }
@@ -5478,6 +5500,11 @@ async function hugTick(getConfig) {
  * @returns {Promise<{hugs:number, listeners:number}>} 这包认出几次拥抱、递给了几个角色
  */
 export function handleDollPush(getConfig, payload) {
+  /*
+   * 盯「手机不发了」的那条循环平时由 iMessage 连接起来时带起来。推送口不依赖
+   * 连接，所以这里也带一下 —— 已经在跑就什么都不做。
+   */
+  armHug(getConfig);
   const config = getConfig();
   const api = config.dollApi ?? {};
   const listeners = hugListeners(config);
@@ -5505,6 +5532,7 @@ export function handleDollPush(getConfig, payload) {
    * **喂状态机这一步是同步的，就在请求里做完。** 它很快，而且只有这样才能
    * 保证「按到达顺序喂」—— 中间一旦 await，下一个请求就会插进来改同一份状态。
    */
+  dollWatcher.lastPushAt = Date.now();
   const hugs = feedDollSamples(
     dollWatcher.state,
     { session: "push", measuring: true, samples: payload.samples, cover: payload.cover },
@@ -5524,6 +5552,14 @@ export function handleDollPush(getConfig, payload) {
    * 所以这里排进一条链就撒手，HTTP 立刻回 200。链是为了让几次拥抱按顺序
    * 递，而不是一拥而上。
    */
+  dispatchHugs(getConfig, hugs, listeners);
+  return { hugs: hugs.length, listeners: listeners.length };
+}
+
+/**
+ * 把认出来的几次拥抱排进递送链。推送口和「手机不发了」的结算共用这一份。
+ */
+function dispatchHugs(getConfig, hugs, listeners) {
   if (hugs.length && !listeners.length) {
     /*
      * 认出来了却没人听。这**不是**调试信息，是用户会真撞上的一种：角色那边
@@ -5540,7 +5576,6 @@ export function handleDollPush(getConfig, payload) {
         .catch((e) => logError(scopeOf(runner, "共感娃娃"), "递送拥抱时出错", e));
     }
   }
-  return { hugs: hugs.length, listeners: listeners.length };
 }
 
 /**

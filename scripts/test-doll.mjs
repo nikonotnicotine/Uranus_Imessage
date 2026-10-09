@@ -62,6 +62,7 @@ const {
   feedDollSamples,
   fetchDollConfig,
   fetchDollSamples,
+  flushSilentHold,
   guessDollBuffers,
   hugDuration,
   hugStrength,
@@ -441,6 +442,24 @@ console.log("\n两步校准：替用户算阈值");
   const bad = suggestThresholds(summarizeCalib([0.5, 0.6]), summarizeCalib([0.7]));
   check("分不开 → ok=false", bad.ok, false);
   checkThat("并且说明了原因", bad.note.includes("差别不大"), bad.note);
+}
+
+console.log("\n手机不发数据了，还停在「抱着」—— 就地结算");
+{
+  const st = createDollState();
+  跑一遍(st, flow(0, 0.05, [4.0, ...held(40)])); // 抱了两秒，然后手机停了
+  const t0 = 1_000_000;
+  check("刚停没多久，不结算", flushSilentHold(st, DOLL_DEFAULTS, t0, 6000, t0 + 3000), null);
+  checkThat("还算抱着", st.holding);
+  const hug = flushSilentHold(st, DOLL_DEFAULTS, t0, 6000, t0 + 7000);
+  checkThat("停够久了，结算出一次", Boolean(hug), JSON.stringify(hug));
+  checkThat("时长按最后一个活跃样本算", hug?.durationMs >= 1900, JSON.stringify(hug));
+  checkThat("结算完回到空闲", !st.holding);
+  check("没在抱着就什么都不做", flushSilentHold(createDollState(), DOLL_DEFAULTS, t0, 6000, t0 + 99999), null);
+  // 太短的照样按老规矩判掉，不因为「手机停了」就放水
+  const st2 = createDollState();
+  跑一遍(st2, flow(0, 0.05, [4.0, 0.6, 0.6]));
+  check("太短的照样不算", flushSilentHold(st2, DOLL_DEFAULTS, t0, 6000, t0 + 7000), null);
 }
 
 console.log("\n「还抱着」阈值比噪声低时要提醒");

@@ -293,6 +293,48 @@ checkThat("「抱着」读到了峰值", c.hug?.peak >= 3.4, JSON.stringify(c.hu
 checkThat("两步做完给出建议", Boolean(c.suggestion), "");
 checkThat("建议的「抱起来」落在放着和抱着之间", c.suggestion.start > c.still.peak && c.suggestion.start < c.hug.peak, JSON.stringify(c.suggestion));
 
+/* ================= 10. 抱得久一点，状态不能被后台抹掉 ================= */
+
+console.log("\n=== 10. 一次持续好几秒的拥抱，中途状态不能被清掉 ===");
+/*
+ * 实机 bug：后台那条给「后端去读手机」用的循环每秒~5 秒跑一次，在推送模式下
+ * 会把共用的状态整个清掉。于是一抱就被抹，日志里只有一串「有动静了」、
+ * 永远等不到结算。以前的测试没抓到，是因为推送几包挨得太近（不到 1 秒），
+ * 那条循环还没来得及跑。这里按真实节奏推：每秒一包、跨好几秒。
+ */
+let t10 = 300;
+const tick = async (vals) => {
+  const r2 = await push(seg(t10, vals));
+  t10 += vals.length * 0.05;
+  await sleep(1000);
+  return r2;
+};
+await tick(quiet(20));
+await tick([4.0, ...held(19)]);
+for (let i = 0; i < 6; i++) await tick(held(20)); // 抱着 6 秒，真实时间也过了 6 秒
+r = await tick(quiet(20)); // 放下（quietMs 压到了 600ms，一包就够）
+check("抱了好几秒，放下之后照样结算出一次", r.body?.hugs, 1);
+
+/* ================= 11. 抱完就点了停止（手机不再发数据） ================= */
+
+console.log("\n=== 11. 抱完点了停止，后面一包都不来了，也得结算 ===");
+/*
+ * 实机原话：「抱完点右上角的停止，也还是没有反应」。判「放下了」要收到几秒
+ * 安静的数据，手机停了就永远收不到。现在按墙上的钟算：手机好几秒不发了、
+ * 状态还停在「抱着」，就当放下了来结算。
+ */
+const before = logText().length;
+await push(seg(t10, [4.0, ...held(39)])); // 抱起来、抱着，然后——
+// 什么都不再推（相当于点了停止）。silentMs = max(600, 2000) + 2×2000 = 6 秒
+await sleep(8000);
+const after = logText().slice(before);
+checkThat("报了「手机那边停了，当成已经放下」", after.includes("手机那边停了"), after.slice(-300));
+checkThat(
+  "而且确实结算出了一次拥抱（本地没人听，所以是「认出 1 次…没有角色在听」）",
+  after.includes("认出 1 次拥抱"),
+  after.slice(-300)
+);
+
 /* ================= 收尾 ================= */
 
 server.kill();
