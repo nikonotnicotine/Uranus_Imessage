@@ -31,7 +31,7 @@ import { offlineMediaUrl, uploadOfflineAvatar } from "../offlinemedia.js";
 import { SaveBar, useSection } from "../section.jsx";
 import { RoleMcpFields } from "./mcp.jsx";
 import { RoleOrderFields } from "./order.jsx";
-import { api, useConfig } from "../store.jsx";
+import { api, apiDownload, useConfig } from "../store.jsx";
 import { Button, Card, Field, Fold, Modal, NumberField, ResultNote, Switch, inputCls } from "../ui.jsx";
 import {
   Brain,
@@ -2665,76 +2665,6 @@ function DollTestButton({ doll, updateDollApi }) {
   );
 }
 
-/**
- * 「校准」：连着读几秒，报这几秒里的峰值和均值。
- *
- * 那两个阈值跟手机型号、玩偶厚度、放的姿势都有关，纸上定不出来。用法是测
- * **两次**：玩偶放着不动测一次看均值（噪声底），抱着测一次看峰值，然后把
- * 「抱起来算几」填在两者之间。所以这里把两个数都报出来，并且给一个
- * 「照这个填」—— 按刚测到的峰值取六成当「抱起来」，那个比例是经验值，
- * 真要紧的是用户能看到自己的数。
- */
-function DollCalibrateButton({ doll, updateDollApi }) {
-  const [state, setState] = useState(null);
-  const host = String(doll.host ?? "").trim();
-  const ready = host && String(doll.magnitude ?? "").trim() && String(doll.time ?? "").trim();
-  const run = async () => {
-    setState({ busy: true });
-    try {
-      const r = await api("/api/doll/calibrate", {
-        method: "POST",
-        body: {
-          host,
-          magnitude: doll.magnitude,
-          time: doll.time,
-          cover: doll.cover,
-          seconds: 6,
-          intervalMs: doll.intervalMs,
-        },
-      });
-      setState({ ok: true, info: r });
-    } catch (e) {
-      setState({ ok: false, msg: String(e?.message ?? e) });
-    }
-  };
-  const info = state?.ok ? state.info : null;
-
-  return (
-    <div className="grid grid-cols-1 gap-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <Button variant="outline" onClick={run} disabled={state?.busy || !ready}>
-          {state?.busy ? "读着…（6 秒）" : "校准：读 6 秒"}
-        </Button>
-        {info && (
-          <Button
-            variant="outline"
-            onClick={() =>
-              updateDollApi({
-                // 峰值的六成当「抱起来」，噪声底的三倍当「还抱着」（至少 0.1）
-                start: Math.max(0.2, Number((info.peak * 0.6).toFixed(2))),
-                hold: Math.max(0.1, Number((info.avg * 3).toFixed(2))),
-              })
-            }
-          >
-            照这次测的填
-          </Button>
-        )}
-      </div>
-      {state && !state.busy && (
-        <ResultNote
-          state={state.ok ? "ok" : "fail"}
-          message={
-            state.ok
-              ? `${info.samples} 个样本：峰值 ${info.peak}、均值 ${info.avg}${
-                  info.cover ? `，遮挡 ${info.cover.min}~${info.cover.max}` : ""
-                }`
-              : state.msg
-          }
-        />
-      )}
-    </div>
-  );
-}
 
 /**
  * 推送模式那一块：手机按我们生成的实验文件，自己定时 POST 过来。
@@ -2748,7 +2678,10 @@ function DollCalibrateButton({ doll, updateDollApi }) {
  * wiki 自己搓一份还要把地址和密钥填对，等于劝退。
  */
 /**
- * 推送模式的两步校准。
+ * 两步校准（两种模式通用）。
+ *
+ * 推送模式下后端截住接下来几秒推过来的数据；拉模式下后端自己去读手机几秒。
+ * 两边结果放在同一个地方，这里只管「每秒问一次读完没」，所以面板是一套。
  *
  * 实机上用户的原话是「我不懂物理也不懂这些数字是什么意思」。所以这里不让人
  * 看波形、不让人自己填数：只做两件事 —— 放着、抱着 —— 剩下的后端算
@@ -2757,7 +2690,7 @@ function DollCalibrateButton({ doll, updateDollApi }) {
  * 后端那边是个「录音窗口」：点了之后截住接下来几秒推过来的样本。所以
  * 点完按钮要**手机那头在推**（phyphox 前台开着、点了播放）才读得到东西。
  */
-function DollPushCalib({ updateDollApi }) {
+function DollCalib({ updateDollApi }) {
   const [st, setSt] = useState(null);
   const [err, setErr] = useState("");
   const [filled, setFilled] = useState(false);
@@ -2799,7 +2732,9 @@ function DollPushCalib({ updateDollApi }) {
         {label}：读到 {r.count} 个数，最大晃到 <strong className="text-ink-soft">{r.peak}</strong>
       </span>
     ) : (
-      <span className="text-warn">{label}：一个数都没收到 —— phyphox 在前台开着、点了播放吗？</span>
+      <span className="text-warn">
+        {label}：{r.error || "一个数都没收到 —— phyphox 在前台开着、点了播放吗？"}
+      </span>
     );
 
   const sug = st?.suggestion;
@@ -2859,6 +2794,7 @@ function DollPushCalib({ updateDollApi }) {
 }
 
 function DollPushFields({ doll, updateDollApi }) {
+  const [dlErr, setDlErr] = useState("");
   const url = String(doll.pushUrl ?? "").trim();
   const secret = String(doll.pushSecret ?? "").trim();
   const ready = url && secret;
@@ -2975,15 +2911,34 @@ function DollPushFields({ doll, updateDollApi }) {
           <Button
             variant="outline"
             disabled={!ready}
-            onClick={() => {
-              // 直接让浏览器去下载：这个接口回的是文件流，不是 JSON
-              window.location.href = "/api/doll/experiment";
+            onClick={async () => {
+              /*
+               * 走 apiDownload（fetch + blob），不要 `location.href = …`。
+               *
+               * 整页跳转在桌面版没问题（控制台和后端同源，浏览器自动带登录态）；
+               * 小手机的控制台在 pages.dev、后端在用户自己的 Worker 上，跳转要靠
+               * Service Worker 截住导航请求再转发 —— 那条路在 iPhone Safari 上没人
+               * 验证过，失败了整页会变成一屏 JSON。apiDownload 走的是普通 fetch，
+               * 备份导出就用它，两边都验证过；出错也能在这儿报出原因。
+               */
+              setDlErr("");
+              try {
+                await apiDownload("/api/doll/experiment", {}, "uranus-hug.phyphox");
+              } catch (e) {
+                setDlErr(String(e?.message ?? e));
+              }
             }}
           >
             下载实验文件
           </Button>
           {!ready && <span className="text-meta text-ink-faint">先把地址和密钥填上</span>}
         </div>
+        {dlErr && <p className="text-meta text-warn">{dlErr}</p>}
+        <p className="text-meta leading-relaxed text-ink-faint">
+          <strong className="text-ink-soft">下载前先保存</strong>
+          —— 实验文件是按<strong className="text-ink-soft">已保存</strong>的地址和密钥生成的，
+          改了没保存就下，拿到的还是旧的。
+        </p>
         <p className="text-meta leading-relaxed text-ink-faint">
           <strong className="text-warn">这个文件里带着上面那串密钥</strong>
           ，等于一把钥匙，别发给别人。改了地址、密钥、采样率之后要
@@ -3245,35 +3200,19 @@ function RoleHugFields({ role }) {
               <p className="text-ui text-ink">怎么算一次拥抱</p>
               <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
                 默认值是按「手机塞在玩偶里、人把玩偶抱起来」估的，不一定合你那只。
-                {doll.mode === "push" ? (
-                  <>
-                    不用看懂下面这些数字 —— 用下面的
-                    <strong className="text-ink-soft">两步校准</strong>
-                    ：先让娃娃放着读一次，再抱着读一次，这边自己把数算出来填好。
-                  </>
-                ) : (
-                  <>
-                    调法：把玩偶
-                    <strong className="text-ink-soft">放着不动</strong>
-                    校准一次，看<strong className="text-ink-soft">均值</strong>（那是噪声底）；
-                    <strong className="text-ink-soft">抱着</strong>
-                    再校准一次，看<strong className="text-ink-soft">峰值</strong>。
-                    「抱起来」填在两者之间，「还抱着」填得比噪声底高一点。
-                  </>
-                )}
+                不用看懂下面这些数字 —— 用下面的
+                <strong className="text-ink-soft">两步校准</strong>
+                ：先让娃娃放着读一次，再抱着读一次，这边自己把数算出来填好。
               </p>
             </div>
 
             {/*
-              校准按钮是「连着读几秒」，只有拉模式做得到 —— 推模式下后端没法
-              主动问手机要数据。那边改成看手机上那张实时波形图（生成的实验
-              文件里就带着一张），效果一样直观。
+              两种模式共用一套两步校准：推送模式截住推过来的数据，拉模式后端
+              自己去读，结果放在同一处（见 index.js 的 /api/doll/calib）。
+              以前拉模式是单步、让人自己看峰值均值去填 —— 用户原话「我不懂物理
+              也不懂这些数字是什么意思」，所以两边都改成这边算。
             */}
-            {doll.mode === "push" ? (
-              <DollPushCalib updateDollApi={updateDollApi} />
-            ) : (
-              <DollCalibrateButton doll={doll} updateDollApi={updateDollApi} />
-            )}
+            <DollCalib updateDollApi={updateDollApi} />
 
             <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
               <NumberField

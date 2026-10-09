@@ -329,6 +329,75 @@ checkThat(
   after.slice(-300)
 );
 
+/* ================= 12. 拉模式也能两步校准 ================= */
+
+console.log("\n=== 12. 「后端去读手机」模式下的两步校准 ===");
+/*
+ * 用户问：「为什么本地部署的共感娃娃没有校准模式？」—— 拉模式以前只有单步、
+ * 让人自己看峰值均值去填。现在两种模式共用一套两步校准，拉模式下由后端自己
+ * 去读手机。这里起一台假 phyphox（会按真实时间往 buffer 里攒样本），把配置切到
+ * 拉模式指向它，走真接口校准一遍。
+ */
+{
+  const http = await import("node:http");
+  let level = 0.03;
+  const t0p = Date.now();
+  const buf = [];
+  const tickP = setInterval(() => buf.push({ t: (Date.now() - t0p) / 1000, a: level }), 50);
+  const phone = http.createServer((q, s) => {
+    const u = new URL(q.url, "http://x");
+    s.setHeader("Content-Type", "application/json");
+    const since = u.searchParams.get("acc_time");
+    const rows = since ? buf.filter((x) => x.t > Number(since)) : buf.slice(-1);
+    s.end(
+      JSON.stringify({
+        buffer: { acc: { buffer: rows.map((x) => x.a) }, acc_time: { buffer: rows.map((x) => x.t) } },
+        status: { session: "p", measuring: true, timedRun: false, countDown: 0 },
+      })
+    );
+  });
+  await new Promise((r) => phone.listen(0, "127.0.0.1", r));
+  const phoneHost = `127.0.0.1:${phone.address().port}`;
+
+  // 配置切到拉模式
+  const cfg = await (await fetch(`${base}/api/config`, { headers: { Cookie: cookie } })).json();
+  const conf = cfg.config ?? cfg;
+  conf.dollApi = { ...conf.dollApi, enabled: true, mode: "pull", host: phoneHost, magnitude: "acc", time: "acc_time" };
+  const put = await fetch(`${base}/api/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify(conf),
+  });
+  check("切到拉模式", put.status, 200);
+
+  const calibPull = async (kind) => {
+    const r2 = await fetch(`${base}/api/doll/calib`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ kind, seconds: 3 }),
+    });
+    check(`拉模式开始校准「${kind}」`, r2.status, 200);
+    await sleep(4000);
+    return (await fetch(`${base}/api/doll/calib`, { headers: { Cookie: cookie } })).json();
+  };
+
+  level = 0.03;
+  let cp = await calibPull("still");
+  checkThat("拉模式「放着」读到了数", cp.still?.count > 10, JSON.stringify(cp.still));
+  checkThat("读完不再显示「正在读」", cp.active === null, JSON.stringify(cp.active));
+
+  level = 3.5;
+  cp = await calibPull("hug");
+  checkThat("拉模式「抱着」读到了峰值", cp.hug?.peak >= 3.5, JSON.stringify(cp.hug));
+  checkThat("两步做完给出建议", Boolean(cp.suggestion?.start), JSON.stringify(cp.suggestion));
+
+  // 手机连不上时，结果里要带着原因，而不是一个干巴巴的 0
+  phone.close();
+  clearInterval(tickP);
+  cp = await calibPull("still");
+  checkThat("读不成时把原因带回来", Boolean(cp.still?.error), JSON.stringify(cp.still));
+}
+
 /* ================= 收尾 ================= */
 
 server.kill();

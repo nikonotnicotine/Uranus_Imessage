@@ -397,6 +397,8 @@ export async function calibrateDoll(host, { magnitude, time, cover = "", seconds
   let peak = 0;
   let sum = 0;
   let count = 0;
+  // 原始读数也带回去：两步校准要拿它算 p95（见 summarizeCalib），光有峰值和均值不够
+  const values = [];
   let coverMin = null;
   let coverMax = null;
   const until = Date.now() + seconds * 1000;
@@ -408,6 +410,7 @@ export async function calibrateDoll(host, { magnitude, time, cover = "", seconds
       if (s.a > peak) peak = s.a;
       sum += s.a;
       count += 1;
+      values.push(s.a);
     }
     if (page.cover != null) {
       coverMin = coverMin == null ? page.cover : Math.min(coverMin, page.cover);
@@ -427,6 +430,7 @@ export async function calibrateDoll(host, { magnitude, time, cover = "", seconds
     peak: Number(peak.toFixed(3)),
     avg: Number((sum / count).toFixed(4)),
     cover: coverMin == null ? null : { min: coverMin, max: coverMax },
+    values,
   };
 }
 

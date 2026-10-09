@@ -1459,7 +1459,7 @@ const dollCalibDone = {}; // { still?: summary, hug?: summary }
 
 /** 窗口到点了就收尾。在推送口和查询口两头都调，谁先碰到谁收。 */
 function finishDollCalib() {
-  if (!dollCalib || Date.now() < dollCalib.until) return;
+  if (!dollCalib || dollCalib.pull || Date.now() < dollCalib.until) return;
   const { kind, values } = dollCalib;
   dollCalibDone[kind] = summarizeCalib(values);
   dollCalib = null;
@@ -1474,15 +1474,54 @@ function finishDollCalib() {
 
 app.post("/api/doll/calib", (req, res) => {
   const api = loadConfig()?.dollApi ?? {};
-  if (!api.enabled || api.mode !== "push") {
-    return res.status(400).json({ ok: false, error: "这个校准只在「手机推给后端」模式、总开关开着的时候能用" });
+  if (!api.enabled) {
+    return res.status(400).json({ ok: false, error: "先把「连手机」那个总开关打开" });
   }
+  const pull = api.mode !== "push";
+  if (pull && (!String(api.host ?? "").trim() || !api.magnitude || !api.time)) {
+    return res.status(400).json({ ok: false, error: "先把手机地址和那两个 buffer 名填上（点一下「测试连接」能自动填）" });
+  }
+  if (dollCalib) return res.status(409).json({ ok: false, error: "上一步还在读，等它读完" });
+
   const kind = req.body?.kind === "hug" ? "hug" : "still";
-  // 默认 8 秒：手机两秒一包，丢掉第一包之后还能收到三包
+  // 默认 8 秒：推送模式下手机两秒一包，丢掉第一包之后还能收到三包
   const seconds = Math.min(Math.max(Number(req.body?.seconds) || 8, 3), 20);
-  dollCalib = { kind, until: Date.now() + seconds * 1000, values: [], skipFirst: true };
+  const label = kind === "still" ? "放着别动" : "抱着";
   delete dollCalibDone[kind];
-  logInfo("共感娃娃", `开始校准「${kind === "still" ? "放着别动" : "抱着"}」，读 ${seconds} 秒`);
+  logInfo("共感娃娃", `开始校准「${label}」，读 ${seconds} 秒`);
+
+  if (!pull) {
+    dollCalib = { kind, until: Date.now() + seconds * 1000, values: [], skipFirst: true };
+    return res.json({ ok: true, kind, seconds });
+  }
+
+  /*
+   * 拉模式（后端去读手机）：后端自己去读这几秒，读完把结果放进同一个地方。
+   *
+   * 后台跑、不让这个请求干等：前端那边和推送模式共用一套「每秒问一次读完没」，
+   * 两种模式长得一样，面板不用分两套。读的办法和以前那个单步校准一样
+   * （calibrateDoll），只是现在拿原始读数去算 p95，而不是让用户自己看峰值均值。
+   */
+  dollCalib = { kind, until: Date.now() + seconds * 1000, pull: true };
+  calibrateDoll(api.host, {
+    magnitude: api.magnitude,
+    time: api.time,
+    cover: api.cover,
+    seconds,
+    intervalMs: api.intervalMs,
+  })
+    .then((r) => {
+      dollCalibDone[kind] = summarizeCalib(r.values);
+      logInfo("共感娃娃", `校准「${label}」读完了：${r.samples} 个样本，最大晃到 ${dollCalibDone[kind].peak}`);
+    })
+    .catch((e) => {
+      const error = String(e?.message ?? e);
+      dollCalibDone[kind] = { count: 0, peak: 0, avg: 0, p90: 0, p95: 0, error };
+      logWarn("共感娃娃", `校准「${label}」没读成：${error}`);
+    })
+    .finally(() => {
+      dollCalib = null;
+    });
   res.json({ ok: true, kind, seconds });
 });
 
@@ -1567,7 +1606,7 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
    */
   // 校准窗口开着就抄一份（见 dollCalib 的注释；开窗后第一包丢掉）
   finishDollCalib();
-  if (dollCalib) {
+  if (dollCalib && !dollCalib.pull) {
     if (dollCalib.skipFirst) dollCalib.skipFirst = false;
     else for (const x of parsed.samples) dollCalib.values.push(x.a);
   }
@@ -1682,40 +1721,6 @@ app.post("/api/doll/test", async (req, res) => {
   } catch (e) {
     const error = String(e?.message ?? e);
     logWarn("共感娃娃", `连不上手机上的 phyphox：${error}`);
-    res.status(400).json({ ok: false, error });
-  }
-});
-
-/**
- * 共感娃娃的校准：连着读几秒，报这几秒里的峰值和均值。
- *
- * 为什么非要有这个：那两个阈值（多大算「抱起来」、多小算「放下了」）跟手机型号、
- * 玩偶厚度、放的姿势都有关，纸上定不出来。用法是测两次 —— 把玩偶放着不动测
- * 一次看**均值**（那是噪声底），抱着测一次看**峰值**，然后把「抱起来」填在
- * 两者之间。面板上的说明就是这么写的。
- *
- * 串行读、一次一跳：phyphox 那个服务器是单线程的，并发打只会让它越来越慢
- * （见 doll.js 文件头）。
- */
-app.post("/api/doll/calibrate", async (req, res) => {
-  const host = String(req.body?.host ?? "").trim();
-  const magnitude = String(req.body?.magnitude ?? "").trim();
-  const time = String(req.body?.time ?? "").trim();
-  const cover = String(req.body?.cover ?? "").trim();
-  if (!host) return res.status(400).json({ ok: false, error: "先填手机上 phyphox 显示的那个地址" });
-  if (!magnitude || !time) return res.status(400).json({ ok: false, error: "先填幅值和时间轴的 buffer 名" });
-
-  // 上限 15 秒：这是个同步等结果的接口，再长前端那边就像卡住了
-  const seconds = Math.min(Math.max(Number(req.body?.seconds) || 6, 2), 15);
-  const intervalMs = Math.min(Math.max(Number(req.body?.intervalMs) || 400, 200), 3_000);
-
-  try {
-    const out = await calibrateDoll(host, { magnitude, time, cover, seconds, intervalMs });
-    logInfo("共感娃娃", `校准 ${seconds} 秒：${out.samples} 个样本，峰值 ${out.peak}、均值 ${out.avg}`);
-    res.json({ ok: true, ...out });
-  } catch (e) {
-    const error = String(e?.message ?? e);
-    logWarn("共感娃娃", `校准没跑完：${error}`);
     res.status(400).json({ ok: false, error });
   }
 });
