@@ -1408,9 +1408,26 @@ app.post("/api/order/test", async (req, res) => {
 /** 「推过来但这边没收」那句话的节流状态，见下面那条路由。 */
 let dollPushQuiet = { why: "", at: 0 };
 
+/**
+ * 最近一次有人打推送口 —— **不管收没收下**。
+ *
+ * 这是推送模式唯一能自证「手机到底有没有连上来」的东西。实机上被这个问题
+ * 卡过两次：手机上明明点了播放，控制台一声不吭，于是开始挨个猜（开关？
+ * 密钥？阈值？引导式访问？），而真相是**请求压根没到**（地址里那个 IP 变了）。
+ *
+ * 没到和「到了但被挡下」在用户那头长得一模一样，所以这里把两种都记下来，
+ * 面板上直接显示。只在内存里：重启之后本来就该从「还没收到过」重新看起。
+ */
+let lastDollPush = null; // { at, ok, why, samples, hugs } | null
+
 app.post(DOLL_PUSH_PATH, async (req, res) => {
   const api = loadConfig()?.dollApi ?? {};
   const want = String(api.pushSecret ?? "").trim();
+  // 一进门就记一笔：收没收下另说，**到没到**本身就是最要紧的那条信息
+  const note = (ok, why = "") => {
+    lastDollPush = { at: Date.now(), ok, why, samples: 0, hugs: 0 };
+    return lastDollPush;
+  };
   if (!api.enabled || api.mode !== "push" || !want) {
     /*
      * 回 404 是故意的（别告诉扫端口的人这儿有东西），但**日志里得说明白**：
@@ -1425,6 +1442,7 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
         ? "现在是「后端去读手机」模式，没在收推送"
         : "还没生成推送密钥";
     const now = Date.now();
+    note(false, why);
     if (now - dollPushQuiet.at > 60_000 || dollPushQuiet.why !== why) {
       logWarn("共感娃娃", `手机推了一包数据过来，但这边没收：${why}（它那头会显示 404）`);
       dollPushQuiet = { why, at: now };
@@ -1435,6 +1453,7 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
   // 密钥只能走查询串（phyphox 带不了请求头），但手工测的时候用头更顺手，两样都认
   const got = String(req.query?.secret ?? req.headers["x-doll-secret"] ?? "").trim();
   if (got !== want) {
+    note(false, "密钥不对（手机上那份实验文件是不是在改密钥之前下的？）");
     logWarn("共感娃娃", "有人往推送口打了一包数据，但密钥不对");
     return res.status(403).json({ ok: false, error: "secret 不对" });
   }
@@ -1444,10 +1463,14 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
     parsed = parseDollPush(req.body);
   } catch (e) {
     const error = String(e?.message ?? e);
+    note(false, `数据看不懂：${error}`);
     logWarn("共感娃娃", `推过来的数据看不懂：${error}`);
     return res.status(400).json({ ok: false, error });
   }
-  if (!parsed.samples.length) return res.json({ ok: true, hugs: 0 });
+  if (!parsed.samples.length) {
+    note(true, "这一包是空的");
+    return res.json({ ok: true, hugs: 0 });
+  }
 
   /*
    * 同步跑完、立刻回。**不等递送** —— 那是一整轮模型调用，十几秒，
@@ -1456,11 +1479,52 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
    */
   try {
     const out = handleDollPush(loadConfig, parsed);
+    Object.assign(note(true), { samples: parsed.samples.length, hugs: out.hugs });
     res.json({ ok: true, ...out });
   } catch (e) {
     logError("共感娃娃", "处理推过来的数据时出错", e);
     res.status(500).json({ ok: false, error: String(e?.message ?? e) });
   }
+});
+
+/**
+ * 共感娃娃推送那条腿的体检：**手机到底有没有连上来。**
+ *
+ * 为什么要有：推送模式下，「手机没推」和「推了但被挡下」在用户那头长得
+ * 一模一样 —— 都是抱了没反应。实机上为这个卡过两次，一次是总开关没开
+ * （1.16.1 修了），一次是地址里那个 IP 变了，而两次都只能靠挨个猜。
+ *
+ * 所以这里回三样：
+ *
+ *  - `lastPush`：最近一次有人打那个口子，**收没收下都算**。空的 = 一个包都
+ *    没到过，那就不是配置问题，是网络那一段不通（地址错、防火墙、不同网）。
+ *  - `addresses`：这台机器自己看到的局域网地址。手机上那份实验文件里的地址
+ *    是**生成时写死的**，机器换了 IP 它不会跟着变 —— 对一眼就知道。
+ *  - 当前配置的几个关键位，省得再回去翻。
+ */
+app.get("/api/doll/status", (_req, res) => {
+  const api = loadConfig()?.dollApi ?? {};
+  /*
+   * 只列 IPv4 的非回环地址。回环（127.0.0.1）要排掉：手机连不上它，而它
+   * 恰恰是用户最容易照着填的那个 —— 控制台地址栏里就写着 localhost。
+   */
+  const addresses = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const nic of list ?? []) {
+      if (nic.family === "IPv4" && !nic.internal) addresses.push(nic.address);
+    }
+  }
+  res.json({
+    ok: true,
+    mode: api.mode === "push" ? "push" : "pull",
+    enabled: Boolean(api.enabled),
+    hasSecret: Boolean(String(api.pushSecret ?? "").trim()),
+    pushUrl: String(api.pushUrl ?? "").trim(),
+    path: DOLL_PUSH_PATH,
+    port: PORT,
+    addresses,
+    lastPush: lastDollPush,
+  });
 });
 
 /**

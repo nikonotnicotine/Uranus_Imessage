@@ -5481,20 +5481,29 @@ export function handleDollPush(getConfig, payload) {
   const config = getConfig();
   const api = config.dollApi ?? {};
   const listeners = hugListeners(config);
-  if (!listeners.length) {
-    logDebug(HUG_SCOPE, "收到一包数据，但这会儿没有角色开着共感娃娃");
-    return { hugs: 0, listeners: 0 };
-  }
 
   /*
+   * **没人在听也照样把数据喂进状态机**，只是不往外递。
+   *
+   * 一开始这里是「没听众就直接 return」，省事但有两处不对：
+   *
+   *  - 桥接掉线重连那几十秒里，样本被整包扔掉，而用户正抱着。连上之后
+   *    状态机还停在几十秒前，下一包的时间对不上，又要走一遍「是不是重来了」；
+   *  - 更要命的是**没法验证**：本地起一个后端是没有 iMessage 连接的，
+   *    于是听众永远是 0，推什么进去都石沉大海，连「认出几次拥抱」都看不到。
+   *    这个功能实机上连着踩坑却难查，有一半就是因为这条路验不了。
+   *
+   * 喂一遍很便宜（纯算术），而且状态连续才是对的。
+   *
+   * ── 另外两件事 ──
+   *
    * 推模式没有 `measuring` / `session` 可问（那两样是远程接口才有的）。
    * 能收到这包本身就说明手机在测量，所以这里直接拿 `true` 和一个固定的
    * session 喂进去 —— 换实验这件事在推模式下表现为「对方换了实验文件」，
    * 那会导致时间轴归零，状态机里有一条专门认它（见 feedDollSamples）。
    *
-   * **喂状态机这一步是同步的，就在请求里做完。** 它很快（纯算术），而且
-   * 只有这样才能保证「按到达顺序喂」—— 中间一旦 await，下一个请求就会插
-   * 进来改同一份状态。
+   * **喂状态机这一步是同步的，就在请求里做完。** 它很快，而且只有这样才能
+   * 保证「按到达顺序喂」—— 中间一旦 await，下一个请求就会插进来改同一份状态。
    */
   const hugs = feedDollSamples(
     dollWatcher.state,
@@ -5515,6 +5524,14 @@ export function handleDollPush(getConfig, payload) {
    * 所以这里排进一条链就撒手，HTTP 立刻回 200。链是为了让几次拥抱按顺序
    * 递，而不是一拥而上。
    */
+  if (hugs.length && !listeners.length) {
+    /*
+     * 认出来了却没人听。这**不是**调试信息，是用户会真撞上的一种：角色那边
+     * 开关是开的，但这条 iMessage 连接还没起来（刚启动、或者掉线重连中）。
+     * 不说的话，他抱了一下、控制台一片安静，又要从头猜一遍。
+     */
+    logWarn(HUG_SCOPE, `认出 ${hugs.length} 次拥抱，但这会儿没有角色在听（连接还没起来？角色那个开关关着？）`);
+  }
   for (const hug of hugs) {
     for (const { runner, role } of listeners) {
       if (runner.stopped) continue;

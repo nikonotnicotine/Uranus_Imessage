@@ -1,0 +1,251 @@
+/**
+ * 共感娃娃**推送模式**的整条链，对着真的服务器跑一遍。
+ *
+ * 和 `test-doll.mjs` 的分工：那边测的是纯函数（状态机、解析、文案），
+ * 这边测的是**接起来之后还通不通** —— 起一个真的 `server/src/index.js`，
+ * 下载一份真的实验文件，照着那份文件里写的地址和密钥，用一台假手机把
+ * phyphox 会发的那种 JSON 一包一包推过去，然后看服务端认不认。
+ *
+ * 为什么值得单独写一个：这个功能实机上连着踩了几次坑，而每一次都**不在**
+ * 纯函数那一层 —— 总开关在界面上点不到、推送口吊着等模型导致乱序、
+ * 实验文件里的密钥过期。这些都只有把真东西接起来才看得见。
+ *
+ * ── 这里验不到的那一段 ──
+ *
+ * 「认出拥抱之后发给角色」要有一条活着的 iMessage 连接（runner），
+ * 本地起不来。所以这个脚本到「服务端认出了几次拥抱」为止 —— 响应里的
+ * `hugs` 就是证据。再往后（排队、拼提示词、调模型）由 test-doll.mjs
+ * 和 test-proactive.mjs 那边各自盯着。
+ *
+ * URANUS_DATA_DIR 指向临时目录，绝不碰真实的 data/。
+ *
+ * 跑：node scripts/test-doll-e2e.mjs
+ */
+
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "uranus-doll-e2e-"));
+const PORT = 18900 + Math.floor(Math.random() * 90);
+const SECRET = "e2e-secret-9f3a";
+
+let pass = 0;
+let fail = 0;
+function check(name, got, want) {
+  if (JSON.stringify(got) === JSON.stringify(want)) {
+    pass += 1;
+    console.log(`  ✓ ${name}`);
+    return;
+  }
+  fail += 1;
+  console.log(`  ✗ ${name}\n      得到 ${JSON.stringify(got)}\n      期望 ${JSON.stringify(want)}`);
+}
+function checkThat(name, cond, detail = "") {
+  if (cond) {
+    pass += 1;
+    console.log(`  ✓ ${name}`);
+  } else {
+    fail += 1;
+    console.log(`  ✗ ${name}${detail ? `  ${detail}` : ""}`);
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const base = `http://127.0.0.1:${PORT}`;
+
+/* ================= 先把配置摆好，再起服务 ================= */
+
+process.env.URANUS_DATA_DIR = TMP;
+const { saveConfig, normalizeConfig } = await import("../server/src/config.js");
+saveConfig(
+  normalizeConfig({
+    dollApi: {
+      enabled: true,
+      mode: "push",
+      pushUrl: base,
+      pushSecret: SECRET,
+      pushRate: 20,
+      pushInterval: 2,
+      // 判定阈值用默认的，但把「安静多久算放下」压短，免得测试干等四秒
+      quietMs: 600,
+      minHoldMs: 500,
+    },
+    roles: [{ id: "role-1", name: "小柚", hug: { enabled: true } }],
+  })
+);
+
+console.log(`\n起一个真的后端（端口 ${PORT}，数据目录 ${TMP}）…`);
+const server = spawn(process.execPath, [path.join(ROOT, "server/src/index.js")], {
+  env: { ...process.env, URANUS_DATA_DIR: TMP, PORT: String(PORT), URANUS_IG_PORT: "off" },
+  stdio: ["ignore", "pipe", "pipe"],
+});
+const serverLog = [];
+server.stdout.on("data", (d) => serverLog.push(String(d)));
+server.stderr.on("data", (d) => serverLog.push(String(d)));
+
+/** 等后端起来。起不来就别往下跑了，否则后面全是看不懂的连接失败。 */
+async function waitUp() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      const r = await fetch(`${base}/api/health`);
+      if (r.ok) return true;
+    } catch {
+      /* 还没起来 */
+    }
+    await sleep(500);
+  }
+  return false;
+}
+if (!(await waitUp())) {
+  console.error("后端没起来，日志：\n" + serverLog.join(""));
+  server.kill();
+  fs.rmSync(TMP, { recursive: true, force: true });
+  process.exit(1);
+}
+
+/** 控制台那套登录：默认密码进去，再改一次（出厂密码只够改密码）。 */
+let cookie = "";
+async function login() {
+  const r1 = await fetch(`${base}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "Uranus", password: "Uranus" }),
+  });
+  cookie = (r1.headers.get("set-cookie") ?? "").split(";")[0];
+  const r2 = await fetch(`${base}/api/auth/change`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ username: "tester", password: "PwForE2E9981" }),
+  });
+  const c2 = (r2.headers.get("set-cookie") ?? "").split(";")[0];
+  if (c2) cookie = c2;
+}
+await login();
+
+/* ================= 1. 实验文件：真的下一份下来 ================= */
+
+console.log("\n=== 1. 下载实验文件，照它说的去连 ===");
+const expResp = await fetch(`${base}/api/doll/experiment`, { headers: { Cookie: cookie } });
+check("下载得到（200）", expResp.status, 200);
+const xml = await expResp.text();
+
+/*
+ * **从文件里把地址抠出来，而不是自己拼。** 这一条正是实机踩过的坑：手机上
+ * 那份文件里的地址和密钥是下载那一刻写死的，和当前配置对不上就一点反应
+ * 都没有。所以这里要测的就是「照着文件里写的去打，通不通」。
+ */
+const addr = /address="([^"]+)"/.exec(xml)?.[1]?.replaceAll("&amp;", "&") ?? "";
+checkThat("文件里有 address", Boolean(addr), xml.slice(0, 200));
+checkThat("地址指向我们填的那台后端", addr.startsWith(base), addr);
+checkThat("地址里带着密钥", addr.includes(SECRET), addr);
+check("推送路径是写死的那条", new URL(addr).pathname, "/doll/hug");
+
+// 采样率和间隔也该跟着配置走（这两样也是写死在文件里的）
+checkThat("采样率进了文件", xml.includes('rate="20"'), "");
+checkThat("推送间隔进了文件", xml.includes('interval="2"'), "");
+
+/* ================= 2. 一台假手机，照 phyphox 的格式推 ================= */
+
+console.log("\n=== 2. 假手机按 phyphox 的格式推数据 ===");
+
+/**
+ * 推一包。
+ *
+ * 形状完全照 phyphox 的 `http/post`：每个 `<send id>` 一个键，buffer 一律是
+ * 数组。我们生成的文件里发的就是 `acc` 和 `t` 这两样。
+ */
+async function push(samples) {
+  const r = await fetch(addr, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ acc: samples.map((s) => s.a), t: samples.map((s) => s.t) }),
+  });
+  return { status: r.status, body: await r.json().catch(() => null) };
+}
+
+/** 造一段样本：20Hz，从 t0 开始。 */
+const seg = (t0, vals) => vals.map((a, i) => ({ t: +(t0 + i * 0.05).toFixed(3), a }));
+const quiet = (n) => Array.from({ length: n }, () => 0.03);
+const held = (n) => Array.from({ length: n }, () => 0.6);
+
+let r = await push(seg(0, quiet(40)));
+check("第一包就收下了（200）", r.status, 200);
+check("静止的时候认不出拥抱", r.body?.hugs, 0);
+/*
+ * listeners 是 0：本地没有活着的 iMessage 连接，所以没有角色在听。
+ * 这不影响上面那一串 —— 服务端照样会把数据喂进状态机、照样会数拥抱。
+ */
+checkThat("本地没有活连接，所以没人在听（符合预期）", r.body?.listeners === 0, JSON.stringify(r.body));
+
+/* ================= 3. 抱一下，看认不认得出来 ================= */
+
+console.log("\n=== 3. 抱一下 ===");
+// 抱起来那一下（尖峰）+ 抱着一会儿
+r = await push(seg(2, [5.0, ...held(40)]));
+check("抱着的时候还不结算", r.body?.hugs, 0);
+// 放下：安静超过 quietMs（这份配置压到了 600ms）
+r = await push(seg(4.1, quiet(40)));
+check("放下之后结算出一次拥抱", r.body?.hugs, 1);
+
+/* ================= 4. 推送口不许吊着等 ================= */
+
+console.log("\n=== 4. 推送口得立刻回 ===");
+/*
+ * 这是 1.16.3 修的那个毛病：以前收到数据会 await 整个递送（一整轮模型调用，
+ * 十几秒），于是 phyphox 超时报「網路連線中斷」，堆积的包还会乱序涌进来。
+ * 手机是每两秒推一包的，所以响应必须远快于那个间隔。
+ */
+const t0 = Date.now();
+for (let i = 0; i < 5; i++) await push(seg(10 + i, quiet(40)));
+const perPush = (Date.now() - t0) / 5;
+checkThat(`每包平均 ${Math.round(perPush)}ms，远短于推送间隔`, perPush < 500, `${perPush}ms`);
+
+/* ================= 5. 乱序不该被当成「手机上清空了」 ================= */
+
+console.log("\n=== 5. 乱序的包不该打断正在进行的拥抱 ===");
+await push(seg(20, [5.0, ...held(40)])); // 抱起来，正抱着
+await push(seg(18, held(10))); // 一包迟到的旧数据插进来
+r = await push(seg(22.1, quiet(40))); // 放下
+check("乱序插了一包，那次拥抱照样认得出来", r.body?.hugs, 1);
+checkThat(
+  "日志里没有把它当成「实验重新开始了」",
+  !serverLog.join("").includes("实验重新开始了"),
+  serverLog.join("").split("\n").filter((l) => l.includes("共感娃娃")).slice(-3).join("\n")
+);
+
+/* ================= 6. 几种「打进来但被挡下」 ================= */
+
+console.log("\n=== 6. 挡下来的几种，状态接口要说得出是哪一种 ===");
+
+const status = async () => (await fetch(`${base}/api/doll/status`, { headers: { Cookie: cookie } })).json();
+let st = await status();
+checkThat("状态接口说「通了」", st.lastPush?.ok === true, JSON.stringify(st.lastPush));
+checkThat("能报出这台机器的局域网地址（用来对照填的对不对）", Array.isArray(st.addresses), JSON.stringify(st.addresses));
+
+// 密钥过期 —— 实机上就是这个：改了配置但手机上那份文件是旧的
+const bad = await fetch(`${base}/doll/hug?secret=OLD-ONE`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ acc: [1], t: [99] }),
+});
+check("旧密钥被挡（403）", bad.status, 403);
+st = await status();
+checkThat("状态接口点明是密钥的事", /密钥不对/.test(st.lastPush?.why ?? ""), JSON.stringify(st.lastPush));
+checkThat("而且提示了「文件是不是改密钥之前下的」", /之前下的/.test(st.lastPush?.why ?? ""), st.lastPush?.why);
+
+/* ================= 收尾 ================= */
+
+server.kill();
+await sleep(300);
+fs.rmSync(TMP, { recursive: true, force: true });
+
+if (fail) {
+  console.log("\n--- 后端日志（最后 40 行）---");
+  console.log(serverLog.join("").split("\n").slice(-40).join("\n"));
+}
+console.log(`\n${fail === 0 ? "全部通过" : "有失败"}：${pass} 通过 / ${fail} 失败\n`);
+process.exit(fail === 0 ? 0 : 1);

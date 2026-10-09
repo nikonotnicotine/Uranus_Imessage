@@ -2747,6 +2747,93 @@ function DollCalibrateButton({ doll, updateDollApi }) {
  * 而 phyphox 官方的网页编辑器不支持网络连接、只能手写 XML —— 让用户照着
  * wiki 自己搓一份还要把地址和密钥填对，等于劝退。
  */
+/**
+ * 「手机到底有没有连上来」那块牌子。
+ *
+ * 推送模式下，「手机没推过来」和「推了但被挡下」在界面上长得一模一样：
+ * 都是抱了没反应。实机上为这个卡过两次（一次总开关没开，一次实验文件是改
+ * 配置之前下的、里面的密钥已经过期），两次都只能挨个猜。所以把服务端那头
+ * 看到的事实直接摆出来。
+ *
+ * 每 3 秒刷一次：这东西是**边抱边看**的 —— 抱一下，看这行数字动没动，
+ * 比什么说明都直观。只在这一栏展开着的时候转，收起来就停。
+ */
+function DollPushStatus() {
+  const [st, setSt] = useState(null);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      try {
+        const r = await api("/api/doll/status");
+        if (alive) {
+          setSt(r);
+          setErr("");
+        }
+      } catch (e) {
+        if (alive) setErr(String(e?.message ?? e));
+      }
+    };
+    void tick();
+    const t = setInterval(tick, 3000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  if (err) return <p className="text-meta text-ink-faint">查不到状态：{err}</p>;
+  if (!st) return <p className="text-meta text-ink-faint">正在看手机连上来没有…</p>;
+
+  const last = st.lastPush;
+  const ago = last ? Math.max(0, Math.round((Date.now() - last.at) / 1000)) : 0;
+  const agoText = ago < 60 ? `${ago} 秒前` : `${Math.round(ago / 60)} 分钟前`;
+
+  return (
+    <div className="grid grid-cols-1 gap-2 rounded border border-line bg-sunken/40 p-3">
+      <p className="text-ui text-ink">手机连上来了吗</p>
+      {!last ? (
+        <p className="text-meta leading-relaxed text-warn">
+          <strong>一个数据包都没收到过。</strong>
+          那就不是开关或阈值的问题，是手机根本没打到这台机器上 —— 看看下面这几条：
+          地址填得对不对、手机和它通不通、防火墙放没放行、
+          <strong className="text-ink-soft">实验文件是不是改配置之前下的</strong>
+          （里面的地址和密钥是下载那一刻写死的，改了要重下一份）。
+        </p>
+      ) : last.ok ? (
+        <p className="text-meta leading-relaxed text-ink-faint">
+          <strong className="text-good">通了。</strong>
+          最近一次 {agoText}
+          {last.samples ? `，收到 ${last.samples} 个样本` : ""}
+          {last.hugs ? `，认出 ${last.hugs} 次拥抱` : ""}。
+          <br />
+          抱一下娃娃，这行里的时间应该跟着跳 —— 不跳就是手机那头停了（phyphox 切后台了？）。
+        </p>
+      ) : (
+        <p className="text-meta leading-relaxed text-warn">
+          <strong>{agoText}收到过，但被挡下了：</strong>
+          {last.why}
+        </p>
+      )}
+      {st.addresses?.length > 0 && (
+        <p className="text-meta leading-relaxed text-ink-faint">
+          这台机器自己看到的局域网地址：
+          {st.addresses.map((a) => (
+            <code key={a} className="mx-1 bg-sunken px-1">
+              {a}:{st.port}
+            </code>
+          ))}
+          <br />
+          手机在同一个 WiFi 下的话，上面「手机要连的地址」就该是其中一个。
+          <strong className="text-ink-soft">别填 localhost</strong>
+          ——那是这台机器自己，手机连不上。
+        </p>
+      )}
+    </div>
+  );
+}
+
 function DollPushFields({ doll, updateDollApi }) {
   const url = String(doll.pushUrl ?? "").trim();
   const secret = String(doll.pushSecret ?? "").trim();
@@ -2756,6 +2843,7 @@ function DollPushFields({ doll, updateDollApi }) {
 
   return (
     <>
+      <DollPushStatus />
       <div>
         <p className="text-ui text-ink">手机那头（所有角色共用）</p>
         <p className="mt-0.5 text-meta leading-relaxed text-ink-faint">
