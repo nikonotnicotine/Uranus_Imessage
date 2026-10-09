@@ -5477,7 +5477,7 @@ async function hugTick(getConfig) {
  * @param {object} payload parseDollPush 的结果
  * @returns {Promise<{hugs:number, listeners:number}>} 这包认出几次拥抱、递给了几个角色
  */
-export async function handleDollPush(getConfig, payload) {
+export function handleDollPush(getConfig, payload) {
   const config = getConfig();
   const api = config.dollApi ?? {};
   const listeners = hugListeners(config);
@@ -5491,20 +5491,48 @@ export async function handleDollPush(getConfig, payload) {
    * 能收到这包本身就说明手机在测量，所以这里直接拿 `true` 和一个固定的
    * session 喂进去 —— 换实验这件事在推模式下表现为「对方换了实验文件」，
    * 那会导致时间轴归零，状态机里有一条专门认它（见 feedDollSamples）。
+   *
+   * **喂状态机这一步是同步的，就在请求里做完。** 它很快（纯算术），而且
+   * 只有这样才能保证「按到达顺序喂」—— 中间一旦 await，下一个请求就会插
+   * 进来改同一份状态。
    */
   const hugs = feedDollSamples(
     dollWatcher.state,
     { session: "push", measuring: true, samples: payload.samples, cover: payload.cover },
     api
   );
+
+  /*
+   * **递送不能让这个 HTTP 请求等着。**
+   *
+   * 递一次拥抱 = 一整轮模型调用，实测十几秒。而手机是每两秒推一包的：
+   * 吊着不回的话，后面的请求就在手机那头排起队，然后几个一起涌进来、
+   * 处理顺序还不一定和发出顺序一致。于是状态机会收到一包「时间比上次还早」
+   * 的样本，把它当成「用户在手机上清空了实验」，整个状态推倒重来 ——
+   * 日志里一秒钟刷四条「实验时间归零了」就是这么来的，正在进行的那次
+   * 拥抱也跟着被丢掉。
+   *
+   * 所以这里排进一条链就撒手，HTTP 立刻回 200。链是为了让几次拥抱按顺序
+   * 递，而不是一拥而上。
+   */
   for (const hug of hugs) {
     for (const { runner, role } of listeners) {
       if (runner.stopped) continue;
-      await deliverHug(getConfig, runner, role, hug);
+      hugDelivery = hugDelivery
+        .then(() => (runner.stopped ? null : deliverHug(getConfig, runner, role, hug)))
+        .catch((e) => logError(scopeOf(runner, "共感娃娃"), "递送拥抱时出错", e));
     }
   }
   return { hugs: hugs.length, listeners: listeners.length };
 }
+
+/**
+ * 递送拥抱的那条链。
+ *
+ * 推送口收到数据就立刻回 200（理由见 handleDollPush），真正的递送排在这儿
+ * 一个一个来 —— 每次都是一整轮模型调用，几个角色一拥而上只会互相抢资源。
+ */
+let hugDelivery = Promise.resolve();
 
 /**
  * 这一下该说给哪个会话。
@@ -5547,7 +5575,19 @@ async function deliverHug(getConfig, runner, role, hug) {
   if (cd && now < runner.hugCooldownUntil) {
     runner.hugPending += 1;
     const left = Math.max(1, Math.round((runner.hugCooldownUntil - now) / 60_000));
-    logDebug(scope, `又被抱了一下（${hugDurationLog(hug)}），冷却还有 ${left} 分钟，攒到第 ${runner.hugPending} 次`);
+    /*
+     * **这条必须是 logInfo，不能是 logDebug。**
+     *
+     * 从用户那头看，「冷却期内被压下」和「压根没认出来」长得一模一样：都是
+     * 抱了一下、角色没反应。控制台上一个字都不说的话，他只会以为功能坏了，
+     * 然后去查手机、查网络、查阈值 —— 而真相只是「十分钟内已经说过一次了」。
+     * 实机上就这么发生过。
+     */
+    logInfo(
+      scope,
+      `又被抱了一下（${hugDurationLog(hug)}），但还在冷却里（还有 ${left} 分钟），` +
+        `这次不另起一轮、攒着下次一起说（已攒 ${runner.hugPending} 次）`
+    );
     return;
   }
 
@@ -5572,7 +5612,8 @@ async function deliverHug(getConfig, runner, role, hug) {
    */
   if (isOfflineOn(memoryKeyFor(role)) || isAssistOn(runner.projectRefId, target.spaceId)) {
     runner.hugPending += 1;
-    logDebug(scope, `被抱了一下，但这会儿不在线上（线下 / 协助模式），攒到第 ${runner.hugPending} 次`);
+    // 同样用 logInfo：不说的话，用户只看到「抱了没反应」，看不出是被什么挡住的
+    logInfo(scope, `被抱了一下，但这会儿不在线上（线下 / 协助模式），攒着下次一起说（已攒 ${runner.hugPending} 次）`);
     return;
   }
 

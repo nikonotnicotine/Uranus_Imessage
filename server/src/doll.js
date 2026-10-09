@@ -88,6 +88,15 @@ const MAX_SAMPLES = 4_000;
  */
 const RESTART_EVERY_MS = 30_000;
 
+/**
+ * 连着这么多包「整包都是旧数据」，才认定手机那边是真的重来过。
+ *
+ * 3 包：推模式默认两秒一包，也就是忍六秒的乱序 —— 够盖住「服务端回得慢、
+ * 几包挤在一起到」那种情况，又不至于在用户真的清空之后傻等太久。
+ * 详见 feedDollSamples 里那段「时间轴往回走了，是哪一种」。
+ */
+const STALE_BATCHES_MAX = 3;
+
 /* ================= 地址 ================= */
 
 /**
@@ -641,6 +650,14 @@ export function createDollState() {
     activeHits: 0,
     /** 上次试着让手机开始测量是什么时候 */
     lastStartTry: 0,
+    /**
+     * 连着几包都「整包都是旧数据」了。
+     *
+     * 推模式下这是**乱序**和**真的重来**唯一的区别：乱序只会坑一两包（下一包
+     * 就又对上了），而用户在手机上清了空、或者换了份实验文件，那是**从此以后
+     * 每一包**都比上次那个时间早。连着几包都旧 → 才是真的重来。
+     */
+    staleBatches: 0,
   };
 }
 
@@ -681,17 +698,55 @@ export function feedDollSamples(state, page, opts = DOLL_DEFAULTS) {
     return out;
   }
 
-  const samples = page.samples ?? [];
+  let samples = page.samples ?? [];
   if (!samples.length) return out;
 
   /*
-   * 时间轴倒退 = 用户在手机上按了「清空」（实验时间归零）。继续按老的 since
-   * 增量取会一个样本都拿不到，所以整个状态推倒。
+   * ── 时间轴往回走了，是哪一种？ ──
+   *
+   * 拉模式下只有一种可能：用户在手机上按了「清空」，实验时间归零。
+   *
+   * 推模式下还有第二种，而且常见得多：**同一批数据重来一遍，或者几包乱了序**。
+   * 手机每隔两秒推一包，网络抖一下、或者服务端回得慢，几包就会挤在一起到，
+   * 到达顺序还不一定是发出顺序。这时候要是当成「归零」，正在进行的那次拥抱
+   * 会被整个丢掉 —— 实机日志里一秒钟刷四条「实验时间归零了」、抱了两次只认出
+   * 一次，就是这么来的。
+   *
+   * 分辨方法：**真的重来是不可逆的**。用户清了空、或者换了份实验文件之后，
+   * 从此每一包都比上次那个时间早；而乱序只坑一两包，下一包就又接上了。
+   * 所以这里不急着推倒，先只把「已经见过的」滤掉；连着好几包整包都是旧的，
+   * 才认定是真的重来。
+   *
+   * 另外给一条快车道：时间轴回到了 0 附近而之前已经跑了一会儿，那不可能是
+   * 乱序（乱序顶多差几秒），直接认定重来，省得白等三包。
    */
-  if (state.since != null && samples[0].t + 1e-9 < state.since) {
-    logDebug("共感娃娃", "实验时间归零了（手机上清空过），重新开始认");
-    resetDoll(state, state.session);
+  if (state.since != null) {
+    const last = samples[samples.length - 1].t;
+    const restarted = samples[0].t < 1 && state.since > 5;
+
+    if (restarted || state.staleBatches >= STALE_BATCHES_MAX) {
+      logInfo("共感娃娃", "手机那边的实验重新开始了（清空过或换了实验文件），重新开始认");
+      resetDoll(state, state.session);
+    } else if (last + 1e-9 < state.since) {
+      // 整包都是旧的：多半是乱序或者重发。先放过，看下一包能不能接上
+      state.staleBatches += 1;
+      logDebug(
+        "共感娃娃",
+        `这一包整包都比上次早（${last.toFixed(2)} < ${state.since.toFixed(2)}），当成乱序跳过` +
+          `（连着 ${state.staleBatches} 包了，到 ${STALE_BATCHES_MAX} 包就认定是重来）`
+      );
+      return out;
+    } else if (samples[0].t + 1e-9 < state.since) {
+      // 部分重叠：把已经见过的那截切掉，剩下的照常喂
+      const fresh = samples.filter((s) => s.t > state.since);
+      logDebug("共感娃娃", `这一包和上次重叠了 ${samples.length - fresh.length} 个样本，去掉重复的`);
+      samples = fresh;
+      state.staleBatches = 0;
+    } else {
+      state.staleBatches = 0;
+    }
   }
+  if (!samples.length) return out;
 
   const covered = page.cover != null && page.cover < o.coverBelow;
 

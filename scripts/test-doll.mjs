@@ -430,9 +430,77 @@ console.log("\n手机那头变了的时候");
   const st = createDollState();
   跑一遍(st, flow(100, 0.02, [4.0, ...held(100)]));
   checkThat("先抱着", st.holding);
-  const out = 跑一遍(st, flow(0, 0.02, quiet(10))); // 时间倒退
+  const out = 跑一遍(st, flow(0, 0.02, quiet(10))); // 时间倒退到 0 附近 = 真的重来
   check("时间归零之后推倒重来，不凭空结算一次", out.length, 0);
   checkThat("不再是抱着", !st.holding);
+}
+
+console.log("\n推模式下乱序和重发不能当成「重来」");
+{
+  /*
+   * 这一节钉的是一个实机踩到的坑：推模式下服务端回得慢（递送拥抱 = 一整轮
+   * 模型调用，十几秒），手机每两秒推一包，于是几包挤在一起到、顺序还乱了。
+   * 以前只要时间往回走一点就当「用户清空了实验」，把正在进行的拥抱整个丢掉
+   * —— 日志里一秒刷四条「实验时间归零了」，抱两次只认出一次。
+   */
+  const st = createDollState();
+  // 抱起来，正抱着
+  跑一遍(st, flow(10, 0.02, [5.0, ...held(100)]));
+  checkThat("先抱着", st.holding);
+  const sinceBefore = st.since;
+
+  // 一包迟到的旧数据插进来（整包都比上次早）
+  const out = 跑一遍(st, flow(8, 0.02, held(20)));
+  check("乱序的旧包不结算", out.length, 0);
+  checkThat("**不该**把它当成重来，还抱着", st.holding);
+  check("since 不被旧包拉回去", st.since, sinceBefore);
+  check("记了一次「整包都旧」", st.staleBatches, 1);
+
+  // 下一包正常接上 → 计数清零，拥抱继续
+  跑一遍(st, flow(12.05, 0.02, held(50)));
+  checkThat("正常包接上之后还抱着", st.holding);
+  check("「整包都旧」的计数清零", st.staleBatches, 0);
+
+  // 放下，照样结算得出来（这才是乱序容忍的意义：那次拥抱没被丢）
+  const done = 跑一遍(st, flow(13.1, 0.02, quiet(300)));
+  check("乱序插了一包也不影响最后结算", done.length, 1);
+  checkThat("时长按最后一个活跃样本算", done[0].durationMs >= 2_000, `${done[0].durationMs}ms`);
+}
+
+{
+  // 部分重叠（重发了一截）：去掉见过的，剩下的照常喂，别整包丢
+  const st = createDollState();
+  跑一遍(st, flow(0, 0.02, quiet(50)));
+  const since = st.since;
+  /*
+   * 从 since 之前一点开始重发，后面接上新数据。
+   *
+   * 尖峰要落在 since **之后**：去重是严格的 `t > since`，正好压在边界上的
+   * 那个样本会被当成「见过了」切掉 —— 这里 0.88 + 20×0.02 = 1.28 > 0.98，
+   * 稳稳在新的那一段里。
+   */
+  const out = 跑一遍(st, flow(since - 0.1, 0.02, [...quiet(20), 5.0, ...held(100)]));
+  check("重叠的包不结算（还抱着）", out.length, 0);
+  checkThat("里面那段新数据照样认出了抱起来", st.holding);
+  checkThat("since 往前推了", st.since > since);
+}
+
+{
+  // 真的重来（但时间不是从 0 开始，快车道判据不命中）：连着几包都旧才认
+  const st = createDollState();
+  跑一遍(st, flow(100, 0.02, [5.0, ...held(100)]));
+  checkThat("先抱着", st.holding);
+  // 连着三包都是旧的
+  跑一遍(st, flow(50, 0.02, quiet(10)));
+  跑一遍(st, flow(50.5, 0.02, quiet(10)));
+  check("前两包只是记账，不推倒", st.holding, true);
+  check("记到 2 了", st.staleBatches, 2);
+  跑一遍(st, flow(51, 0.02, quiet(10)));
+  check("第三包记到 3", st.staleBatches, 3);
+  // 第四包时达到阈值 → 认定重来
+  跑一遍(st, flow(51.5, 0.02, quiet(10)));
+  checkThat("连着旧够多包之后认定是重来，状态推倒", !st.holding);
+  check("计数跟着清零", st.staleBatches, 0);
 }
 
 {

@@ -1449,8 +1449,13 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
   }
   if (!parsed.samples.length) return res.json({ ok: true, hugs: 0 });
 
+  /*
+   * 同步跑完、立刻回。**不等递送** —— 那是一整轮模型调用，十几秒，
+   * 而手机每两秒就推一包，吊着不回会让请求在手机那头堆起来，
+   * 然后乱序涌进来（详见 imessage.js:handleDollPush 里那段注释）。
+   */
   try {
-    const out = await handleDollPush(loadConfig, parsed);
+    const out = handleDollPush(loadConfig, parsed);
     res.json({ ok: true, ...out });
   } catch (e) {
     logError("共感娃娃", "处理推过来的数据时出错", e);
