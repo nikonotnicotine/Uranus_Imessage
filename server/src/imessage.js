@@ -5703,7 +5703,18 @@ async function deliverHug(getConfig, runner, role, hug) {
     () =>
       runProactiveTurn(getConfig, runner, slot, target.spaceId, {
         toModel,
-        toHistory: "[共感娃娃被抱了一下]",
+        /*
+         * 存进上下文的就是发给模型的那一整句，不用占位符。
+         *
+         * 提醒那边存的是 `[触发了提醒：X]` 这种短占位，因为它的提示词很长，
+         * 每轮都跟着历史重发太浪费。这句不一样：它本来就短，而且里面的
+         * 时长、力度、次数是**这件事本身**——角色之后翻上下文，该看得到
+         * 「那次抱了 8 秒、很用力」，而不是一句没信息量的「被抱了一下」。
+         * 用户看到存档里只有占位符，也问过「为什么不是那句系统提示」。
+         *
+         * `{{user}}` 照旧留字面量，拼提示词时由 applyVars 换。
+         */
+        toHistory: toModel,
         label: "共感娃娃",
         scope: "共感娃娃",
       }),

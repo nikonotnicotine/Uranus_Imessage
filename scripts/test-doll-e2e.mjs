@@ -219,12 +219,7 @@ checkThat(
 
 /* ================= 6. 几种「打进来但被挡下」 ================= */
 
-console.log("\n=== 6. 挡下来的几种，状态接口要说得出是哪一种 ===");
-
-const status = async () => (await fetch(`${base}/api/doll/status`, { headers: { Cookie: cookie } })).json();
-let st = await status();
-checkThat("状态接口说「通了」", st.lastPush?.ok === true, JSON.stringify(st.lastPush));
-checkThat("能报出这台机器的局域网地址（用来对照填的对不对）", Array.isArray(st.addresses), JSON.stringify(st.addresses));
+console.log("\n=== 6. 旧密钥要被挡，而且控制台说得出是密钥的事 ===");
 
 // 密钥过期 —— 实机上就是这个：改了配置但手机上那份文件是旧的
 const bad = await fetch(`${base}/doll/hug?secret=OLD-ONE`, {
@@ -233,9 +228,8 @@ const bad = await fetch(`${base}/doll/hug?secret=OLD-ONE`, {
   body: JSON.stringify({ acc: [1], t: [99] }),
 });
 check("旧密钥被挡（403）", bad.status, 403);
-st = await status();
-checkThat("状态接口点明是密钥的事", /密钥不对/.test(st.lastPush?.why ?? ""), JSON.stringify(st.lastPush));
-checkThat("而且提示了「文件是不是改密钥之前下的」", /之前下的/.test(st.lastPush?.why ?? ""), st.lastPush?.why);
+await sleep(100);
+checkThat("控制台点明是密钥的事", serverLog.join("").includes("密钥不对"), "");
 
 /* ================= 7. 控制台得「有反应」 ================= */
 

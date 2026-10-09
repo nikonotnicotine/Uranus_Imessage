@@ -1506,12 +1506,8 @@ let dollPushQuiet = { why: "", at: 0 };
 /**
  * 最近一次有人打推送口 —— **不管收没收下**。
  *
- * 这是推送模式唯一能自证「手机到底有没有连上来」的东西。实机上被这个问题
- * 卡过两次：手机上明明点了播放，控制台一声不吭，于是开始挨个猜（开关？
- * 密钥？阈值？引导式访问？），而真相是**请求压根没到**（地址里那个 IP 变了）。
- *
- * 没到和「到了但被挡下」在用户那头长得一模一样，所以这里把两种都记下来，
- * 面板上直接显示。只在内存里：重启之后本来就该从「还没收到过」重新看起。
+ * 用来判「断了一阵之后又连上来了」，好在控制台报一声「手机连上来了」
+ * （见推送口那条路由）。只在内存里：重启之后本来就该从「还没收到过」重新看起。
  */
 let lastDollPush = null; // { at, ok, why, samples, hugs } | null
 
@@ -1598,46 +1594,6 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
     logError("共感娃娃", "处理推过来的数据时出错", e);
     res.status(500).json({ ok: false, error: String(e?.message ?? e) });
   }
-});
-
-/**
- * 共感娃娃推送那条腿的体检：**手机到底有没有连上来。**
- *
- * 为什么要有：推送模式下，「手机没推」和「推了但被挡下」在用户那头长得
- * 一模一样 —— 都是抱了没反应。实机上为这个卡过两次，一次是总开关没开
- * （1.16.1 修了），一次是地址里那个 IP 变了，而两次都只能靠挨个猜。
- *
- * 所以这里回三样：
- *
- *  - `lastPush`：最近一次有人打那个口子，**收没收下都算**。空的 = 一个包都
- *    没到过，那就不是配置问题，是网络那一段不通（地址错、防火墙、不同网）。
- *  - `addresses`：这台机器自己看到的局域网地址。手机上那份实验文件里的地址
- *    是**生成时写死的**，机器换了 IP 它不会跟着变 —— 对一眼就知道。
- *  - 当前配置的几个关键位，省得再回去翻。
- */
-app.get("/api/doll/status", (_req, res) => {
-  const api = loadConfig()?.dollApi ?? {};
-  /*
-   * 只列 IPv4 的非回环地址。回环（127.0.0.1）要排掉：手机连不上它，而它
-   * 恰恰是用户最容易照着填的那个 —— 控制台地址栏里就写着 localhost。
-   */
-  const addresses = [];
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const nic of list ?? []) {
-      if (nic.family === "IPv4" && !nic.internal) addresses.push(nic.address);
-    }
-  }
-  res.json({
-    ok: true,
-    mode: api.mode === "push" ? "push" : "pull",
-    enabled: Boolean(api.enabled),
-    hasSecret: Boolean(String(api.pushSecret ?? "").trim()),
-    pushUrl: String(api.pushUrl ?? "").trim(),
-    path: DOLL_PUSH_PATH,
-    port: PORT,
-    addresses,
-    lastPush: lastDollPush,
-  });
 });
 
 /**
