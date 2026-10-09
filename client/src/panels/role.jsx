@@ -2929,6 +2929,13 @@ function RoleHugFields({ role }) {
             （还没说过话的话这边会在日志里提一句，先聊一句就有了）。
             <br />
             线下模式、提示词协助模式开着的时候不打扰，那几次会攒起来，下一次一起说。
+            <br />
+            懒得开网页：在聊天里发
+            <code className="mx-1 bg-sunken px-1">/共感娃娃</code>
+            就翻一下这个开关（也可以说死
+            <code className="mx-1 bg-sunken px-1">/共感娃娃开启</code>
+            <code className="mr-1 bg-sunken px-1">/共感娃娃关闭</code>
+            ）。这条不消耗 token。
           </span>
         </span>
         <Switch checked={Boolean(hug.enabled)} onChange={(v) => set({ enabled: v })} label="启用共感娃娃" />

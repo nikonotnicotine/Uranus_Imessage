@@ -299,14 +299,15 @@ await ok("两个角色共用一个 Photon 项目 → 报错", () => {
   assert.match(g.errors[0].detail, /一个角色一个 Photon 项目/);
 });
 
-await ok("同一个号登记在两个项目 → 报错", () => {
+// 「同一个号登记在两个项目 → 报错」那条在 1.16.2 删了（用户说那不算报错），
+// 所以这里反过来钉：**同一个号不该再被喊**，免得哪天又被加回来
+await ok("同一个号登记在两个项目 → 不喊（1.16.2 起不再当成错）", () => {
   const g = buildConflictGuard();
   g.warn([
     { id: "a", mode: "cloud", projectId: "aaaa", myPhone: "+8613800138000" },
     { id: "b", mode: "cloud", projectId: "bbbb", myPhone: "+8613800138000" },
   ]);
-  assert.equal(g.errors.length, 1);
-  assert.match(g.errors[0].message, /在 2 个项目里都登记了/);
+  assert.equal(g.errors.length, 0);
 });
 
 await ok("两个角色各自独立 → 一个字都不说", () => {

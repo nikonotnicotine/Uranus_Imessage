@@ -708,6 +708,65 @@ console.log("\n=== 22. 原始提示词的 XML 包装 ===");
   checkThat("末尾那遍禁了消息格式标记", /消息格式标记/.test(msgs[5].content), msgs[5].content);
 }
 
+console.log("\n=== 23. /共感娃娃（开关）===");
+{
+  /*
+   * 三条共用「共感娃娃」这个前缀，靠别名匹配的贪婪规则分开。这是最容易写错的
+   * 一处：`[一-龥]+` 要是不贪婪，`/共感娃娃开启` 会先匹配到 `共感娃娃`，
+   * 于是「开启」变成了「翻面」—— 本来想开，结果在已经开着的时候给关了。
+   */
+  check("/共感娃娃", parseCommand("/共感娃娃"), cmd("hug", null));
+  check("/共感娃娃开启", parseCommand("/共感娃娃开启"), cmd("hugon", null));
+  check("/共感娃娃关闭", parseCommand("/共感娃娃关闭"), cmd("hugoff", null));
+  check("全角 ／共感娃娃", parseCommand("／共感娃娃"), cmd("hug", null));
+  // 长得像但不是的，别劫走
+  check("/共感娃娃是什么 → 不是指令", parseCommand("/共感娃娃是什么"), null);
+  check("/共感 → 不是指令", parseCommand("/共感"), null);
+
+  const hugOf = () => Boolean(loadConfig().roles.find((r) => r.id === "role-1")?.hug?.enabled);
+  // ctx.role 得现读：上一条指令刚把配置写回磁盘，拿旧的那份会一直看到旧值
+  const hugCtx = () => ({ role: loadConfig().roles.find((r) => r.id === "role-1"), sessionId: SID, forget: () => {} });
+
+  check("一开始是关着的", hugOf(), false);
+
+  let h = tryCommand("/共感娃娃", hugCtx());
+  check("翻一下 → 开了", hugOf(), true);
+  checkThat("回复说已开启", /已开启/.test(h.text), h.text);
+  /*
+   * 开着但手机那头没配 —— 得在同一句话里说清楚，不然用户看到「已开启」
+   * 抱半天没反应，只会以为功能坏了。这份夹具配置里压根没有 dollApi。
+   */
+  checkThat("顺带提醒手机那头还没配", /⚠️/.test(h.text), h.text);
+
+  h = tryCommand("/共感娃娃", hugCtx());
+  check("再翻一下 → 关了", hugOf(), false);
+  checkThat("回复说已关闭", /已关闭/.test(h.text), h.text);
+
+  h = tryCommand("/共感娃娃开启", hugCtx());
+  check("说死「开启」→ 开", hugOf(), true);
+  h = tryCommand("/共感娃娃开启", hugCtx());
+  check("已经开着再开启 → 还是开着", hugOf(), true);
+  checkThat("并且说「本来就是开着的」", /本来就是开着/.test(h.text), h.text);
+
+  h = tryCommand("/共感娃娃关闭", hugCtx());
+  check("说死「关闭」→ 关", hugOf(), false);
+  h = tryCommand("/共感娃娃关闭", hugCtx());
+  checkThat("已经关着再关闭 → 说本来就是关着的", /本来就是关着/.test(h.text), h.text);
+  check("还是关着", hugOf(), false);
+
+  // 只动这个角色，别碰全局那块（那是「手机那头」，关掉会把所有角色一起停）
+  tryCommand("/共感娃娃开启", hugCtx());
+  check("没有顺手去动全局的 dollApi.enabled", loadConfig().dollApi?.enabled, false);
+  // 收尾：别把开着的状态留给后面的用例
+  tryCommand("/共感娃娃关闭", hugCtx());
+
+  // 没绑角色时照旧给那句提示，不该崩
+  const noRole = tryCommand("/共感娃娃", { role: null, sessionId: SID, forget: () => {} });
+  checkThat("没绑角色时给提示而不是崩", /还没绑定角色/.test(noRole.text), noRole.text);
+
+  checkThat("/help 里列了这条", /共感娃娃/.test(tryCommand("/help", hugCtx()).text));
+}
+
 // 收尾：临时目录删掉
 fs.rmSync(TMP, { recursive: true, force: true });
 

@@ -72,6 +72,9 @@ const COMMANDS = new Set([
   "reminddel",
   "addanniv",
   "addbday",
+  "hug",
+  "hugon",
+  "hugoff",
 ]);
 
 /**
@@ -125,6 +128,14 @@ const COMMAND_ALIASES = {
   删除提醒: "reminddel",
   增加纪念日: "addanniv",
   增加生日: "addbday",
+  /*
+   * 共感娃娃。三条共用「共感娃娃」这个前缀，靠上面说的**贪婪匹配**分开：
+   * `[一-龥]+` 会把 `/共感娃娃开启` 整个吃进去，于是查到的是 `共感娃娃开启`
+   * 而不是 `共感娃娃`。和「提醒 / 提醒列表」是同一个路子。
+   */
+  共感娃娃: "hug",
+  共感娃娃开启: "hugon",
+  共感娃娃关闭: "hugoff",
 };
 
 /**
@@ -437,6 +448,8 @@ function buildHelp(trigger) {
     "/增加纪念日 在一起 2025年10月10日  每年这天进时间感知，满百天也会告诉角色",
     "/增加生日 宝宝 10月10日            农历写 农历八月十五",
     "/提醒列表  看还没到点的提醒和日程     /删除提醒 2  删掉列表里第 2 条",
+    "/共感娃娃  翻一下这个角色感不感知拥抱（开着就关、关着就开）",
+    "           也可以说死：/共感娃娃开启、/共感娃娃关闭",
     "/help      看这张表",
     "",
     "只有上面这几条会被当指令。其余 `/` 开头的消息（网址、路径…）照常发给 AI。",
@@ -873,6 +886,58 @@ function cmdOfflineOff() {
   return { offline: { action: "off" }, log: "快捷指令：关闭线下模式" };
 }
 
+/* ---------------- 共感娃娃 ---------------- */
+
+/**
+ * `/共感娃娃` 翻面，`/共感娃娃开启`、`/共感娃娃关闭` 指定开关。
+ *
+ * 改的是**这个角色**的 `hug.enabled`（和网页端那个开关是同一个字段），不碰
+ * 全局的 dollApi —— 那边是「手机那头」的事，关掉会把所有角色一起停掉，
+ * 不该由某一个角色的聊天窗口来动。
+ *
+ * 开着但整条腿没通的时候要说清楚是哪一种不通：手机地址没填（拉模式）、
+ * 密钥没生成（推模式）、或者总开关关着。不然用户发完 `/共感娃娃` 看到一句
+ * 「已开启」，抱半天没反应，只会以为是功能坏了。
+ *
+ * @param {"toggle"|"on"|"off"} want
+ */
+function cmdHug({ config, role }, want) {
+  const now = Boolean(role?.hug?.enabled);
+  const next = want === "toggle" ? !now : want === "on";
+
+  if (next === now) {
+    return { text: `共感娃娃本来就是${now ? "开着" : "关着"}的。`, log: `快捷指令：共感娃娃没动（${now ? "开" : "关"}）` };
+  }
+
+  saveConfig({
+    ...config,
+    roles: (config.roles ?? []).map((r) =>
+      r.id === role.id ? { ...r, hug: { ...(r.hug ?? {}), enabled: next } } : r
+    ),
+  });
+
+  if (!next) {
+    return { text: "已关闭共感娃娃，再抱也不会打扰你了。", log: "快捷指令：共感娃娃关" };
+  }
+
+  /*
+   * 开了之后顺带体检一遍「手机那头」。这几句是**纯提示**，不挡着开 ——
+   * 用户可能就是先把开关打开、等会儿再去配手机。
+   */
+  const doll = config.dollApi ?? {};
+  let note = "";
+  if (!doll.enabled) {
+    note = "\n⚠️ 不过「连手机」那个总开关是关的，现在还收不到 —— 去网页端的角色设置 →「共感娃娃」里打开。";
+  } else if (doll.mode === "push") {
+    if (!String(doll.pushSecret ?? "").trim()) note = "\n⚠️ 不过推送密钥还没生成，手机推过来会被挡掉。";
+    else if (!String(doll.pushUrl ?? "").trim()) note = "\n⚠️ 不过手机要连的那个地址还没填。";
+  } else if (!String(doll.host ?? "").trim()) {
+    note = "\n⚠️ 不过手机地址还没填，这边不知道去哪儿读。";
+  }
+
+  return { text: `已开启共感娃娃，抱一下我就知道。${note}`, log: "快捷指令：共感娃娃开" };
+}
+
 /** `/小总结`、`/大总结` —— 手动出一份，不看轮数够不够。 */
 function cmdSummary(kind) {
   return {
@@ -977,6 +1042,12 @@ export function tryCommand(text, ctx) {
       return cmdPromptMode(args);
     case "offlineon":
       return cmdOfflineOn(args);
+    case "hug":
+      return cmdHug(args, "toggle");
+    case "hugon":
+      return cmdHug(args, "on");
+    case "hugoff":
+      return cmdHug(args, "off");
     case "sumsmall":
       return cmdSummary("small");
     case "sumbig":
