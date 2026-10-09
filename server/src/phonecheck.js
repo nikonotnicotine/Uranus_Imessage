@@ -551,6 +551,21 @@ function summarize(config, batch, maxChars, detailChars) {
 }
 
 /**
+ * 「每轮最多带」那个设置换算成 summarize 的两个参数。
+ *
+ * **凡是把手机内容塞进模型的地方都走这里** —— 同步到私聊、同步到日记待总结。
+ * 以前日记那条是写死的 1500 字，用户把「每轮最多带」调到几万，私聊里带全了、
+ * 日记里还是那 1500 字，等于设置只管了一半。
+ *
+ * 每条正文截多长也跟着总字数走：总共只给 300 字的时候每条 24 字正好能多塞几条，
+ * 给到几千字还只截 24 字就白瞎 —— 条数早列完了，省下的字数没人用。
+ */
+function injectWidth(role) {
+  const chars = clamp(role?.phone?.injectChars, 3000, 50, 99999);
+  return { chars, detail: Math.min(120, Math.max(24, Math.round(chars / 40))) };
+}
+
+/**
  * 「同步到私聊」那一段：最近一次查手机的摘要。
  *
  * **只在这一轮请求里注入、不进存档**（和天气同一个道理），所以 token 花费是
@@ -572,12 +587,8 @@ export function phoneNote(config, role) {
     return "";
   }
   if (!state.last?.at || Date.now() - state.last.at > p.injectHours * 3600_000) return "";
-  /*
-   * 每条正文截多长跟着总字数走：总共只给 300 字的时候每条 24 字正好能多塞几条，
-   * 但给到几千字还只截 24 字就白瞎 —— 条数早列完了，省下的字数没人用。
-   */
-  const detail = Math.min(120, Math.max(24, Math.round(p.injectChars / 40)));
-  const body = summarize(config, state.last.items, p.injectChars, detail);
+  const { chars, detail } = injectWidth(role);
+  const body = summarize(config, state.last.items, chars, detail);
   if (!body) return "";
   return (
     `<Phone>\n这是你自己手机里最近的东西（只是让你知道自己的近况，别主动念出来，被问到时对得上就行）：\n${body}\n</Phone>`
@@ -695,7 +706,9 @@ export async function runGenerate(config, role, appIds, opts = {}) {
   // 日记待总结：写日记时能顺带提到手机里的事
   if (role.phone?.toDiary && role.memories?.diary?.enabled) {
     try {
-      const text = summarize(config, batch, 1500, 60).replace(/\n/g, "；");
+      // 字数跟着「每轮最多带」走，和同步到私聊一个口径（见 injectWidth）
+      const w = injectWidth(role);
+      const text = summarize(config, batch, w.chars, w.detail).replace(/\n/g, "；");
       appendDiaryLine(memoryKeyFor(role), diaryLogLine(`${role.name}的手机`, text));
     } catch (e) {
       logWarn(SCOPE, "没记进日记待总结（不影响查手机本身）", e);

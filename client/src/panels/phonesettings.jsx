@@ -289,18 +289,24 @@ export function SettingsApp({ close, role, data, apps, running, onGenerate, onBo
   if (page === "sync") {
     return (
       <Page title="同步与指令" onBack={back}>
-        <Section foot="之后聊天时把最近一次查手机压成几行摘要告诉角色。只进当轮请求、不进存档，每轮固定多下面这么多字（数字能直接点进去敲），过了时效就不再带。">
+        <Section foot="之后聊天时把最近一次查手机压成几行摘要告诉角色。只进当轮请求、不进存档，过了时效就不再带。">
           <SetRow label="同步到私聊" right={<Toggle on={Boolean(p.injectChat)} onChange={(v) => patchRole({ injectChat: v })} label="同步到私聊" />} last={!p.injectChat} />
           {p.injectChat && (
-            <>
-              <SetRow label="每轮最多带" right={<Stepper edit value={p.injectChars ?? 3000} min={50} max={99999} step={50} suffix="字" onChange={(v) => patchRole({ injectChars: v })} />} />
-              <SetRow label="生成后多久内带" last right={<Stepper value={p.injectHours ?? 24} min={1} max={720} step={1} suffix="时" onChange={(v) => patchRole({ injectHours: v })} />} />
-            </>
+            <SetRow label="生成后多久内带" last right={<Stepper value={p.injectHours ?? 24} min={1} max={720} step={1} suffix="时" onChange={(v) => patchRole({ injectHours: v })} />} />
           )}
         </Section>
         <Section foot={p.toDiary && !role.memories?.diary?.enabled ? "这个角色的日记没开，这条暂时不起作用（在「角色 → 单独配置 → 记忆库」里开）。" : "每次生成完往日记流水里记一行，角色写日记时能顺带写到手机里的事。"}>
           <SetRow label="同步到日记待总结" last right={<Toggle on={Boolean(p.toDiary)} onChange={(v) => patchRole({ toDiary: v })} label="同步到日记" />} />
         </Section>
+        {/*
+          字数是上面两条共用的，所以单独一组 —— 跟在「同步到私聊」里的话，
+          只开日记不开私聊的人就看不见这个管着自己日记长度的设置了。
+        */}
+        {(p.injectChat || p.toDiary) && (
+          <Section foot="上面两条共用这个长度：压出来的摘要最多这么多字，超了就截断。数字能直接点进去敲。">
+            <SetRow label="每轮最多带" last right={<Stepper edit value={p.injectChars ?? 3000} min={50} max={99999} step={50} suffix="字" onChange={(v) => patchRole({ injectChars: v })} />} />
+          </Section>
+        )}
         <Section foot="在 iMessage 里发 /查手机，按「一次生成」那一组接着翻一次，结果回你一条消息（不进上下文）。">
           <SetRow label="允许 /查手机 指令" last right={<Toggle on={Boolean(p.command)} onChange={(v) => patchRole({ command: v })} label="查手机指令" />} />
         </Section>
