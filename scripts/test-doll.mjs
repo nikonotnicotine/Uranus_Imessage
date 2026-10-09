@@ -404,6 +404,20 @@ const 跑一遍 = (state, samples, extra = {}) =>
   checkThat("结算出来的时长就是封顶那么长", out[0].durationMs >= DOLL_DEFAULTS.maxHoldMs, `${out[0].durationMs}ms`);
 }
 
+console.log("\n「还抱着」阈值比噪声低时要提醒");
+{
+  /*
+   * 手机放着不动的晃动高过「还抱着」那个阈值，放下了也一直结束不了，要等十分钟
+   * 封顶 —— 用户看到的就是「抱完没反应」。抱了半分钟还没结算就提醒一次。
+   */
+  const st = createDollState();
+  跑一遍(st, flow(0, 0.1, [5.0, ...held(200)])); // 20 秒
+  check("20 秒时还没提醒", st.longWarned, false);
+  跑一遍(st, flow(20.1, 0.1, held(150))); // 再 15 秒，过了 30 秒
+  check("过了 30 秒提醒一次", st.longWarned, true);
+  checkThat("仍然算抱着（只是提醒，不擅自结算）", st.holding);
+}
+
 console.log("\n手机那头变了的时候");
 {
   // 用户在手机上换了实验：buffer 名可能已经不存在了，状态全作废

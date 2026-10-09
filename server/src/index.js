@@ -1405,6 +1405,40 @@ app.post("/api/order/test", async (req, res) => {
  * 路径写死不跟着配置走：这个地址要抄进手机上的实验文件里（其实是我们生成的），
  * 少一处能填错的地方。
  */
+/**
+ * 同一个推送地址，用**浏览器**打开时的样子 —— 给人排查用的。
+ *
+ * phyphox 发的是 POST，浏览器地址栏只能发 GET，所以以前把实验文件里那个地址
+ * 贴进手机浏览器只会看到一个光秃秃的 404，什么都说明不了。现在 GET 也接，
+ * 回一句人话：
+ *
+ *  - 打不开 → 网络那一段不通（地址、防火墙、IP 白名单）；
+ *  - 「密钥不对」→ 手机上那份实验文件是旧的；
+ *  - 「通了」→ 地址和密钥都没问题，剩下的就是 phyphox 那头（播放键、切后台）。
+ *
+ * 功能没开时照样 404，和 POST 那条一个规矩：不对外承认这儿有东西。
+ */
+app.get(DOLL_PUSH_PATH, (req, res) => {
+  const api = loadConfig()?.dollApi ?? {};
+  const want = String(api.pushSecret ?? "").trim();
+  if (!api.enabled || api.mode !== "push" || !want) return res.status(404).end();
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  const got = String(req.query?.secret ?? "").trim();
+  if (got !== want) {
+    return res
+      .status(403)
+      .send("共感娃娃推送口：地址是通的，但密钥不对。\n手机上那份实验文件是旧的 —— 去控制台重新下载一份装上。");
+  }
+  logInfo("共感娃娃", "有人用浏览器打开了推送地址，地址和密钥都对");
+  res.send(
+    "共感娃娃推送口：通了，地址和密钥都对。\n\n" +
+      "接下来要是还没反应，问题在 phyphox 那头：\n" +
+      "· 打开的是「共感娃娃」这个实验（不是自带的加速度实验）\n" +
+      "· 按了播放键，而且 phyphox 一直开在前台\n" +
+      "· 实验页面底下有没有红色的 error 提示"
+  );
+});
+
 /** 「推过来但这边没收」那句话的节流状态，见下面那条路由。 */
 let dollPushQuiet = { why: "", at: 0 };
 
@@ -1466,6 +1500,17 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
     note(false, `数据看不懂：${error}`);
     logWarn("共感娃娃", `推过来的数据看不懂：${error}`);
     return res.status(400).json({ ok: false, error });
+  }
+  /*
+   * 断了一阵之后的第一包（或者开机后的第一包）报一声「连上了」。
+   *
+   * 成功的推送以前是**一个字都不打**的（每两秒一包，打了就刷屏）——
+   * 结果「推到了但还没认出拥抱」和「根本没推到」在控制台上一模一样，
+   * 都是一片安静。这一句只在状态变化时说，不刷屏。
+   */
+  const prev = lastDollPush;
+  if (!prev || !prev.ok || Date.now() - prev.at > 60_000) {
+    logInfo("共感娃娃", `手机连上来了，开始收数据（这一包 ${parsed.samples.length} 个样本）`);
   }
   if (!parsed.samples.length) {
     note(true, "这一包是空的");

@@ -237,6 +237,27 @@ st = await status();
 checkThat("状态接口点明是密钥的事", /密钥不对/.test(st.lastPush?.why ?? ""), JSON.stringify(st.lastPush));
 checkThat("而且提示了「文件是不是改密钥之前下的」", /之前下的/.test(st.lastPush?.why ?? ""), st.lastPush?.why);
 
+/* ================= 7. 控制台得「有反应」 ================= */
+
+console.log("\n=== 7. 推到了就得在控制台看得见 ===");
+/*
+ * 实机上被问了好几次「抱完控制台什么反应都没有」。以前成功的推送一个字都
+ * 不打，「推到了还没认出拥抱」和「根本没推到」长得一模一样。
+ */
+const logText = () => serverLog.join("");
+checkThat("第一包到的时候报了「手机连上来了」", logText().includes("手机连上来了"), "");
+checkThat("抱起来那一刻就报了，不用等放下", logText().includes("抱起来了"), "");
+
+/* ================= 8. 拿手机浏览器直接打开推送地址 ================= */
+
+console.log("\n=== 8. 用浏览器打开推送地址，能看出通不通 ===");
+let g = await fetch(addr);
+check("密钥对：200", g.status, 200);
+checkThat("页面上说「通了」", (await g.text()).includes("通了"), "");
+g = await fetch(`${base}/doll/hug?secret=OLD-ONE`);
+check("密钥不对：403", g.status, 403);
+checkThat("页面上点明是实验文件旧了", (await g.text()).includes("重新下载"), "");
+
 /* ================= 收尾 ================= */
 
 server.kill();

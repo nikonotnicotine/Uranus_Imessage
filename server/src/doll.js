@@ -59,7 +59,7 @@
  * 它是被捂着的，一松手就亮/变远。填了那个的时长准得多，没填也能跑。
  */
 
-import { logDebug, logInfo } from "./logs.js";
+import { logDebug, logInfo, logWarn } from "./logs.js";
 
 /** 探一次（/config、/meta、cmd=start）给多久。手机慢，给宽一点。 */
 const PROBE_TIMEOUT = 8_000;
@@ -96,6 +96,9 @@ const RESTART_EVERY_MS = 30_000;
  * 详见 feedDollSamples 里那段「时间轴往回走了，是哪一种」。
  */
 const STALE_BATCHES_MAX = 3;
+
+/** 连续算「抱着」多久就提醒一句阈值可能太低。见 feedDollSamples。 */
+const LONG_HOLD_WARN_MS = 30_000;
 
 /* ================= 地址 ================= */
 
@@ -658,6 +661,8 @@ export function createDollState() {
      * 每一包**都比上次那个时间早。连着几包都旧 → 才是真的重来。
      */
     staleBatches: 0,
+    /** 这一次拥抱里「抱得太久了」那句提醒说过没有（一次拥抱只说一次） */
+    longWarned: false,
   };
 }
 
@@ -761,6 +766,13 @@ export function feedDollSamples(state, page, opts = DOLL_DEFAULTS) {
         state.activeT = s.t;
         state.peak = s.a;
         state.activeHits = 1;
+        state.longWarned = false;
+        /*
+         * 抱起来的那一刻就吭一声。以前要等**放下、结算完**才有第一条日志，
+         * 于是「抱着的时候控制台一片安静」和「压根没收到数据」长得一模一样 ——
+         * 实机上就这么被问过好几次「抱了没反应」。
+         */
+        logInfo("共感娃娃", `抱起来了（这一下 ${s.a.toFixed(2)}），等放下之后结算`);
       }
       state.since = s.t;
       continue;
@@ -775,6 +787,21 @@ export function feedDollSamples(state, page, opts = DOLL_DEFAULTS) {
 
     const heldMs = (state.activeT - state.startT) * 1000;
     const quietMs = (s.t - state.activeT) * 1000;
+
+    /*
+     * 抱了半分钟还没结算，十有八九不是真抱了这么久，而是「还抱着」那个阈值
+     * 比手机放着不动时的噪声还低 —— 于是放下了也一直算「还抱着」，要等十分钟
+     * 封顶才结算，用户这期间看到的就是「抱完没反应」。说一次，把当下的数摆出来。
+     */
+    if (!state.longWarned && heldMs >= LONG_HOLD_WARN_MS) {
+      state.longWarned = true;
+      logWarn(
+        "共感娃娃",
+        `已经连续算「抱着」${Math.round(heldMs / 1000)} 秒了。要是其实早放下了，说明「还抱着算几」` +
+          `（现在是 ${o.hold}）比手机放着不动时的晃动还低，放下了也一直结束不了 —— ` +
+          `把它调高一点（这会儿读数大概在 ${s.a.toFixed(2)} 上下）`
+      );
+    }
 
     // 封顶：一直有动静（装在包里走路那种），到点先结算一次
     if (heldMs >= o.maxHoldMs) {
