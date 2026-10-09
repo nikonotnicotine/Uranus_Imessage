@@ -246,7 +246,7 @@ console.log("\n=== 7. 推到了就得在控制台看得见 ===");
  */
 const logText = () => serverLog.join("");
 checkThat("第一包到的时候报了「手机连上来了」", logText().includes("手机连上来了"), "");
-checkThat("抱起来那一刻就报了，不用等放下", logText().includes("抱起来了"), "");
+checkThat("有动静那一刻就报了，不用等放下", logText().includes("有动静了"), "");
 
 /* ================= 8. 拿手机浏览器直接打开推送地址 ================= */
 
@@ -257,6 +257,41 @@ checkThat("页面上说「通了」", (await g.text()).includes("通了"), "");
 g = await fetch(`${base}/doll/hug?secret=OLD-ONE`);
 check("密钥不对：403", g.status, 403);
 checkThat("页面上点明是实验文件旧了", (await g.text()).includes("重新下载"), "");
+
+/* ================= 9. 两步校准（推送模式） ================= */
+
+console.log("\n=== 9. 两步校准：截住推过来的数据，替用户算阈值 ===");
+/*
+ * 实机上用户说「我不懂物理也不懂这些数字是什么意思」。校准是让他只做两件事
+ * （放着、抱着），数字由后端算。这里验整条：开窗 → 推 → 到点收尾 → 给建议。
+ */
+const calib = async (kind, pushes) => {
+  const r = await fetch(`${base}/api/doll/calib`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ kind, seconds: 3 }),
+  });
+  check(`开始校准「${kind}」`, r.status, 200);
+  for (const p of pushes) await push(p);
+  await sleep(3200);
+  return (await fetch(`${base}/api/doll/calib`, { headers: { Cookie: cookie } })).json();
+};
+let tc = 200;
+const next = (vals) => {
+  const out = seg(tc, vals);
+  tc += vals.length * 0.05 + 0.05;
+  return out;
+};
+// 第一包会被丢掉（装的是开窗之前那两秒），所以这里故意让第一包很大：混进来的话「放着」就不准了
+let c = await calib("still", [next([9, 9, 9]), next(quiet(40)), next(quiet(40))]);
+check("「放着」读完", c.active, null);
+checkThat("开窗后第一包被丢掉了（不然峰值会是 9）", c.still?.peak < 1, JSON.stringify(c.still));
+check("还没做第二步，不给建议", c.suggestion, null);
+
+c = await calib("hug", [next(quiet(10)), next([3.4, ...held(30)]), next([2.7, ...held(30)])]);
+checkThat("「抱着」读到了峰值", c.hug?.peak >= 3.4, JSON.stringify(c.hug));
+checkThat("两步做完给出建议", Boolean(c.suggestion), "");
+checkThat("建议的「抱起来」落在放着和抱着之间", c.suggestion.start > c.still.peak && c.suggestion.start < c.hug.peak, JSON.stringify(c.suggestion));
 
 /* ================= 收尾 ================= */
 

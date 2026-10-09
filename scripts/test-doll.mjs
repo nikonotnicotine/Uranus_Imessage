@@ -69,6 +69,8 @@ const {
   renderHugLine,
   shouldTryStart,
   startDollMeasuring,
+  suggestThresholds,
+  summarizeCalib,
 } = await import("../server/src/doll.js");
 
 /* ================= 1. 地址 ================= */
@@ -326,8 +328,8 @@ const quiet = (n) => Array.from({ length: n }, () => 0.03);
 /** 一段「抱着」：n 个刚过活跃阈值的样本（呼吸、体动） */
 const held = (n) => Array.from({ length: n }, () => 0.5);
 
-const 跑一遍 = (state, samples, extra = {}) =>
-  feedDollSamples(state, { session: "s1", measuring: true, samples, cover: null, ...extra }, DOLL_DEFAULTS);
+const 跑一遍 = (state, samples, extra = {}, opts = DOLL_DEFAULTS) =>
+  feedDollSamples(state, { session: "s1", measuring: true, samples, cover: null, ...extra }, opts);
 
 {
   // 一次像样的拥抱：抱起来那一下 5.0，然后抱着 3 秒，然后放下安静 5 秒
@@ -402,6 +404,43 @@ const 跑一遍 = (state, samples, extra = {}) =>
   const out = 跑一遍(st, 很多);
   check("超过封顶先结算一次", out.length, 1);
   checkThat("结算出来的时长就是封顶那么长", out[0].durationMs >= DOLL_DEFAULTS.maxHoldMs, `${out[0].durationMs}ms`);
+}
+
+console.log("\n两步校准：替用户算阈值");
+{
+  check("空读数", summarizeCalib([]).count, 0);
+  const sum = summarizeCalib([0.1, 0.2, 0.3, -0.4, null, NaN]);
+  check("负数按绝对值、非数跳过", sum.count, 4);
+  check("峰值", sum.peak, 0.4);
+
+  /*
+   * 用实机日志里那位用户的读数：放在桌上的晃动很小，抱起来那一下在
+   * 2~3.4 之间（日志里一串「抱起来了（这一下 2.02 / 2.34 / 3.38）」），
+   * 抱住之后手机几乎不动 —— 默认阈值下全被判成「不算抱」。
+   */
+  const still = summarizeCalib(Array.from({ length: 160 }, (_, i) => (i % 40 === 0 ? 0.09 : 0.03)));
+  const hug = summarizeCalib([3.38, 2.3, 2.72, ...Array.from({ length: 100 }, () => 0.6)]);
+  const s = suggestThresholds(still, hug);
+  check("分得开 → ok", s.ok, true);
+  checkThat("「抱起来」在放着的峰值之上", s.start > still.peak, JSON.stringify(s));
+  checkThat("「抱起来」在抱着的峰值之下（不然真抱也够不着）", s.start < hug.peak, JSON.stringify(s));
+  // 判「放下了」要连续安静好几秒：线要是低于放着时的峰值，永远等不到安静够久
+  checkThat("「还抱着」压过放着时的峰值", s.hold > still.peak, JSON.stringify(s));
+  checkThat("「还抱着」不超过「抱起来」的一半", s.hold <= s.start * 0.5 + 1e-9, JSON.stringify(s));
+  checkThat("轻轻 < 用力", s.soft < s.firm, JSON.stringify(s));
+  check("最短时长降到 0.8 秒", s.minHoldMs, 800);
+
+  // 用校准出来的数，喂一次「抱住之后不太动」的拥抱 —— 实机上正是这种被判掉了
+  const st = createDollState();
+  const opts = { ...DOLL_DEFAULTS, ...s };
+  跑一遍(st, flow(0, 0.05, [...quiet(20), 3.38, ...Array.from({ length: 20 }, () => 0.6)]), {}, opts);
+  const out = 跑一遍(st, flow(2.1, 0.05, quiet(100)), {}, opts);
+  check("用校准过的阈值，同样那一抱认出来了", out.length, 1);
+
+  // 两段分不开：照样给数，但 ok=false 并说明
+  const bad = suggestThresholds(summarizeCalib([0.5, 0.6]), summarizeCalib([0.7]));
+  check("分不开 → ok=false", bad.ok, false);
+  checkThat("并且说明了原因", bad.note.includes("差别不大"), bad.note);
 }
 
 console.log("\n「还抱着」阈值比噪声低时要提醒");

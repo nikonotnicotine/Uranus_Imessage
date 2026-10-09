@@ -57,6 +57,8 @@ import {
   fetchDollSamples,
   guessDollBuffers,
   parseDollPush,
+  suggestThresholds,
+  summarizeCalib,
 } from "./doll.js";
 import { getLastPrompt } from "./lastprompt.js";
 import {
@@ -1439,6 +1441,65 @@ app.get(DOLL_PUSH_PATH, (req, res) => {
   );
 });
 
+/**
+ * 推送模式下的两步校准。
+ *
+ * 拉模式的校准是后端主动去读手机几秒（calibrateDoll）；推模式下后端联系不上
+ * 手机，只能**截住接下来几秒推过来的数据**。所以这里是一个「录音窗口」：
+ * 面板上点一下开始，推送口收到的样本在窗口期内都抄一份进来，到点算概况。
+ *
+ * `skipFirst`：开窗后到的第一包要丢掉。手机每两秒推一包，那一包里装的是
+ * **开窗之前**那两秒的数据 —— 用户点「抱着」之后才去抱，第一包里多半还是
+ * 放着的样子，混进来会把「抱着」的读数拉低。
+ *
+ * 只在内存里：校准是当场做的事，重启了重做就是。
+ */
+let dollCalib = null; // { kind, until, values:[], skipFirst } | null
+const dollCalibDone = {}; // { still?: summary, hug?: summary }
+
+/** 窗口到点了就收尾。在推送口和查询口两头都调，谁先碰到谁收。 */
+function finishDollCalib() {
+  if (!dollCalib || Date.now() < dollCalib.until) return;
+  const { kind, values } = dollCalib;
+  dollCalibDone[kind] = summarizeCalib(values);
+  dollCalib = null;
+  const r = dollCalibDone[kind];
+  logInfo(
+    "共感娃娃",
+    r.count
+      ? `校准「${kind === "still" ? "放着别动" : "抱着"}」读完了：${r.count} 个样本，最大晃到 ${r.peak}`
+      : `校准「${kind === "still" ? "放着别动" : "抱着"}」这几秒一个样本都没收到（phyphox 在前台开着、点了播放吗？）`
+  );
+}
+
+app.post("/api/doll/calib", (req, res) => {
+  const api = loadConfig()?.dollApi ?? {};
+  if (!api.enabled || api.mode !== "push") {
+    return res.status(400).json({ ok: false, error: "这个校准只在「手机推给后端」模式、总开关开着的时候能用" });
+  }
+  const kind = req.body?.kind === "hug" ? "hug" : "still";
+  // 默认 8 秒：手机两秒一包，丢掉第一包之后还能收到三包
+  const seconds = Math.min(Math.max(Number(req.body?.seconds) || 8, 3), 20);
+  dollCalib = { kind, until: Date.now() + seconds * 1000, values: [], skipFirst: true };
+  delete dollCalibDone[kind];
+  logInfo("共感娃娃", `开始校准「${kind === "still" ? "放着别动" : "抱着"}」，读 ${seconds} 秒`);
+  res.json({ ok: true, kind, seconds });
+});
+
+app.get("/api/doll/calib", (_req, res) => {
+  finishDollCalib();
+  const { still, hug } = dollCalibDone;
+  res.json({
+    ok: true,
+    active: dollCalib
+      ? { kind: dollCalib.kind, left: Math.max(0, Math.ceil((dollCalib.until - Date.now()) / 1000)) }
+      : null,
+    still: still ?? null,
+    hug: hug ?? null,
+    suggestion: still?.count && hug?.count ? suggestThresholds(still, hug) : null,
+  });
+});
+
 /** 「推过来但这边没收」那句话的节流状态，见下面那条路由。 */
 let dollPushQuiet = { why: "", at: 0 };
 
@@ -1508,6 +1569,13 @@ app.post(DOLL_PUSH_PATH, async (req, res) => {
    * 结果「推到了但还没认出拥抱」和「根本没推到」在控制台上一模一样，
    * 都是一片安静。这一句只在状态变化时说，不刷屏。
    */
+  // 校准窗口开着就抄一份（见 dollCalib 的注释；开窗后第一包丢掉）
+  finishDollCalib();
+  if (dollCalib) {
+    if (dollCalib.skipFirst) dollCalib.skipFirst = false;
+    else for (const x of parsed.samples) dollCalib.values.push(x.a);
+  }
+
   const prev = lastDollPush;
   if (!prev || !prev.ok || Date.now() - prev.at > 60_000) {
     logInfo("共感娃娃", `手机连上来了，开始收数据（这一包 ${parsed.samples.length} 个样本）`);

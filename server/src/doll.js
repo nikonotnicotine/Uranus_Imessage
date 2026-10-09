@@ -602,6 +602,97 @@ export function buildDollExperiment({ url, rate = 20, interval = 2, cover = fals
 `;
 }
 
+/* ================= 两步校准：替用户把阈值算出来 ================= */
+
+/**
+ * 一段读数的概况。校准两步各出一份。
+ *
+ * 除了峰值和均值，还要 p90 / p95：放着不动的那一段里偶尔会有一两个跳点
+ * （有人从桌边走过、手机自己震了一下），只看峰值会把「还抱着」的线抬得太高。
+ *
+ * @param {number[]} values
+ * @returns {{count:number, peak:number, avg:number, p90:number, p95:number}}
+ */
+export function summarizeCalib(values) {
+  const v = (values ?? []).filter((x) => typeof x === "number" && Number.isFinite(x)).map(Math.abs);
+  if (!v.length) return { count: 0, peak: 0, avg: 0, p90: 0, p95: 0 };
+  const sorted = [...v].sort((a, b) => a - b);
+  const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+  const round = (x) => Number(x.toFixed(3));
+  return {
+    count: v.length,
+    peak: round(sorted[sorted.length - 1]),
+    avg: round(v.reduce((a, b) => a + b, 0) / v.length),
+    p90: round(at(0.9)),
+    p95: round(at(0.95)),
+  };
+}
+
+/**
+ * 从「放着不动」和「抱着」两段读数，算出那几个阈值。
+ *
+ * ── 为什么要有这个 ──
+ *
+ * 那几个数（多大算抱起来、多小算放下）跟手机型号、玩偶多厚、手机塞在哪儿都
+ * 有关，纸上定不出来。以前让用户自己看峰值、均值去填 —— 实机上的回答是
+ * 「我不懂物理也不懂这些数字是什么意思」，这完全合理。所以让他只做两件事
+ * （放着、抱着），数字这边算。
+ *
+ * ── 怎么算 ──
+ *
+ *  - 「放着」的上沿取 max(p95, 峰值×0.6)：既不被一两个跳点拉高，也不至于
+ *    把真实存在的晃动当没有；
+ *  - **抱起来**：放在「放着的上沿」和「抱着的峰值」之间，靠下一点（40% 处）。
+ *    靠下是因为真抱的时候不一定每次都像校准那次那么用力；
+ *  - **还抱着**：放着的上沿再高一截，但不超过「抱起来」的一半 —— 不然
+ *    「还抱着」和「抱起来」挤在一起，抱着稍微松一点就被判成放下；
+ *  - **轻轻 / 用力**：按这次抱着的峰值往两边分；
+ *  - **最短时长**降到 0.8 秒：校准过的阈值已经够挡住桌子的晃动了，
+ *    不需要再靠「动够 1.5 秒」来防误触 —— 那道闸实机上把真抱也挡掉了
+ *    （抱着不动时手机几乎不晃，算出来的时长就很短）。
+ *
+ * 两段分不开（抱着的峰值没比放着的上沿高多少）时照样给一组数，但 `ok`
+ * 为假并说明原因 —— 多半是手机没塞紧、或者抱得太轻，校准这一步没测出区别。
+ *
+ * @returns {{ok:boolean, note:string, start:number, hold:number, soft:number,
+ *            firm:number, minHoldMs:number}}
+ */
+export function suggestThresholds(still, hug) {
+  const r2 = (x) => Number(Math.max(0.01, x).toFixed(2));
+  const stillTop = Math.max(still?.p95 ?? 0, (still?.peak ?? 0) * 0.6, 0.02);
+  const hugPeak = hug?.peak ?? 0;
+
+  const gap = hugPeak - stillTop;
+  const ok = hugPeak > stillTop * 1.5 && gap > 0.3;
+
+  const start = ok ? stillTop + gap * 0.4 : Math.max(stillTop * 1.2, hugPeak * 0.7);
+  /*
+   * 「还抱着」必须压过放着时的**峰值**，不能只压过 p95。
+   *
+   * 判「放下了」要连续安静好几秒（默认 4 秒，20Hz 下是 80 个样本）。线要是
+   * 只比 p95 高一点，放着的时候每 20 个样本里就有一个越线，80 个里几乎必然
+   * 撞上一个 —— 于是永远等不到「安静够久」，正是实机上「一直卡着不结算」
+   * 那个症状。所以取峰值再高两成；封顶在「抱起来」的一半，免得一个跳点
+   * 把它顶得太高。
+   */
+  const hold = Math.min(Math.max((still?.peak ?? 0) * 1.2, stillTop * 1.5, 0.05), start * 0.5);
+  const soft = start + Math.max(hugPeak - start, 0) * 0.5;
+  const firm = Math.max(hugPeak * 1.3, soft + 0.5);
+
+  return {
+    ok,
+    note: ok
+      ? ""
+      : `「放着」和「抱着」差别不大（放着最高 ${stillTop.toFixed(2)}，抱着最高 ${hugPeak.toFixed(2)}），` +
+        "可能是手机没塞紧、或者这次抱得太轻。先照这组数试试，不灵的话把手机塞紧一点、抱的时候用点力，再校准一次",
+    start: r2(start),
+    hold: r2(hold),
+    soft: r2(soft),
+    firm: r2(firm),
+    minHoldMs: 800,
+  };
+}
+
 /* ================= 认出一次拥抱 ================= */
 
 /**
@@ -772,7 +863,7 @@ export function feedDollSamples(state, page, opts = DOLL_DEFAULTS) {
          * 于是「抱着的时候控制台一片安静」和「压根没收到数据」长得一模一样 ——
          * 实机上就这么被问过好几次「抱了没反应」。
          */
-        logInfo("共感娃娃", `抱起来了（这一下 ${s.a.toFixed(2)}），等放下之后结算`);
+        logInfo("共感娃娃", `有动静了（晃动 ${s.a.toFixed(2)}），看看是不是一次拥抱…`);
       }
       state.since = s.t;
       continue;
@@ -821,9 +912,17 @@ export function feedDollSamples(state, page, opts = DOLL_DEFAULTS) {
       if (heldMs >= o.minHoldMs && state.activeHits >= 3) {
         out.push({ durationMs: Math.round(heldMs), peak: state.peak });
       } else {
-        logDebug(
+        /*
+         * **用人话说，而且是 logInfo。** 以前这里是 debug 级别、一串术语：
+         * 用户只看到一行「抱起来了」，之后再也没下文，以为是卡住了 ——
+         * 其实那一下早就结束了，只是被判成「碰了一下」。实机上就这么卡过。
+         */
+        const sec = (heldMs / 1000).toFixed(1);
+        const need = (o.minHoldMs / 1000).toFixed(1);
+        logInfo(
           "共感娃娃",
-          `有一下动静不算抱（${Math.round(heldMs)}ms、峰值 ${state.peak.toFixed(2)}、活跃 ${state.activeHits} 个样本）`
+          `刚才那一下不算抱：只持续了 ${sec} 秒（要 ${need} 秒以上才算），多半是拿起放下或者碰了一下。` +
+            `要是你确实抱了却被这样判掉，去控制台「共感娃娃」里做一下两步校准`
         );
       }
       const session = state.session;

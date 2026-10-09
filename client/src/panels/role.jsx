@@ -2917,6 +2917,117 @@ function DollAddressHint({ port, addresses, onFill }) {
   );
 }
 
+/**
+ * 推送模式的两步校准。
+ *
+ * 实机上用户的原话是「我不懂物理也不懂这些数字是什么意思」。所以这里不让人
+ * 看波形、不让人自己填数：只做两件事 —— 放着、抱着 —— 剩下的后端算
+ * （doll.js:suggestThresholds），一个按钮填进去。
+ *
+ * 后端那边是个「录音窗口」：点了之后截住接下来几秒推过来的样本。所以
+ * 点完按钮要**手机那头在推**（phyphox 前台开着、点了播放）才读得到东西。
+ */
+function DollPushCalib({ updateDollApi }) {
+  const [st, setSt] = useState(null);
+  const [err, setErr] = useState("");
+  const [filled, setFilled] = useState(false);
+
+  const load = async () => {
+    try {
+      setSt(await api("/api/doll/calib"));
+      setErr("");
+    } catch (e) {
+      setErr(String(e?.message ?? e));
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  // 读着的时候每秒刷一次，读完就停
+  useEffect(() => {
+    if (!st?.active) return undefined;
+    const t = setInterval(load, 1000);
+    return () => clearInterval(t);
+  }, [st?.active?.kind]);
+
+  const start = async (kind) => {
+    setFilled(false);
+    try {
+      await api("/api/doll/calib", { method: "POST", body: { kind } });
+      await load();
+    } catch (e) {
+      setErr(String(e?.message ?? e));
+    }
+  };
+
+  const busy = Boolean(st?.active);
+  const line = (r, label) =>
+    !r ? null : r.count ? (
+      <span>
+        {label}：读到 {r.count} 个数，最大晃到 <strong className="text-ink-soft">{r.peak}</strong>
+      </span>
+    ) : (
+      <span className="text-warn">{label}：一个数都没收到 —— phyphox 在前台开着、点了播放吗？</span>
+    );
+
+  const sug = st?.suggestion;
+
+  return (
+    <div className="grid grid-cols-1 gap-3 rounded border border-line p-3">
+      <p className="text-ui text-ink">两步校准</p>
+      <p className="text-meta leading-relaxed text-ink-faint">
+        手机塞好在娃娃里、phyphox 开着并点了播放，然后：
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="outline" disabled={busy} onClick={() => start("still")}>
+          第一步：娃娃放着别碰，点这里
+        </Button>
+        <Button variant="outline" disabled={busy} onClick={() => start("hug")}>
+          第二步：点这里，然后马上抱住娃娃
+        </Button>
+      </div>
+      {busy && (
+        <p className="text-meta text-ink-soft">
+          正在读「{st.active.kind === "still" ? "放着别碰" : "抱着"}」……还剩 {st.active.left} 秒
+          {st.active.kind === "hug" ? "，抱紧一点、可以晃一晃" : "，别碰它"}
+        </p>
+      )}
+      <p className="grid gap-1 text-meta leading-relaxed text-ink-faint">
+        {line(st?.still, "放着")}
+        {line(st?.hug, "抱着")}
+      </p>
+      {sug && (
+        <div className="grid gap-2">
+          {sug.note && <p className="text-meta leading-relaxed text-warn">{sug.note}</p>}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              onClick={() => {
+                updateDollApi({
+                  start: sug.start,
+                  hold: sug.hold,
+                  soft: sug.soft,
+                  firm: sug.firm,
+                  minHoldMs: sug.minHoldMs,
+                });
+                setFilled(true);
+              }}
+            >
+              照校准结果填好
+            </Button>
+            {filled && <span className="text-meta text-good">填好了，记得保存。抱一下试试。</span>}
+          </div>
+          <p className="text-meta leading-relaxed text-ink-faint">
+            （会填成：超过 {sug.start} 算抱起来，低于 {sug.hold} 算放下，至少持续 {sug.minHoldMs / 1000} 秒）
+          </p>
+        </div>
+      )}
+      {err && <p className="text-meta text-warn">{err}</p>}
+    </div>
+  );
+}
+
 function DollPushFields({ doll, updateDollApi }) {
   const url = String(doll.pushUrl ?? "").trim();
   const secret = String(doll.pushSecret ?? "").trim();
@@ -3017,6 +3128,9 @@ function DollPushFields({ doll, updateDollApi }) {
           <span className="mt-0.5 block text-meta leading-relaxed text-ink-faint">
             抱着不动的时候加速度几乎是 0，光看加速度会以为已经放下了；加上这个，
             「被捂着」就算还抱着，时长准得多。没有这个传感器的机器会自动跳过。
+            <br />
+            <strong className="text-ink-soft">iPhone 上实测读不到</strong>
+            （phyphox 在 iPhone 上拿不到接近传感器的数据），开了也不起作用，关着就行。
           </span>
         </span>
         <Switch
@@ -3304,10 +3418,9 @@ function RoleHugFields({ role }) {
                 默认值是按「手机塞在玩偶里、人把玩偶抱起来」估的，不一定合你那只。
                 {doll.mode === "push" ? (
                   <>
-                    调法：手机上打开那个实验，底下就是一张实时波形图 ——
-                    <strong className="text-ink-soft">放着不动</strong>看基线有多高，
-                    <strong className="text-ink-soft">抱一下</strong>看峰值冲到多少。
-                    「抱起来」填在两者之间，「还抱着」填得比基线高一点。
+                    不用看懂下面这些数字 —— 用下面的
+                    <strong className="text-ink-soft">两步校准</strong>
+                    ：先让娃娃放着读一次，再抱着读一次，这边自己把数算出来填好。
                   </>
                 ) : (
                   <>
@@ -3327,7 +3440,11 @@ function RoleHugFields({ role }) {
               主动问手机要数据。那边改成看手机上那张实时波形图（生成的实验
               文件里就带着一张），效果一样直观。
             */}
-            {doll.mode !== "push" && <DollCalibrateButton doll={doll} updateDollApi={updateDollApi} />}
+            {doll.mode === "push" ? (
+              <DollPushCalib updateDollApi={updateDollApi} />
+            ) : (
+              <DollCalibrateButton doll={doll} updateDollApi={updateDollApi} />
+            )}
 
             <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
               <NumberField
