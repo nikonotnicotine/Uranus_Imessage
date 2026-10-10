@@ -25,7 +25,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { patchHttp2Window } from "../server/src/http2window.js";
 import { closeClients, createLineClients } from "../server/src/photongrpc.js";
+
+// 和正式运行时一致
+await patchHttp2Window();
 
 const MB = Number(process.argv[2]) || 4;
 const DATA = path.resolve("data");
@@ -104,7 +108,8 @@ try {
       const info = await client.attachments.get(guid);
       const bytes = Number(info?.totalBytes ?? 0);
       console.log(`  ${guid.slice(0, 20)}…  ${kb(bytes)}  ${info?.mimeType || "(无 mime)"}  ${info?.transferState}`);
-      if (bytes > 100 * 1024 && (!picked || bytes > picked.bytes)) picked = { guid, bytes, name: info?.fileName };
+      // 挑 1～4MB 的：太小量不出速度，太大的在慢线路上要等很久
+      if (bytes > 1024 * 1024 && bytes < 4 * 1024 * 1024 && !picked) picked = { guid, bytes, name: info?.fileName };
     } catch (e) {
       console.log(`  ${guid.slice(0, 20)}…  取不到：${String(e?.message ?? e).slice(0, 50)}`);
     }
@@ -122,6 +127,9 @@ try {
   let got = 0;
   let prev = 0;
   const marks = [];
+  // 慢线路上别闷着：每 5 秒报一次进度，90 秒还没下完就停
+  let lastReport = start;
+  const giveUp = setTimeout(() => frames.close().catch(() => {}), 90_000);
   for await (const frame of frames) {
     if (frame.type !== "primaryChunk") continue;
     const now = Date.now();
@@ -132,8 +140,13 @@ try {
     marks.push({ at: now - start, gap: now - prev, size: frame.data.length });
     prev = now;
     got += frame.data.length;
+    if (now - lastReport >= 5000) {
+      lastReport = now;
+      console.log(`  +${ms(now - start)} 已下 ${kb(got)}`);
+    }
   }
-  await frames.close();
+  clearTimeout(giveUp);
+  await frames.close().catch(() => {});
 
   const total = Date.now() - start;
   const transferSecs = Math.max(0.001, (Date.now() - firstByteAt) / 1000);
