@@ -50,7 +50,7 @@ export function ChatPanel() {
             </p>
             <p className="mt-1 text-meta leading-relaxed text-ink-faint">
               {force
-                ? "现在是开着的。上面那个分隔符不生效了，改成按标点和空白切 —— 逗号、句号、问号、叹号（中英两套）、分号冒号顿号、省略号、任意个换行、任意个空格。"
+                ? "现在是开着的。上面那个分隔符不生效了，改成按标点切 —— 逗号、句号、问号、叹号（中英两套）、分号冒号顿号、省略号、任意个换行。空格不切（它在句子内部，不是句子之间）。"
                 : "现在是关着的。只按上面的分隔符切，模型怎么给就怎么发。角色要是老不分段、或者拿空行当间隔，开这个。"}
             </p>
             {force && (
@@ -79,8 +79,10 @@ export function ChatPanel() {
                 <code className="mx-1 font-mono text-ink-soft">
                   3{config.chat.separator || "$"}14
                 </code>
-                。方括号里的内容不切（语音、图片、卡片那些标记是整条，里面的逗号是台词）。
-                不想被切就别开。
+                。方括号里的内容不切（语音、图片、卡片那些标记是整条，里面的逗号是台词），
+                里面再套一层括号也不切，像
+                <code className="mx-1 font-mono text-ink-soft">[audio_message:[whispers] …]</code>
+                这种。不想被切就别开。
               </p>
             )}
           </div>

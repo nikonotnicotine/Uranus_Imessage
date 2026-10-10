@@ -816,6 +816,59 @@ export function sniffImageType(buf) {
 }
 
 /**
+ * 这份字节看着是不是一张**完整**的图 —— 只看尾巴，不解码。
+ *
+ * ── 为什么需要它 ──
+ *
+ * 用户报的「识图识出一片黑」就是这个：附件的 gRPC 流提前结束（不报错），
+ * 我们拿着半份 JPEG 一路往下走，ffmpeg 把缺的部分填成死色、**退出码 0**，
+ * 于是一张下半截全黑的图被当成正常图送去识别。拿本仓库打包的 ffmpeg 实测
+ * （testsrc2 2400×1800 的 JPEG 按比例截断后，跑 shrinkForVision 的同一条命令）：
+ *
+ *     下到 45% → 退出码 0，下半幅 YAVG=0（纯黑）
+ *     下到 15% → 退出码 0，85% 的画面是一整块死色
+ *
+ * attachread.js 那边已经拿 SDK 报的 `size` 对过一次账，但那条路有两个漏洞：
+ * `size` 可能压根没有（可选字段），以及对账失败五轮之后它会把最长的那份
+ * 残缺字节交出来（理由见那边的注释）。所以识别前再验一道尾巴 —— 这道**不**
+ * 依赖任何外部报的数字，只看这份字节自己说不说得通。
+ *
+ * ── 为什么只认 JPEG 和 PNG ──
+ *
+ * 这两种有明确、固定、就在最后几个字节的结束标记：JPEG 的 EOI（FFD9）、
+ * PNG 的 IEND 块。WebP / GIF 的结构没这么干脆（WebP 靠 RIFF 长度字段、
+ * GIF 的 trailer 只有一个字节 0x3B，太容易在残缺数据里偶然命中），认不准
+ * 的一律返回 true —— 这道校验的职责是「抓住确凿的残缺」，不是「证明完整」。
+ * 宁可漏掉几张也不能把好图误杀，那样代价是角色看不见对方发的图。
+ *
+ * JPEG 的 FFD9 往后找一小段而不是死抠最后两个字节：有些相机和聊天软件会在
+ * EOI 后面追 EXIF 缩略图或者填充字节，抠死了会把完整的图判成残缺。
+ *
+ * @param {Buffer} buf 图片字节
+ * @returns {boolean} 确凿残缺时 false；完整、或者认不出格式时 true
+ */
+export function imageLooksComplete(buf) {
+  if (!buf?.length) return false;
+  const hit = sniffImageType(buf);
+  if (!hit) return true; // 认不出格式就不表态
+
+  if (hit.mimeType === "image/jpeg") {
+    // EOI 可能不在最末尾（后面跟着 EXIF 缩略图、填充字节），往回找一小段
+    const tail = buf.subarray(Math.max(0, buf.length - 64));
+    for (let i = 0; i < tail.length - 1; i += 1) {
+      if (tail[i] === 0xff && tail[i + 1] === 0xd9) return true;
+    }
+    return false;
+  }
+  if (hit.mimeType === "image/png") {
+    // IEND 块：长度(0) + "IEND" + CRC，固定是最后 12 个字节
+    if (buf.length < 12) return false;
+    return buf.subarray(buf.length - 8, buf.length - 4).toString("ascii") === "IEND";
+  }
+  return true;
+}
+
+/**
  * 上传上来的文件名 → 能安全落盘、且不撞名的文件名。
  *
  * 壁纸、参考图、表情包三处上传共用这一份 —— 三边的规矩本来就该一样，
@@ -1231,6 +1284,21 @@ export async function toMp3ForStt(buffer, { ext = "", mimeType = "", scope }) {
  */
 const VISION_SHRINK_MIN = 700 * 1024;
 
+/*
+ * ffmpeg 在 stderr 里说「这份图片数据是坏的」的几种说法。
+ *
+ * `EOI missing` 和 `overread` 是 mjpeg 解码器碰上截断 JPEG 的两句话（实测一份
+ * 截断到 55% 的图两句都出现了；换个截断位置可能只出其中一句，所以两句都认）。
+ * `Premature end` / `truncated` / `Invalid JPEG` / `error while decoding` 是
+ * 同一件事在别的解码器和别的版本里的措辞；PNG 残缺报的是 `IDAT`/`CRC error`。
+ *
+ * 宁可认窄不认宽：这个正则命中就放弃压缩结果、退回原图，代价只是这一张图
+ * 传得慢一点。认宽了（比如把 `warning` 一概算上）会把大量正常图的压缩白白
+ * 扔掉 —— 那正是这个函数一开始要避免的事。
+ */
+const DECODE_BROKEN =
+  /eoi missing|overread|premature end|truncat|invalid jpeg|error while decoding|corrupt|crc error/i;
+
 /**
  * 压完最长边不超过这个。
  *
@@ -1311,6 +1379,25 @@ export async function shrinkForVision(buffer, { mimeType = "", name = "", scope 
 
       if (code !== 0) {
         logWarn(scope, `ffmpeg 压图失败（退出码 ${code}），按原图送去识别`, clipBody(stderr));
+        return fallback();
+      }
+      /*
+       * 退出码 0 也得看一眼 stderr。
+       *
+       * ffmpeg 碰上残缺图片**不报错**：它尽力解出能解的部分，剩下的填成死色，
+       * 然后心满意足地 exit 0。实测截断到 15% 的 JPEG 走这条命令，退出码是 0、
+       * 输出文件 49KB 看着一切正常，画面 85% 是一整块死色。
+       *
+       * 但它在 stderr 里是**喊过**的（`[mjpeg @ …] overread 8`）—— 以前这段
+       * 只在 `code !== 0` 时才读 stderr，这个现成的信号就白扔了。
+       *
+       * 认出来之后走 fallback 而不是抛错：压缩本来就是「永不抛错」的那一类
+       * （见函数头）。原图送上去，让 imessage.js:readImage 那道尾标记校验
+       * 去决定这张图要不要识别 —— 那道判得比关键词准，这里只负责别把一张
+       * 已经被填成黑块的压缩结果当成好图递出去。
+       */
+      if (DECODE_BROKEN.test(String(stderr ?? ""))) {
+        logWarn(scope, "ffmpeg 解这张图时报了残缺（压出来多半有死色块），按原图送去识别", clipBody(stderr));
         return fallback();
       }
       const out = await fs.promises.readFile(outPath);

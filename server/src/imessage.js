@@ -72,6 +72,7 @@ import {
   describeEffectId,
   generateImage,
   hasLeaveOnRead,
+  imageLooksComplete,
   resolveRefFile,
   shrinkForVision,
   splitMedia,
@@ -238,6 +239,11 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
  *
  * 20 秒：正常一张手机照片一两秒就下完，这个数碰不到；真卡住的那种，二十秒
  * 之后多等也只是让对方干等。
+ *
+ * 上面那个 321 秒的案例后来查清了，是 HTTP/2 接收窗口没配导致的（详见
+ * http2window.js）—— 窗口修好之后 3.1MB 实测 1.9 秒，这个 20 秒的闸门
+ * 日常更碰不到了。留着它是因为「服务端回源慢」那一类卡顿还在：实机见过
+ * 第一个字节等 80～120 秒，那种跟带宽无关，照样得让这一轮先走。
  */
 const IMAGE_PATIENCE_MS = 20_000;
 
@@ -1094,6 +1100,17 @@ async function readImage(content, scope = "桥接") {
   if (!buf?.length) throw new Error("附件读出来是空的");
   if (buf.length > MAX_IMAGE_BYTES) {
     throw new Error(`图片 ${mb(buf.length)}MB，超过 ${cap}MB 上限`);
+  }
+  /*
+   * 残缺的图**不送去识别**，宁可这一轮当没收到。
+   *
+   * 半份 JPEG 不会报错、也不会是空的 —— 它会被解码器补成一张下半截死黑的图，
+   * 模型照着那张黑图一本正经地描述一通（用户报的「识图识出一片黑」）。
+   * 那比「没看见图」糟得多：没看见还能从上下文绕过去，看见一张假图就是
+   * 言之凿凿地说错话。详见 media.js:imageLooksComplete。
+   */
+  if (!imageLooksComplete(buf)) {
+    throw new Error(`图片没下全（${mb(buf.length)}MB，结尾标记不在），这一轮不送去识别`);
   }
 
   /*

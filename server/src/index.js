@@ -255,6 +255,7 @@ import {
   logWarn,
   subscribe,
 } from "./logs.js";
+import { patchHttp2Window } from "./http2window.js";
 import { canRestart, requestRestart, setShutdown } from "./restart.js";
 import { clearCaches, startMaintenance } from "./maintenance.js";
 import {
@@ -265,6 +266,16 @@ import {
   login,
   mustChangeCredentials,
 } from "./auth.js";
+
+/*
+ * 必须在任何 gRPC 客户端建立之前调 —— 已经连上的连接不会被追溯改窗口。
+ * 放在这儿（模块体最顶上、app 还没建）是整个进程里最早能跑到的地方之一。
+ * 不调的话收附件只有 127KB/s，详见 http2window.js 的文件头。
+ *
+ * 不 await：模块体里 await 会拖慢整个启动，而 gRPC 连接要到桥接起来时才建，
+ * 这几个微任务绰绰有余。失败了它自己吞掉（最坏结果是「没加速」）。
+ */
+void patchHttp2Window();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_DIST = path.resolve(__dirname, "../../client/dist");

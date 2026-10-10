@@ -422,7 +422,7 @@ export const DEFAULT_CONFIG = {
   // 发送节奏是全局的：几个角色打字的手感一致
   chat: {
     separator: "$", // 气泡分隔符
-    // 强制分隔：不认 $，改按逗号句号换行空格切。和 separator 是互斥的两条路
+    // 强制分隔：不认 $，改按逗号句号换行切（空格不算）。和 separator 是互斥的两条路
     forceSeparator: false,
     queueWait: 8, // 收到消息后合并等待时间（秒）
     delay: {

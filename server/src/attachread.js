@@ -96,7 +96,7 @@ const LOUD_BYTES = 2 * 1024 * 1024;
  */
 export function isTransientRead(err) {
   const name = String(err?.constructor?.name ?? err?.name ?? "");
-  if (name === "ConnectionError" || name === "TimeoutError") return true;
+  if (name === "ConnectionError" || name === "TimeoutError" || name === "ShortReadError") return true;
   const text = `${err?.message ?? ""} ${err?.cause?.message ?? ""}`;
   return /Connection dropped|UNAVAILABLE|DEADLINE_EXCEEDED|socket hang up|ECONNRESET|ETIMEDOUT|EPIPE/i.test(
     text
@@ -126,8 +126,10 @@ export function isTransientRead(err) {
  * @param {string} what 日志里的东西名：「图片」/「语音」/「文件」
  * @param {{firstByteMs?: number, stallMs?: number}} [limits] 卡住多久算死（默认
  *   FIRST_BYTE_MS / STALL_MS）。只有自测会传：真等 60 秒的测试没人跑
- * @returns {Promise<Buffer>}
- * @throws 最后一次的错误。不可重试的当场抛，不等。
+ * @returns {Promise<Buffer>} 字节。和 SDK 报的 `size` 对过账（见循环里那段）；
+ *   重试耗尽还是短的话返回**最长的那份残缺字节**而不是抛错，调用方自己验
+ *   （图片那条路验尾标记，见 media.js:imageLooksComplete）
+ * @throws 最后一次的错误。不可重试的当场抛，不等；一个字节都没拿到也抛。
  */
 export async function readBytes(content, scope, what, limits = {}) {
   const claimed = Number(content?.size ?? 0);
@@ -142,18 +144,42 @@ export async function readBytes(content, scope, what, limits = {}) {
 
   const startedAt = Date.now();
   let last = null;
+  // 历次尝试里最长的那份。全都短了的话，宁可交出最长的也别一张都不给（见下）
+  let best = null;
   for (let i = 0; i <= RETRY_MS.length; i += 1) {
     if (i) {
       const wait = RETRY_MS[i - 1];
       logWarn(
         scope,
-        `读${what}附件${last instanceof TimeoutError ? "卡住了" : "断在半路"}，${(wait / 1000).toFixed(1)}s 后第 ${i} 次重试`,
+        `读${what}附件${stuckWord(last)}，${(wait / 1000).toFixed(1)}s 后第 ${i} 次重试`,
         last
       );
       await new Promise((resolve) => setTimeout(resolve, wait));
     }
     try {
       const { buf, firstMs } = await fetchOnce(content, { scope, what, claimed, loud, ...limits });
+      if (!best || buf.length > best.length) best = buf;
+      /*
+       * 和 SDK 报的大小对一下账。
+       *
+       * 为什么必须对：流**提前 done 不报错**时（服务端把流结束掉，不是断开），
+       * 上面那个 for 循环一个异常都收不到，`Buffer.concat` 把半份字节当成全份
+       * 交出去。调用方也看不出来 —— readImage 只验「空」和「超上限」。实机
+       * 表现就是用户报的「识图识出一片黑」：半份 JPEG 过一遍 ffmpeg，缺的那
+       * 部分被解码器填成死色，而 ffmpeg **退出码是 0**，于是整条链路一声不响
+       * 地把一张下半截全黑的图送去识别。
+       *
+       * 留 SLACK：`totalBytes` 是服务端算的，和我们收到的 primaryChunk 字节
+       * 对不对得上严格取决于它怎么算（见 AttachmentInfo —— Live Photo 的伴随
+       * 文件另有自己的 CompanionInfo.totalBytes，所以理论上该相等）。真要是
+       * 口径差几个字节，不留余量就会把**每一张**附件都判成残缺、白白重试五轮，
+       * 那比现在这个 bug 更糟。差一点点不计较，差一大截才当残缺。
+       */
+      if (claimed > 0 && buf.length < claimed - SHORT_SLACK_BYTES) {
+        throw new ShortReadError(
+          `${what}只下到 ${mb(buf.length)}MB，SDK 报的是 ${mb(claimed)}MB（流提前结束了）`
+        );
+      }
       const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
       // 第一个字节等了多久：分得清「服务端半天不吐」和「吐得慢」（见 fetchOnce）
       const first = firstMs >= FIRST_BYTE_NOTE_MS ? `，其中等第一个字节 ${(firstMs / 1000).toFixed(1)}s` : "";
@@ -166,7 +192,48 @@ export async function readBytes(content, scope, what, limits = {}) {
       if (!isTransientRead(e)) throw e;
     }
   }
+  /*
+   * 五轮下来还是短的：把最长的那份交出去，**不抛**。
+   *
+   * 这一步是防自己写错的保险。万一 `totalBytes` 的口径和这里的假设不一样
+   * （上面 SLACK 那段讲的那种），抛错等于把每一张附件都毙掉 —— 一个本来
+   * 只影响少数残缺图的 bug，会被这道校验放大成「所有图都识别不了」。
+   *
+   * 残缺图不会就这么混进识别：图片那条路还有一道尾标记校验
+   * （imessage.js:readImage → media.js:imageLooksComplete），JPEG 的 FFD9、
+   * PNG 的 IEND 不在就不送去识别。这里只负责把字节和这行警告交出去。
+   */
+  if (best?.length) {
+    logWarn(
+      scope,
+      `${what}重试 ${RETRY_MS.length} 轮都没下全（最多下到 ${mb(best.length)}MB` +
+        `${claimed ? `，应有 ${mb(claimed)}MB` : ""}），先按这份残缺的往下走`,
+      last
+    );
+    return best;
+  }
   throw last;
+}
+
+/**
+ * 字节数差多少之内不算残缺。
+ *
+ * 4KB：对一张几 MB 的图来说是噪音级的差异，而真正的「流提前结束」实测是
+ * 差掉一半以上（3.5MB 只下到 1.8MB）。两者量级差了三个数量级，这条线
+ * 划在哪儿都不影响判断。
+ */
+const SHORT_SLACK_BYTES = 4096;
+
+/** 字节没下全。名字要叫 ShortReadError —— isTransientRead 靠它认出「可以重试」。 */
+class ShortReadError extends Error {
+  name = "ShortReadError";
+}
+
+/** 重试那行日志里「因为什么」那半句。 */
+function stuckWord(err) {
+  if (err instanceof TimeoutError) return "卡住了";
+  if (err instanceof ShortReadError) return "没下全";
+  return "断在半路";
 }
 
 /**
@@ -178,9 +245,24 @@ export async function readBytes(content, scope, what, limits = {}) {
  * 一次重试都没触发 —— 流没断，只是半天不来字节。RETRY_MS 只管「断了」，
  * 管不到「没断但不动」，于是那 5 分多钟里只能干等，连是卡在哪儿都看不出来。
  *
- * 两个数分开：第一个字节之前服务端可能还在把附件从 Apple 那边取回来，
- * 给得宽一些；一旦开始吐了，中途 60 秒一个字节都不来就是真卡了，
- * 掐掉重开一条比接着等更有希望。掐掉抛的是 TimeoutError，走上面的重试。
+ * 两个数分开：第一个字节之前服务端可能还在把附件从 Apple 那边取回来（实机
+ * 见过 80～120 秒），给得宽一些；一旦开始吐了，中途 60 秒一个字节都不来就是
+ * 真卡了。掐掉抛的是 TimeoutError，走上面的重试。
+ *
+ * ── 为什么 60 秒这个数现在是对的 ──
+ *
+ * 这两个数曾经被一份「3.5MB 下了七分钟」的日志逼着往上抬过，当时的理由是
+ * 「掐掉重开等于从零开始，而这条链路只有 13～18KB/s，重下一次太亏」。
+ *
+ * 那个理由站不住 —— 13KB/s 本身是我们自己的 bug：HTTP/2 接收窗口没配，
+ * 卡在默认的 64KB，吞吐被按在「窗口 ÷ RTT」上（详见 http2window.js）。
+ * 窗口调到 8MB 之后同一个附件实测 5032KB/s，3.1MB 总共 1.9 秒。
+ *
+ * 于是「重开的代价」从「几分钟」变回了「一两秒」，掐掉重来重新变成划算的
+ * 选择，60 秒也重新变成一个合理的「这条流已经死了」的判据。
+ *
+ * 要是以后又看见这里频繁超时，别再来调大这个数 —— 先去量一遍
+ * （scripts/diag-attach-speed.mjs），看是不是又有哪一层把吞吐按下去了。
  */
 const FIRST_BYTE_MS = 180_000;
 const STALL_MS = 60_000;
