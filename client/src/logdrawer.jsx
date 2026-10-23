@@ -8,21 +8,23 @@
  *
  * 两个状态：
  *  - `open`：展开 / 收成胶囊。收起时只剩一个胶囊，显示连接状态和问题条数角标。
- *  - `pinned`：固定。打开过一次就记到 localStorage，下次进控制台自动展开。
+ *  - `defaultOpen`：默认展开偏好（footer 可勾选，localStorage 记忆）。
+ *    开启后每次进入页面都自动展开；临时收起只影响本次会话，下次仍以偏好为准。
+ *    未开启时保留旧习惯：手动展开一次后会记住，刷新仍展开。
  *
  * 和「控制台」面板的区别：那个是完整版（搜索、复制、清空、账号、服务控制…），
  * 这个是它的「随身缩略」——只取实时日志 + 链路状态，主打「不切页面也能盯着」。
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Pause, Play, Pin, PinOff, Radio, Search, Terminal, Trash2, X } from "lucide-react";
+import { Pause, Play, Radio, Search, Terminal, Trash2, X } from "lucide-react";
 import { useLogs } from "./store.jsx";
 import { LEVEL_FILTERS, LEVEL_META, LEVEL_ORDER, LogRow } from "./panels/console.jsx";
 
 const DRAWER_OPEN_KEY = "uranus.logdrawer.open.v1";
-const DRAWER_PIN_KEY = "uranus.logdrawer.pinned.v1";
+const DRAWER_DEFAULT_OPEN_KEY = "uranus.logdrawer.defaultOpen.v1";
 
-/** 读 localStorage 的布尔偏好，读不到按传入的默认值。 */
+/** 读 localStorage 的布尔偏好，读不到返回 fallback。 */
 function readBool(key, fallback) {
   try {
     const v = window.localStorage.getItem(key);
@@ -35,8 +37,14 @@ function readBool(key, fallback) {
 
 export function LiveLogDrawer() {
   const { logs, connected, paused, setPaused, pendingCount, clear } = useLogs();
-  const [open, setOpen] = useState(() => readBool(DRAWER_OPEN_KEY, false));
-  const [pinned, setPinned] = useState(() => readBool(DRAWER_PIN_KEY, false));
+  const [defaultOpen, setDefaultOpen] = useState(() =>
+    readBool(DRAWER_DEFAULT_OPEN_KEY, false)
+  );
+  const [open, setOpen] = useState(() => {
+    // 开了「默认展开」就每次都展开；否则沿用「上次是否展开」的记忆（首次则为关）
+    if (defaultOpen) return true;
+    return readBool(DRAWER_OPEN_KEY, false);
+  });
   const [level, setLevel] = useState("info");
   const [query, setQuery] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
@@ -46,16 +54,16 @@ export function LiveLogDrawer() {
     try {
       window.localStorage.setItem(DRAWER_OPEN_KEY, open ? "1" : "0");
     } catch {
-      /* 隐身模式：这一次照样展开，只是刷新后记不住 */
+      /* 隐身模式：本次照样展开，只是刷新后记不住 */
     }
   }, [open]);
   useEffect(() => {
     try {
-      window.localStorage.setItem(DRAWER_PIN_KEY, pinned ? "1" : "0");
+      window.localStorage.setItem(DRAWER_DEFAULT_OPEN_KEY, defaultOpen ? "1" : "0");
     } catch {
       /* 同上 */
     }
-  }, [pinned]);
+  }, [defaultOpen]);
 
   const minRank = LEVEL_ORDER.indexOf(level);
   const filtered = useMemo(() => {
@@ -74,8 +82,9 @@ export function LiveLogDrawer() {
   // 警告以上条数：收起时当角标，一眼看出「有没有出问题」
   const problemCount = useMemo(
     () =>
-      logs.filter((e) => LEVEL_ORDER.indexOf(e.level) >= LEVEL_ORDER.indexOf("warn"))
-        .length,
+      logs.filter(
+        (e) => LEVEL_ORDER.indexOf(e.level) >= LEVEL_ORDER.indexOf("warn")
+      ).length,
     [logs]
   );
 
@@ -95,13 +104,11 @@ export function LiveLogDrawer() {
 
   function collapse() {
     setOpen(false);
-    // 收起时一并取消固定：固定本意就是「一直展开」，收起说明不想一直展开了
-    if (pinned) setPinned(false);
   }
-  function togglePin() {
-    setPinned((p) => {
-      const next = !p;
-      if (next) setOpen(true); // 钉上就立刻展开
+  function toggleDefaultOpen() {
+    setDefaultOpen((v) => {
+      const next = !v;
+      if (next) setOpen(true); // 开启默认展开时立刻展开当前会话
       return next;
     });
   }
@@ -128,7 +135,7 @@ export function LiveLogDrawer() {
 
   return (
     <div className="fixed bottom-4 left-4 z-40 flex w-[min(440px,calc(100vw-2rem))] flex-col rounded-2xl border border-line bg-paper shadow-xl">
-      {/* 头部：标题 + 链路状态 + 固定/收起 */}
+      {/* 头部：标题 + 链路状态 + 收起 */}
       <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <Terminal size={15} className="shrink-0 text-ink-meta" />
@@ -143,17 +150,6 @@ export function LiveLogDrawer() {
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
-          <button
-            type="button"
-            onClick={togglePin}
-            aria-label={pinned ? "取消固定" : "固定（每次打开都展开）"}
-            title={pinned ? "取消固定（每次打开都展开）" : "固定（每次打开都展开）"}
-            className={`flex h-8 w-8 items-center justify-center rounded-item transition-colors duration-150 ${
-              pinned ? "text-ink" : "text-ink-faint hover:bg-sunken hover:text-ink"
-            }`}
-          >
-            {pinned ? <Pin size={14} strokeWidth={2} /> : <PinOff size={14} />}
-          </button>
           <button
             type="button"
             onClick={collapse}
@@ -245,10 +241,20 @@ export function LiveLogDrawer() {
         )}
       </div>
 
-      <p className="border-t border-line px-3 py-2 text-meta leading-relaxed text-ink-faint">
-        后端实时日志。线下模式等生成时盯着这里：链路断了会先变红「已断开」，
-        API 报错（超时 / 拒连 / 限流）会实时冒出来 —— 不用切去控制台面板。
-      </p>
+      <div className="flex items-center justify-between gap-3 border-t border-line px-3 py-2">
+        <label className="inline-flex cursor-pointer select-none items-center gap-1.5 text-meta text-ink-faint">
+          <input
+            type="checkbox"
+            checked={defaultOpen}
+            onChange={toggleDefaultOpen}
+            className="h-3.5 w-3.5 accent-blue-500"
+          />
+          默认展开
+        </label>
+        <p className="text-meta leading-relaxed text-ink-faint">
+          后端实时日志。盯着这里：链路断了先变红「已断开」，报错实时冒出 —— 不用切控制台。
+        </p>
+      </div>
     </div>
   );
 }
