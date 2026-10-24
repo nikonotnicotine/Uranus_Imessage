@@ -4,7 +4,7 @@
  * 痛点：线下模式等 API 出字时，页面一片空白干等，分不清是「在慢慢生成」还是
  * 「API 已经断了」，只能切去「控制台」面板看日志。这个抽屉把同一份实时日志流
  * （全局 LogProvider 的 SSE，控制台面板也在用）钉在页面角落，任何分区都能看到，
- * 不用切 tab。
+ * 不用切 tab。气泡支持拖到任意位置，落点会记忆到 localStorage，避免挡住视野。
  *
  * 两个状态：
  *  - `open`：展开 / 收成胶囊。收起时只剩一个胶囊，显示连接状态和问题条数角标。
@@ -23,6 +23,9 @@ import { LEVEL_FILTERS, LEVEL_META, LEVEL_ORDER, LogRow } from "./panels/console
 
 const DRAWER_OPEN_KEY = "uranus.logdrawer.open.v1";
 const DRAWER_DEFAULT_OPEN_KEY = "uranus.logdrawer.defaultOpen.v1";
+const DRAWER_POS_KEY = "uranus.logdrawer.pos.v1";
+const DRAWER_W = 440; // 面板估算宽度，用于展开时越界修正
+const DRAWER_EST_H = 430; // 面板估算高度（日志区 300 + 头/工具条/底栏）
 
 /** 读 localStorage 的布尔偏好，读不到返回 fallback。 */
 function readBool(key, fallback) {
@@ -33,6 +36,22 @@ function readBool(key, fallback) {
   } catch {
     return fallback;
   }
+}
+
+/** 读气泡位置，读不到/非法则默认落在右下角（不再死磕左下）。 */
+function readPos() {
+  try {
+    const raw = window.localStorage.getItem(DRAWER_POS_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && typeof p.x === "number" && typeof p.y === "number") return p;
+    }
+  } catch {
+    /* ignore */
+  }
+  const w = typeof window !== "undefined" ? window.innerWidth : 1280;
+  const h = typeof window !== "undefined" ? window.innerHeight : 800;
+  return { x: Math.max(8, w - 140), y: Math.max(8, h - 64) };
 }
 
 export function LiveLogDrawer() {
@@ -49,6 +68,49 @@ export function LiveLogDrawer() {
   const [query, setQuery] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const boxRef = useRef(null);
+
+  // 气泡位置：可拖动，落点记忆到 localStorage（默认右下角，不再死磕左下）
+  const [pos, setPos] = useState(readPos);
+  const posRef = useRef(pos);
+  posRef.current = pos;
+  const [dragging, setDragging] = useState(false);
+
+  /** 生成拖拽手柄：onPointerDown 启动；松手时若几乎没动则当作点击（onTap）。 */
+  const makeDrag = (onTap) => (e) => {
+    if (e.button != null && e.button !== 0) return; // 只响应左键 / 触摸
+    if (e.cancelable) e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const baseX = posRef.current.x;
+    const baseY = posRef.current.y;
+    let moved = false;
+    setDragging(true);
+    const move = (ev) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+      const maxX = window.innerWidth - 60;
+      const maxY = window.innerHeight - 48;
+      const nx = Math.max(8, Math.min(baseX + dx, maxX));
+      const ny = Math.max(8, Math.min(baseY + dy, maxY));
+      const next = { x: nx, y: ny };
+      posRef.current = next;
+      setPos(next);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setDragging(false);
+      if (!moved && onTap) onTap();
+      try {
+        window.localStorage.setItem(DRAWER_POS_KEY, JSON.stringify(posRef.current));
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
 
   useEffect(() => {
     try {
@@ -114,12 +176,22 @@ export function LiveLogDrawer() {
   }
 
   if (!open) {
+    const capStyle = {
+      left: pos.x,
+      top: pos.y,
+      right: "auto",
+      bottom: "auto",
+      touchAction: "none",
+    };
     return (
       <button
         type="button"
-        onClick={() => setOpen(true)}
-        title="展开实时日志"
-        className="fixed bottom-4 left-4 z-40 inline-flex items-center gap-2 rounded-full border border-line bg-paper px-3.5 py-2 text-ui shadow-lg transition-colors duration-150 hover:bg-sunken"
+        onPointerDown={makeDrag(() => setOpen(true))}
+        title="展开实时日志（可拖动到任意位置）"
+        style={capStyle}
+        className={`fixed z-40 inline-flex items-center gap-2 rounded-full border border-line bg-paper px-3.5 py-2 text-ui shadow-lg transition-colors duration-150 hover:bg-sunken ${
+          dragging ? "cursor-grabbing" : "cursor-grab"
+        }`}
       >
         <Radio size={13} className={connected ? "text-good animate-pulse" : "text-warn"} />
         <span className="text-ink">实时日志</span>
@@ -133,10 +205,33 @@ export function LiveLogDrawer() {
     );
   }
 
+  // 展开面板：跟随气泡位置，但自动避让屏幕右/下边缘，保证完整可见
+  const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
+  const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+  let panelLeft = pos.x;
+  let panelTop = pos.y;
+  if (panelLeft + DRAWER_W > vw - 8) panelLeft = Math.max(8, vw - DRAWER_W - 8);
+  if (panelTop + DRAWER_EST_H > vh - 8) panelTop = Math.max(8, vh - DRAWER_EST_H - 8);
+  const panelStyle = {
+    left: panelLeft,
+    top: panelTop,
+    right: "auto",
+    bottom: "auto",
+  };
+
   return (
-    <div className="fixed bottom-4 left-4 z-40 flex w-[min(440px,calc(100vw-2rem))] flex-col rounded-2xl border border-line bg-paper shadow-xl">
-      {/* 头部：标题 + 链路状态 + 收起 */}
-      <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
+    <div
+      style={panelStyle}
+      className="fixed z-40 flex w-[min(440px,calc(100vw-2rem))] flex-col rounded-2xl border border-line bg-paper shadow-xl"
+    >
+      {/* 头部：标题 + 链路状态 + 收起（整条头部可拖动） */}
+      <div
+        onPointerDown={makeDrag(null)}
+        style={{ touchAction: "none" }}
+        className={`flex items-center justify-between gap-2 border-b border-line px-3 py-2 select-none ${
+          dragging ? "cursor-grabbing" : "cursor-grab"
+        }`}
+      >
         <div className="flex min-w-0 items-center gap-2">
           <Terminal size={15} className="shrink-0 text-ink-meta" />
           <span className="truncate text-ui text-ink">运行日志</span>
@@ -152,6 +247,7 @@ export function LiveLogDrawer() {
         <div className="flex shrink-0 items-center gap-0.5">
           <button
             type="button"
+            onPointerDown={(e) => e.stopPropagation()}
             onClick={collapse}
             aria-label="收起日志"
             title="收起日志"
@@ -252,7 +348,7 @@ export function LiveLogDrawer() {
           默认展开
         </label>
         <p className="text-meta leading-relaxed text-ink-faint">
-          后端实时日志。盯着这里：链路断了先变红「已断开」，报错实时冒出 —— 不用切控制台。
+          后端实时日志。盯着这里：链路断了先变红「已断开」，报错实时冒出 —— 不用切控制台。拖动标题栏可挪到任意位置。
         </p>
       </div>
     </div>
