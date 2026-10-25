@@ -60,7 +60,7 @@ import {
   readStory,
   setCurrent,
 } from "./offlinestore.js";
-import { presetLabel, resolvePreset } from "./preset.js";
+import { presetLabel, resolvePreset, rulesForDepth } from "./preset.js";
 import { buildPrompt, wrap } from "./prompt.js";
 import { applyAndLog, applyRules } from "./regex.js";
 
@@ -289,13 +289,26 @@ export function storyForView(config, role, story) {
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
   };
-  const turns = (story?.turns ?? []).map((t) =>
+  /*
+   * 楼层号：**倒数**第几条角色回复，最新那条是 1（和 prompt.js:filterHistory
+   * 一个数法 —— 只数 assistant，不然楼层号会随「这轮有没有人插话」漂移）。
+   *
+   * 带楼层的渲染规则靠它工作：「最近两楼出完整日程表、更早的只留一行」这种。
+   * 从后往前数，所以先把下标算出来再 map。
+   */
+  const all = story?.turns ?? [];
+  const depths = new Map();
+  let d = 0;
+  for (let i = all.length - 1; i >= 0; i -= 1) {
+    if (all[i]?.role === "assistant") depths.set(i, (d += 1));
+  }
+  const turns = all.map((t, i) =>
     t.role === "assistant"
       ? {
           ...t,
           // trim 跟 runTurn 那边保持一致 —— 剥 <content> 会留下一个行首空行，
           // 一边 trim 一边不 trim 的话，同一条气泡刷新前后长得不一样
-          display: applyRules(t.content, preset.regex, {
+          display: applyRules(t.content, rulesForDepth(preset.regex, depths.get(i) ?? null), {
             target: "aiOutput",
             field: "toUser",
             vars,
@@ -628,9 +641,17 @@ export async function runOfflineTurn(config, role, user, opts = {}) {
    * 下一轮拼提示词时才执行（`buildPrompt` 已经在调，见 historyOf 那条路）。
    * 所以模型看到的上文照旧是滤过的，没有 HTML 泄进去。
    */
+  /*
+   * 刚生成的这一条**永远是最新那楼**，所以楼层号写死 1 —— 而不是 null。
+   *
+   * 传 null 的话带 `maxDepth` 的规则（「只有最近一两楼出完整日程表」）在这儿会被
+   * 当成「不分楼层、一律跑」，看着也对；但等下一轮刷新整条剧情时，
+   * storyForView 按真实楼层又算一遍，同一条气泡的样子就变了。写死 1 让
+   * 「刚发出来」和「刷新之后」是同一个结果。
+   */
   const display = applyAndLog(
     cut.body,
-    built.preset.regex,
+    rulesForDepth(built.preset.regex, 1),
     { target: "aiOutput", field: "toUser", vars },
     "线下回复（给人看）"
   ).text;

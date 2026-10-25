@@ -59,7 +59,9 @@ import {
   SPY_CHILD_KINDS,
   formatChildLead,
   resolvePreset,
+  rulesForDepth,
 } from "./preset.js";
+import { makeVarScope } from "./promptvars.js";
 import { applyRules } from "./regex.js";
 // 只为了线下模式的「线上聊天记录」条目 —— 线上存档是那批消息唯一的来源
 import { listSessions, recentMessages } from "./sessions.js";
@@ -655,18 +657,29 @@ export function mergeAdjacent(messages) {
  */
 export function filterHistory(hist, rules, vars) {
   const out = [];
-  for (const m of hist) {
+  /*
+   * 楼层号：**倒数**第几条 assistant 消息，最新那条是 1。
+   *
+   * 只数 assistant —— 带楼层的规则讲的都是「角色的第几次回复」（第 N 楼的状态栏、
+   * 日程表那些），把对方说的话也数进去的话楼层号会随「这轮有没有人插话」漂移。
+   * 从后往前遍历就是为了先知道「这是倒数第几条」。
+   */
+  let depth = 0;
+  for (let i = hist.length - 1; i >= 0; i -= 1) {
+    const m = hist[i];
     const content = applyVars(m.content, vars);
     if (m.role !== "assistant" || !rules?.length) {
-      if (content) out.push({ role: m.role, content });
+      if (content) out.unshift({ role: m.role, content });
       continue;
     }
-    const { text } = applyRules(content, rules, {
+    depth += 1;
+    // 管这一楼的规则才跑。一条都不剩时 applyRules 原样返回，不白跑
+    const { text } = applyRules(content, rulesForDepth(rules, depth), {
       target: "aiOutput",
       field: "toHistory",
       vars,
     });
-    if (text.trim()) out.push({ role: m.role, content: text });
+    if (text.trim()) out.unshift({ role: m.role, content: text });
   }
   return out;
 }
@@ -829,7 +842,19 @@ export async function buildPrompt(config, role, user, history, weatherNote = "",
     user: user?.name ?? "",
     sep: config?.chat?.separator ?? "",
   };
-  const fill = (text) => applyVars(text, vars).trim();
+  /*
+   * `fill` 现在走变量表（promptvars.js）而不是光 applyVars：除了 char / user /
+   * sep / lastUserMessage 四个名字，还认 setvar / getvar / trim / random / roll。
+   *
+   * **一轮一张表**，所以 scope 开在这儿而不是模块顶上 —— 同时挂着好几条号码时，
+   * 一张共享的表会让两个角色的变量互相串味。
+   *
+   * 条目**按顺序**求值（下面那个 for 就是预设里排好的顺序），这跟变量汇编式预设
+   * 的写法对得上：上面几十条 setvar 先把料攒齐，后面的 getvar 才拼得出东西。
+   * 反过来（先 get 后 set）读到的是空串，promptvars 会报一条 warn 点名是哪个变量。
+   */
+  const scope = makeVarScope(vars);
+  const fill = (text) => scope.fill(text);
 
   // 发给模型的那份上文：思维链之类的在这里滤掉，hist 本身留原文。
   // 天气紧接着掺进去 —— 它是这一份的一部分，不是 hist 的一部分。

@@ -1734,6 +1734,54 @@ function normalizeEntries(list, mode = "online") {
  * 导出给 transfer.js 用：正则的单独导入（`KIND.regex`）也得过同一套字段补齐，
  * 否则从别的预设导出来的规则少了 flags / targets 时，两边补出来的东西不一样。
  */
+/**
+ * 楼层号：非负整数，别的一律算「不限」。
+ *
+ * 0 是合法的（ST 那边 0 表示「从最新那条算起」），负数和小数不是 —— 手滑
+ * 输成负数时当不限，比按 0 处理更接近用户的本意（他只是没想清楚）。
+ */
+function depthOf(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+/**
+ * 这条规则管不管「倒数第 depth 条」这一楼。
+ *
+ * 区间两头都是闭的：`minDepth: 3` = 倒数第 3 条及更早，`maxDepth: 2` =
+ * 倒数第 1、2 条。两个一起写就是夹出中间一段，都是 `null` 就管所有楼层
+ * （绝大多数规则是这样）。
+ *
+ * `depth` 传 null（不分楼层的场合，比如对方刚发来那一句）时一律算「管」：
+ * 带楼层的规则在那种场合本来就无从判断，按没有这个字段时的行为走。
+ */
+function depthInRange(rule, depth) {
+  if (depth === null || depth === undefined) return true;
+  const lo = rule?.minDepth;
+  const hi = rule?.maxDepth;
+  if (lo !== null && lo !== undefined && depth < lo) return false;
+  if (hi !== null && hi !== undefined && depth > hi) return false;
+  return true;
+}
+
+/**
+ * 挑出管这一楼的规则。
+ *
+ * 做成一道独立的筛子、而不是塞进 `regex.js:applyRules`：楼层是**消息的属性**，
+ * 不是文本的属性 —— `applyRules` 收到的只是一串字，它没法知道这串字是倒数第几条。
+ * 所以由调用方（拼提示词、渲染剧情）先按楼层筛一遍再交给它。
+ *
+ * 两个调用点都要用，所以放在这儿而不是各写一份：
+ *   - `prompt.js:filterHistory`（发给模型的那份）
+ *   - `offline.js`（给人看的那份）
+ */
+export function rulesForDepth(rules, depth) {
+  const list = Array.isArray(rules) ? rules : [];
+  if (depth === null || depth === undefined) return list;
+  return list.filter((r) => depthInRange(r, depth));
+}
+
 export function normalizeRegexRules(list) {
   const used = new Set();
   return (Array.isArray(list) ? list : []).map((raw, i) => {
@@ -1767,6 +1815,23 @@ export function normalizeRegexRules(list) {
       // 两个都没勾等于这条规则什么都不做，缺字段时默认都改
       toUser: raw?.toUser === undefined ? true : Boolean(raw.toUser),
       toHistory: raw?.toHistory === undefined ? true : Boolean(raw.toHistory),
+      /*
+       * 楼层范围：这条规则只作用在「倒数第几条消息」上。
+       *
+       * `null` = 不限，这是绝大多数规则该有的样子，也是缺字段时的值
+       * （老配置原样升级）。倒数第 1 条是最新那条，往前递增。
+       *
+       * 为什么需要它：有一类省 token 的规则是「远处的楼层只留摘要」——
+       * 最近几轮发完整正文，更早的那些把状态栏、日程表之类的大块剥掉。
+       * 没有楼层概念的话这种规则只有两种结果，而两种都不是用户要的：
+       * 作用在所有楼层（连最新那条的状态栏也删了，界面上那一栏直接空掉），
+       * 或者压根不敢开。
+       *
+       * 只对 `aiOutput` 有意义 —— `userInput` 是对方刚打的那一句，落盘前就跑完了，
+       * 压根没有「第几条」可言（regex.js:applyRules 收到的 depth 是 null）。
+       */
+      minDepth: depthOf(raw?.minDepth),
+      maxDepth: depthOf(raw?.maxDepth),
     };
   });
 }
