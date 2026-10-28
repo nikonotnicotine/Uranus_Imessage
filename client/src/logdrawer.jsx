@@ -1,0 +1,356 @@
+/*
+ * 常驻「运行日志」抽屉。
+ *
+ * 痛点：线下模式等 API 出字时，页面一片空白干等，分不清是「在慢慢生成」还是
+ * 「API 已经断了」，只能切去「控制台」面板看日志。这个抽屉把同一份实时日志流
+ * （全局 LogProvider 的 SSE，控制台面板也在用）钉在页面角落，任何分区都能看到，
+ * 不用切 tab。气泡支持拖到任意位置，落点会记忆到 localStorage，避免挡住视野。
+ *
+ * 两个状态：
+ *  - `open`：展开 / 收成胶囊。收起时只剩一个胶囊，显示连接状态和问题条数角标。
+ *  - `defaultOpen`：默认展开偏好（footer 可勾选，localStorage 记忆）。
+ *    开启后每次进入页面都自动展开；临时收起只影响本次会话，下次仍以偏好为准。
+ *    未开启时保留旧习惯：手动展开一次后会记住，刷新仍展开。
+ *
+ * 和「控制台」面板的区别：那个是完整版（搜索、复制、清空、账号、服务控制…），
+ * 这个是它的「随身缩略」——只取实时日志 + 链路状态，主打「不切页面也能盯着」。
+ */
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Pause, Play, Radio, Search, Terminal, Trash2, X } from "lucide-react";
+import { useLogs } from "./store.jsx";
+import { LEVEL_FILTERS, LEVEL_META, LEVEL_ORDER, LogRow } from "./panels/console.jsx";
+
+const DRAWER_OPEN_KEY = "uranus.logdrawer.open.v1";
+const DRAWER_DEFAULT_OPEN_KEY = "uranus.logdrawer.defaultOpen.v1";
+const DRAWER_POS_KEY = "uranus.logdrawer.pos.v1";
+const DRAWER_W = 440; // 面板估算宽度，用于展开时越界修正
+const DRAWER_EST_H = 430; // 面板估算高度（日志区 300 + 头/工具条/底栏）
+
+/** 读 localStorage 的布尔偏好，读不到返回 fallback。 */
+function readBool(key, fallback) {
+  try {
+    const v = window.localStorage.getItem(key);
+    if (v === null) return fallback;
+    return v === "1";
+  } catch {
+    return fallback;
+  }
+}
+
+/** 读气泡位置，读不到/非法则默认落在右下角（不再死磕左下）。 */
+function readPos() {
+  try {
+    const raw = window.localStorage.getItem(DRAWER_POS_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && typeof p.x === "number" && typeof p.y === "number") return p;
+    }
+  } catch {
+    /* ignore */
+  }
+  const w = typeof window !== "undefined" ? window.innerWidth : 1280;
+  const h = typeof window !== "undefined" ? window.innerHeight : 800;
+  return { x: Math.max(8, w - 140), y: Math.max(8, h - 64) };
+}
+
+export function LiveLogDrawer() {
+  const { logs, connected, paused, setPaused, pendingCount, clear } = useLogs();
+  const [defaultOpen, setDefaultOpen] = useState(() =>
+    readBool(DRAWER_DEFAULT_OPEN_KEY, false)
+  );
+  const [open, setOpen] = useState(() => {
+    // 开了「默认展开」就每次都展开；否则沿用「上次是否展开」的记忆（首次则为关）
+    if (defaultOpen) return true;
+    return readBool(DRAWER_OPEN_KEY, false);
+  });
+  const [level, setLevel] = useState("info");
+  const [query, setQuery] = useState("");
+  const [autoScroll, setAutoScroll] = useState(true);
+  const boxRef = useRef(null);
+
+  // 气泡位置：可拖动，落点记忆到 localStorage（默认右下角，不再死磕左下）
+  const [pos, setPos] = useState(readPos);
+  const posRef = useRef(pos);
+  posRef.current = pos;
+  const [dragging, setDragging] = useState(false);
+
+  /** 生成拖拽手柄：onPointerDown 启动；松手时若几乎没动则当作点击（onTap）。 */
+  const makeDrag = (onTap) => (e) => {
+    if (e.button != null && e.button !== 0) return; // 只响应左键 / 触摸
+    if (e.cancelable) e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const baseX = posRef.current.x;
+    const baseY = posRef.current.y;
+    let moved = false;
+    setDragging(true);
+    const move = (ev) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+      const maxX = window.innerWidth - 60;
+      const maxY = window.innerHeight - 48;
+      const nx = Math.max(8, Math.min(baseX + dx, maxX));
+      const ny = Math.max(8, Math.min(baseY + dy, maxY));
+      const next = { x: nx, y: ny };
+      posRef.current = next;
+      setPos(next);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setDragging(false);
+      if (!moved && onTap) onTap();
+      try {
+        window.localStorage.setItem(DRAWER_POS_KEY, JSON.stringify(posRef.current));
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DRAWER_OPEN_KEY, open ? "1" : "0");
+    } catch {
+      /* 隐身模式：本次照样展开，只是刷新后记不住 */
+    }
+  }, [open]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DRAWER_DEFAULT_OPEN_KEY, defaultOpen ? "1" : "0");
+    } catch {
+      /* 同上 */
+    }
+  }, [defaultOpen]);
+
+  const minRank = LEVEL_ORDER.indexOf(level);
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return logs.filter((e) => {
+      if (LEVEL_ORDER.indexOf(e.level) < minRank) return false;
+      if (!q) return true;
+      return (
+        e.message.toLowerCase().includes(q) ||
+        e.scope.toLowerCase().includes(q) ||
+        (e.detail ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [logs, minRank, query]);
+
+  // 警告以上条数：收起时当角标，一眼看出「有没有出问题」
+  const problemCount = useMemo(
+    () =>
+      logs.filter(
+        (e) => LEVEL_ORDER.indexOf(e.level) >= LEVEL_ORDER.indexOf("warn")
+      ).length,
+    [logs]
+  );
+
+  // 新日志进来贴到底（用户往上翻时不抢滚动条）
+  useEffect(() => {
+    if (!autoScroll || !open) return;
+    const box = boxRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [filtered, autoScroll, open]);
+
+  function onScroll() {
+    const box = boxRef.current;
+    if (!box) return;
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    setAutoScroll(atBottom);
+  }
+
+  function collapse() {
+    setOpen(false);
+  }
+  function toggleDefaultOpen() {
+    setDefaultOpen((v) => {
+      const next = !v;
+      if (next) setOpen(true); // 开启默认展开时立刻展开当前会话
+      return next;
+    });
+  }
+
+  if (!open) {
+    const capStyle = {
+      left: pos.x,
+      top: pos.y,
+      right: "auto",
+      bottom: "auto",
+      touchAction: "none",
+    };
+    return (
+      <button
+        type="button"
+        onPointerDown={makeDrag(() => setOpen(true))}
+        title="展开实时日志（可拖动到任意位置）"
+        style={capStyle}
+        className={`fixed z-40 inline-flex items-center gap-2 rounded-full border border-line bg-paper px-3.5 py-2 text-ui shadow-lg transition-colors duration-150 hover:bg-sunken ${
+          dragging ? "cursor-grabbing" : "cursor-grab"
+        }`}
+      >
+        <Radio size={13} className={connected ? "text-good animate-pulse" : "text-warn"} />
+        <span className="text-ink">实时日志</span>
+        {!connected && <span className="text-eyebrow uppercase text-warn">· 断开</span>}
+        {problemCount > 0 && (
+          <span className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-warn px-1.5 text-[11px] font-medium text-white">
+            {problemCount}
+          </span>
+        )}
+      </button>
+    );
+  }
+
+  // 展开面板：跟随气泡位置，但自动避让屏幕右/下边缘，保证完整可见
+  const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
+  const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+  let panelLeft = pos.x;
+  let panelTop = pos.y;
+  if (panelLeft + DRAWER_W > vw - 8) panelLeft = Math.max(8, vw - DRAWER_W - 8);
+  if (panelTop + DRAWER_EST_H > vh - 8) panelTop = Math.max(8, vh - DRAWER_EST_H - 8);
+  const panelStyle = {
+    left: panelLeft,
+    top: panelTop,
+    right: "auto",
+    bottom: "auto",
+  };
+
+  return (
+    <div
+      style={panelStyle}
+      className="fixed z-40 flex w-[min(440px,calc(100vw-2rem))] flex-col rounded-2xl border border-line bg-paper shadow-xl"
+    >
+      {/* 头部：标题 + 链路状态 + 收起（整条头部可拖动） */}
+      <div
+        onPointerDown={makeDrag(null)}
+        style={{ touchAction: "none" }}
+        className={`flex items-center justify-between gap-2 border-b border-line px-3 py-2 select-none ${
+          dragging ? "cursor-grabbing" : "cursor-grab"
+        }`}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <Terminal size={15} className="shrink-0 text-ink-meta" />
+          <span className="truncate text-ui text-ink">运行日志</span>
+          <span
+            className={`inline-flex shrink-0 items-center gap-1 text-eyebrow uppercase ${
+              connected ? "text-good" : "text-warn"
+            }`}
+          >
+            <Radio size={11} className={connected ? "animate-pulse" : ""} />
+            {connected ? "实时连接中" : "已断开，重连中…"}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <button
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={collapse}
+            aria-label="收起日志"
+            title="收起日志"
+            className="flex h-8 w-8 items-center justify-center rounded-item text-ink-faint transition-colors duration-150 hover:bg-sunken hover:text-ink"
+          >
+            <X size={15} />
+          </button>
+        </div>
+      </div>
+
+      {/* 工具条：级别筛选 + 搜索 + 暂停/清空 */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-line px-3 py-2">
+        <div className="flex items-center gap-0.5">
+          {LEVEL_FILTERS.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              onClick={() => setLevel(f.id)}
+              className={`rounded-item px-2 py-1 text-meta transition-colors duration-150 ${
+                level === f.id
+                  ? "bg-sunken text-ink"
+                  : "text-ink-meta hover:bg-sunken hover:text-ink"
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex min-w-[120px] flex-1 items-center gap-1.5 border-b border-line pb-1 focus-within:border-ink">
+          <Search size={13} className="shrink-0 text-ink-meta" />
+          <input
+            className="w-full bg-transparent text-meta text-ink outline-none placeholder:text-ink-meta"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索关键词…"
+          />
+        </div>
+        <button
+          type="button"
+          onClick={() => setPaused(!paused)}
+          className="inline-flex h-7 items-center gap-1 rounded-item px-2 text-meta text-ink-meta transition-colors duration-150 hover:bg-sunken hover:text-ink"
+        >
+          {paused ? <Play size={13} /> : <Pause size={13} />}
+          {paused ? `继续${pendingCount ? `（+${pendingCount}）` : ""}` : "暂停"}
+        </button>
+        <button
+          type="button"
+          onClick={clear}
+          disabled={!logs.length}
+          className="inline-flex h-7 items-center gap-1 rounded-item px-2 text-meta text-ink-meta transition-colors duration-150 hover:bg-sunken hover:text-ink disabled:opacity-40"
+        >
+          <Trash2 size={13} /> 清空
+        </button>
+      </div>
+
+      {/* 日志列表 */}
+      <div className="relative">
+        <div
+          ref={boxRef}
+          onScroll={onScroll}
+          className="h-[300px] overflow-y-auto"
+        >
+          {filtered.length === 0 ? (
+            <div className="flex h-full items-center justify-center px-6">
+              <p className="max-w-[40ch] text-center text-meta leading-relaxed text-ink-faint">
+                {logs.length === 0
+                  ? "还没有日志。给线路号码发条 iMessage，或去「连接」点一下测试。"
+                  : "当前筛选条件下没有日志。"}
+              </p>
+            </div>
+          ) : (
+            filtered.map((e) => <LogRow key={e.id} entry={e} />)
+          )}
+        </div>
+        {!autoScroll && (
+          <button
+            type="button"
+            onClick={() => {
+              setAutoScroll(true);
+              const box = boxRef.current;
+              if (box) box.scrollTop = box.scrollHeight;
+            }}
+            className="absolute bottom-3 right-3 inline-flex items-center gap-1.5 rounded-full border border-line bg-paper px-3 py-1.5 text-meta text-ink-soft shadow transition-colors duration-150 hover:bg-sunken hover:text-ink"
+          >
+            回到最新
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-center justify-between gap-3 border-t border-line px-3 py-2">
+        <label className="inline-flex cursor-pointer select-none items-center gap-1.5 text-meta text-ink-faint">
+          <input
+            type="checkbox"
+            checked={defaultOpen}
+            onChange={toggleDefaultOpen}
+            className="h-3.5 w-3.5 accent-blue-500"
+          />
+          默认展开
+        </label>
+        <p className="text-meta leading-relaxed text-ink-faint">
+          后端实时日志。盯着这里：链路断了先变红「已断开」，报错实时冒出 —— 不用切控制台。拖动标题栏可挪到任意位置。
+        </p>
+      </div>
+    </div>
+  );
+}
