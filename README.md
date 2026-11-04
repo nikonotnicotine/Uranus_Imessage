@@ -195,8 +195,10 @@ Node.js 20+ / Express 后端，React 18 + Vite 5 + Tailwind 3 前端，npm works
 生产环境后端直接 serve 前端产物，只占一个端口。数据全部落在本地文件，没有数据库。
 
 模型接口默认走 OpenAI 兼容协议（服务商源的「自定义」类型，中转站都是这种）；
-新建服务商源时也能直接选 OpenAI、Google Gemini、Anthropic Claude 三家官方接口，
-后两家打的是各自的原生接口。听音那条走 Gemini 原生接口。
+新建服务商源时也能直接选 OpenAI、Google Gemini、Google Vertex AI、Anthropic Claude
+四家官方接口，后三家打的是各自的原生接口。Vertex 那条密钥粘一整份 GCP 服务账号 JSON
+就行（express 模式的 API key 也认），同一个源下 Gemini 和 Vertex 上托管的 Claude 都能用。
+听音那条走 Gemini 原生接口。
 生图还能选 NovelAI（只能画图），中文画面描述会先借聊天模型翻成英文 tag。
 iMessage 走 Photon / Spectrum。
 

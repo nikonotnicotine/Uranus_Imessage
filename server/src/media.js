@@ -35,6 +35,7 @@ import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
 import { netCodes, whyNetwork } from "./net.js";
 import { GEMINI_SAFETY_OFF, apiType, geminiHeaders, geminiModelUrl } from "./apitype.js";
+import { isVertexClaude, vertexAuth, vertexModelUrl } from "./vertex.js";
 import {
   NOVELAI_TRANSLATE_PROMPT,
   cleanTranslation,
@@ -2239,12 +2240,16 @@ function dropUnknownField(body, form, raw) {
 }
 
 /**
- * Gemini 类型的服务商源出一张图（Google 官方原生接口）。
+ * Google 原生接口出一张图（`gemini` 和 `vertex` 两种类型共用）。
  *
  * 两种模型两个接口：
  *   Imagen 系    POST …/models/{model}:predict，回 `predictions[0].bytesBase64Encoded`
  *   Gemini 画图  POST …/models/{model}:generateContent，`responseModalities` 里要有
  *                IMAGE，图在 `candidates[0].content.parts[].inlineData` 里
+ *
+ * 请求体两个类型**逐字段相同**，差的只有地址和鉴权头 —— 所以那两样由调用方算好
+ * 传进来（Vertex 的路径带 projects / locations，鉴权还要先换 access token），
+ * 这个函数只管「Google 那套请求体和响应长什么样」。
  *
  * 负面提示词两边都没有对应字段（Imagen 3 起把 negativePrompt 撤了），只能写进
  * 正文里让模型自己避开。比例两边都认同一套写法（`9:16`），config.js:IMAGE_RATIOS
@@ -2253,10 +2258,12 @@ function dropUnknownField(body, form, raw) {
  * 重试规则和 OpenAI 那条路一样（IMAGE_RETRY_DELAYS / worthImageRetry）；比例被嫌弃
  * 时去掉比例重发一次，和那边剥 aspect_ratio 是同一个意思。
  *
+ * @param {{model:string, prompt:string, negative:string, refFile:string|null,
+ *          ratio:object|null, method:(m:string)=>string, headers:object}} args
+ *        `method` 把方法名（`predict` / `generateContent`）拼成完整地址
  * @returns {Promise<{buffer: Buffer, ratioSent: boolean}>}
  */
-async function geminiImage({ base, key, model, prompt, negative, refFile, ratio }, scope) {
-  if (!key) throw new Error("生图模型没填密钥");
+async function geminiImage({ model, prompt, negative, refFile, ratio, urlFor, headers }, scope) {
   const imagen = /^(models\/)?imagen/i.test(model);
   const text = negative ? `${prompt}\n\n画面里不要出现：${negative}` : prompt;
 
@@ -2289,8 +2296,7 @@ async function geminiImage({ base, key, model, prompt, negative, refFile, ratio 
     };
   }
 
-  const url = geminiModelUrl(base, model, imagen ? "predict" : "generateContent");
-  const headers = geminiHeaders(base, key);
+  const url = urlFor(imagen ? "predict" : "generateContent");
   /** 比例还在不在请求体里（上游嫌弃的话会被去掉）。 */
   const ratioIn = () =>
     imagen ? "aspectRatio" in body.parameters : Boolean(body.generationConfig.imageConfig);
@@ -2799,10 +2805,32 @@ export async function generateImage(endpoint, req, scope = "生图") {
     return { buffer, mimeType, ext, ms };
   }
 
-  // Gemini 类型走原生接口，请求和响应都是另一个样子，见 geminiImage
-  if (type === "gemini") {
+  // Gemini / Vertex 走 Google 原生接口，请求和响应都是另一个样子，见 geminiImage。
+  // 两者请求体相同，差的只有地址和鉴权头，所以在这儿算好再传进去
+  if (type === "gemini" || type === "vertex") {
+    if (!key) throw new Error("生图模型没填密钥");
+    let urlFor;
+    let headers;
+    if (type === "vertex") {
+      if (isVertexClaude(model)) {
+        throw new Error("生图模型选的是 Vertex 上的 Claude，Claude 不会画图，换一个 Gemini 或 Imagen 的模型");
+      }
+      const auth = await vertexAuth(base, key);
+      urlFor = (method) =>
+        vertexModelUrl({
+          root: auth.root,
+          project: auth.project,
+          region: auth.region,
+          model,
+          method,
+        });
+      headers = auth.headers;
+    } else {
+      urlFor = (method) => geminiModelUrl(base, model, method);
+      headers = geminiHeaders(base, key);
+    }
     const { buffer, ratioSent } = await geminiImage(
-      { base, key, model, prompt, negative, refFile, ratio },
+      { model, prompt, negative, refFile, ratio, urlFor, headers },
       scope
     );
     const ms = Date.now() - startedAt;

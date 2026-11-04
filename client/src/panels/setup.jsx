@@ -476,6 +476,7 @@ function StepProvider({ provider }) {
             value={(provider?.keys ?? [""])[0] ?? ""}
             onChange={(v) => updateProviderKey(provider.id, 0, v)}
             placeholder={typeMeta.keyPlaceholder}
+            multiline={typeMeta.id === "vertex"}
           />
         </Field>
       </div>

@@ -25,6 +25,7 @@ import {
   PRESET_MODE_LABELS,
   ENTRY_KIND_LABELS,
   ENTRY_KIND_HINTS,
+  PROVIDER_TYPES as UI_PROVIDER_TYPES,
   presetMode,
   presetsFor,
   resolvePreset,
@@ -37,7 +38,7 @@ import {
   FIXED_KINDS,
 } from "../server/src/preset.js";
 import { pickSttSource } from "../server/src/stt.js";
-import { normalizeConfig } from "../server/src/config.js";
+import { normalizeConfig, PROVIDER_TYPES as SRV_PROVIDER_TYPES } from "../server/src/config.js";
 
 let pass = 0;
 let fail = 0;
@@ -64,6 +65,27 @@ group("预设的玩法清单：前端和服务端必须一字不差");
   check(
     "每一种玩法都有中文名",
     SRV_MODES.filter((m) => !PRESET_MODE_LABELS[m]),
+    []
+  );
+}
+
+group("服务商源的 API 类型：前端和服务端必须一字不差");
+{
+  /*
+   * 这两份清单错位的后果和 PRESET_MODES 那次一样隐蔽：服务端加了
+   * `vertex`、前端没加，于是「新增服务商源」的弹窗里压根没有那个入口，
+   * 而已经存在的 vertex 源会被 providerTypeOf 认成「自定义」—— 界面上
+   * 显示着自定义的说明和占位文案，请求却照 Vertex 发出去。
+   */
+  check(
+    "PROVIDER_TYPES 对得上（顺序也一样）",
+    UI_PROVIDER_TYPES.map((t) => t.id),
+    SRV_PROVIDER_TYPES
+  );
+  // 缺文案的后果是卡片上一片空白
+  check(
+    "每一种都有 label 和 desc",
+    UI_PROVIDER_TYPES.filter((t) => !t.label || !t.desc).map((t) => t.id),
     []
   );
 }

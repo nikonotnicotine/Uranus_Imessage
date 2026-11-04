@@ -89,9 +89,47 @@ export function NewProviderModal({ onChoose, onClose }) {
   );
 }
 
-/** 密钥输入框：带小眼睛切换明文。 */
-export function SecretInput({ value, onChange, placeholder }) {
+/**
+ * 密钥输入框：带小眼睛切换明文。
+ *
+ * `multiline` 是给 Vertex 那种「密钥本身是一整份 JSON」的类型用的 —— 单行框里
+ * 粘一份服务账号 JSON，看不出自己粘对了没，而且浏览器会把里面的换行揉成空格。
+ * 多行时没有 password 那层遮挡可用，所以明文开关换成「要不要显示出来」：
+ * 没点开就只显示一句摘要，不把一整份凭据摊在屏幕上。
+ */
+export function SecretInput({ value, onChange, placeholder, multiline = false }) {
   const [show, setShow] = useState(false);
+  if (multiline) {
+    const filled = String(value ?? "").trim().length;
+    return (
+      <div className="relative">
+        {show ? (
+          <textarea
+            className={`${inputCls} min-h-[7rem] pr-10 font-mono text-meta leading-relaxed`}
+            value={value ?? ""}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={placeholder}
+            spellCheck={false}
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShow(true)}
+            className={`${inputCls} flex items-center pr-10 text-left text-ink-faint`}
+          >
+            {filled ? `已填（${filled} 个字符），点开查看或修改` : "点开粘贴"}
+          </button>
+        )}
+        <button
+          type="button"
+          className="absolute right-2 top-2 rounded-item p-1 text-ink-faint hover:text-ink"
+          onClick={() => setShow((s) => !s)}
+        >
+          {show ? <EyeOff size={16} /> : <Eye size={16} />}
+        </button>
+      </div>
+    );
+  }
   return (
     <div className="relative">
       <input
@@ -1114,6 +1152,7 @@ export function ProviderSettings({ provider }) {
                     value={k}
                     onChange={(v) => updateProviderKey(provider.id, i, v)}
                     placeholder={typeMeta.keyPlaceholder}
+                    multiline={typeMeta.id === "vertex"}
                   />
                 </div>
                 <button

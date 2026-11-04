@@ -5,6 +5,31 @@ BUG 反馈与功能建议，请加入 QQ 群：**1125033956**。
 
 ---
 
+## 1.22.5  2026-11-04
+
+- **新增：服务商源能选 Google Vertex AI 了。** 密钥框里粘一整份 GCP 的服务账号
+  JSON（下载下来那个 `.json` 的全部内容）就能用，项目 ID 和区域都不用另填 ——
+  前者从 JSON 里读，后者从接口地址的域名认（`aiplatform.googleapis.com` 是全局，
+  `us-central1-aiplatform.googleapis.com` 就是那个区域）。聊天、识图、听音、
+  看视频、生图、向量六条路都通。
+  - **Vertex 上托管的 Claude 一起支持**：模型名带 `claude` 的自动走 Claude 那条
+    （`publishers/anthropic`），其余走 Gemini 那条。一个源下两家模型混着用，
+    角色那边照旧只是在下拉框里挑一个，看不出底下是谁。
+  - express 模式的 API key 也认（粘一条 `AIza…` 进去就行），只是 Google 那边的
+    express 模式不托管 Claude —— 选了会当场说清，不会让你对着一句 404 发愁。
+  - **和原来那个「Google Gemini」类型是两条线**，不是同一个东西的两个地址：
+    那条打的是 AI Studio（`generativelanguage.googleapis.com`），模型名、计费、
+    配额全和 Vertex 分开，同一把密钥互相不通。手上是 GCP 的服务账号就选 Vertex，
+    是 AI Studio 的 `AIza…` 就选 Gemini。
+  - 「获取模型列表」给的是**内置清单** —— Vertex 没有通用的列模型接口。要别的
+    型号用「自定义模型」手填；Claude 在 Vertex 上的名字带 `@日期`
+    （`claude-opus-4-5@20251101`），别手改成横杠，那样会 404。
+  - 密钥框对这个类型是**多行**的：一份服务账号 JSON 塞进单行框里既看不清自己
+    粘对了没，浏览器还会把里面的换行揉成空格。没点开只显示一句「已填 N 个字符」，
+    不把一整份凭据摊在屏幕上。
+
+---
+
 ## 1.22.4  2026-10-26
 
 - **新增：预设里能用变量了。** `{{setvar::名::正文}}` 往变量里存，`{{getvar::名}}`

@@ -148,6 +148,15 @@ export const PROVIDER_TYPES = [
     keyPlaceholder: "AIza…",
   },
   {
+    id: "vertex",
+    label: "Google Vertex AI",
+    desc: "GCP 上的 Gemini 和 Claude。密钥粘整个服务账号 JSON，express 模式的 API key 也认",
+    url: "https://aiplatform.googleapis.com",
+    urlHint: "全局地址已经填好；要指定区域就换成 us-central1-aiplatform.googleapis.com 这样的前缀",
+    placeholder: "https://aiplatform.googleapis.com",
+    keyPlaceholder: '整个服务账号 JSON（{"type":"service_account",…}），或 express 模式的 API key',
+  },
+  {
     id: "anthropic",
     label: "Anthropic Claude",
     desc: "Claude 官方原生接口。不能画图、听音、做向量",

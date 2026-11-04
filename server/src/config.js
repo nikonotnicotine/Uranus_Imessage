@@ -937,7 +937,10 @@ function normalizeModelEntry(input, id) {
  *
  *  - `custom`    自定义：OpenAI 兼容的 `/chat/completions`。中转站、自建反代都是这种
  *  - `openai`    OpenAI 官方。请求和 custom 一模一样，区别只在新建时预填的地址
- *  - `gemini`    Google Gemini 原生接口（`generateContent`，`x-goog-api-key`）
+ *  - `gemini`    Google AI Studio 原生接口（`generateContent`，`x-goog-api-key`）
+ *  - `vertex`    Google Vertex AI（GCP）：路径带 `projects/{项目}/locations/{区域}`，
+ *                密钥粘服务账号 JSON（签 JWT 换 access token）或 express 模式的 API key。
+ *                模型名带 `claude` 的走 Vertex 上托管的 Claude，见 vertex.js
  *  - `anthropic` Anthropic Claude 原生接口（`/v1/messages`，`x-api-key`）
  *  - `novelai`   NovelAI 生图（`/ai/generate-image`，Bearer pst- 开头的令牌）。只能画图
  *
@@ -945,7 +948,7 @@ function normalizeModelEntry(input, id) {
  * 「老版本、已经有 API 的一律是自定义 API」。老配置在加这个字段之前走的就是
  * OpenAI 兼容那一套，算成 custom 行为一个字都不变。
  */
-export const PROVIDER_TYPES = ["custom", "openai", "gemini", "anthropic", "novelai"];
+export const PROVIDER_TYPES = ["custom", "openai", "gemini", "vertex", "anthropic", "novelai"];
 
 function normalizeProviderType(value) {
   return PROVIDER_TYPES.includes(value) ? value : "custom";

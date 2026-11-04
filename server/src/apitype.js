@@ -1,14 +1,22 @@
 /**
  * 服务商源的「API 类型」：同一份 OpenAI 形状的请求，落到各家原生接口上长什么样。
  *
- * 五种类型（config.js:PROVIDER_TYPES）：
+ * 六种类型（config.js:PROVIDER_TYPES）：
  *
  *  - `custom`    自定义。OpenAI 兼容的 `/chat/completions`，中转站、自建反代都是这种。
  *                老版本升上来的、没选过类型的一律是它 —— 行为和以前一个字都不差。
  *  - `openai`    OpenAI 官方。请求形状和 custom **完全一样**，区别只在新建时预填的
  *                地址。单列出来是给用户一个「我选的就是官方」的入口，不是另一套协议。
- *  - `gemini`    Google 官方原生接口：`/v1beta/models/{model}:generateContent`，
+ *  - `gemini`    Google AI Studio 的原生接口：`/v1beta/models/{model}:generateContent`，
  *                `x-goog-api-key` 鉴权，安全过滤全关。
+ *  - `vertex`    Google Vertex AI（GCP 那套）：
+ *                `/v1/projects/{项目}/locations/{区域}/publishers/{厂商}/models/{模型}:{方法}`，
+ *                服务账号签 JWT 换 access token 鉴权（细节在 vertex.js）。
+ *                **同一个类型下有两种请求体** —— 模型名带 `claude` 的是 Vertex 上托管的
+ *                Claude，走 `publishers/anthropic` + `:rawPredict`，请求体是 Claude 那套；
+ *                其余走 `publishers/google` + `:generateContent`，请求体是 Gemini 那套。
+ *                和 `gemini` 是两条完全分开的线（模型名、计费、配额都不通用），所以是两种
+ *                类型，不是一种类型的两个地址。
  *  - `anthropic` Claude 官方原生接口：`/v1/messages`，`x-api-key` 鉴权。
  *  - `novelai`   NovelAI 生图：`/ai/generate-image`，只能画图，聊天那条路不走它
  *                （请求在 media.js:novelaiImage 里拼，这个文件只认个名字）。
@@ -23,7 +31,19 @@
  * 所以 body 永远是 OpenAI 形状，循环照旧改它；每一圈发请求之前才翻译成原生
  * 形状，收到响应再翻回 `choices[0].message.content`。循环里的代码看不出这一轮
  * 打的是谁家。
+ *
+ * ── 为什么 chatRequest 是 async ──
+ *
+ * 只有 Vertex 一家需要：服务账号那条路要先用私钥签个 JWT 换 access token。
+ * 换出来的 token 在 vertex.js 里缓存着，所以绝大多数圈数并不真打网络 ——
+ * 但第一圈会，签名本身也是异步的（WebCrypto），所以这个函数只能是 async。
  */
+
+import {
+  isVertexClaude,
+  vertexAuth,
+  vertexModelUrl,
+} from "./vertex.js";
 
 /** 去掉末尾斜杠。和 llm.js / media.js 里那份是同一个规矩。 */
 function trimBase(url) {
@@ -40,12 +60,14 @@ function stripSuffix(url, suffixes) {
 /** 端点上的类型。缺的、不认识的一律当自定义 —— 和 config.js 的规矩一致。 */
 export function apiType(endpoint) {
   const t = endpoint?.type;
-  return t === "openai" || t === "gemini" || t === "anthropic" || t === "novelai" ? t : "custom";
+  return t === "openai" || t === "gemini" || t === "vertex" || t === "anthropic" || t === "novelai"
+    ? t
+    : "custom";
 }
 
-/** 这个类型打的是不是原生接口（要翻译请求体的那两种）。 */
+/** 这个类型打的是不是原生接口（要翻译请求体的那几种）。 */
 export function isNativeType(type) {
-  return type === "gemini" || type === "anthropic";
+  return type === "gemini" || type === "vertex" || type === "anthropic";
 }
 
 /** 中文叫法，进错误文案用。 */
@@ -53,6 +75,7 @@ export const API_TYPE_NAMES = {
   custom: "自定义",
   openai: "OpenAI",
   gemini: "Google Gemini",
+  vertex: "Google Vertex AI",
   anthropic: "Anthropic Claude",
   novelai: "NovelAI",
 };
@@ -471,14 +494,34 @@ export function toAnthropicBody(body, streaming) {
 }
 
 /**
+ * Vertex 上托管的 Claude：请求体和官方 Messages API 差两处。
+ *
+ *  - **`model` 要去掉**：模型名在 URL 的路径里，body 里再带一个就 400；
+ *  - **`anthropic_version` 要加上**：官方那边这是个 HTTP 头，Vertex 这边挪进了
+ *    body。写死 `vertex-2023-10-16` —— 这是 Vertex 上这套接口唯一的版本号，
+ *    和官方的 `anthropic-version` 不是同一套取值。
+ */
+const VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16";
+
+function toVertexAnthropicBody(body, streaming) {
+  const out = toAnthropicBody(body, streaming);
+  delete out.model;
+  return { anthropic_version: VERTEX_ANTHROPIC_VERSION, ...out };
+}
+
+/**
  * 一次聊天请求的「发到哪、带什么头、发什么」。
  *
- * custom / openai 原样返回（headers 为 null = 用默认的 Bearer）；另外两种每次都
+ * custom / openai 原样返回（headers 为 null = 用默认的 Bearer）；原生那几种每次都
  * 从当下的 body 重新翻译 —— 循环可能刚脱掉一个参数、换了一句说法。
  *
- * @returns {{url:string, headers:object|null, body:object, decode:Function|null, native:boolean}}
+ * `shape` 是响应该按谁家来读。除 Vertex 以外都和 `type` 一个值；Vertex 一个类型
+ * 下有两种形状（Gemini / Claude），所以要单独带出来给 nativeResult 用。
+ *
+ * @returns {Promise<{url:string, headers:object|null, body:object,
+ *                    decode:Function|null, native:boolean, shape:string|null}>}
  */
-export function chatRequest(type, base, key, body, streaming) {
+export async function chatRequest(type, base, key, body, streaming) {
   if (type === "gemini") {
     return {
       url: geminiModelUrl(
@@ -490,6 +533,45 @@ export function chatRequest(type, base, key, body, streaming) {
       body: toGeminiBody(body),
       decode: decodeGeminiChunk,
       native: true,
+      shape: "gemini",
+    };
+  }
+  if (type === "vertex") {
+    const auth = await vertexAuth(base, key);
+    const claude = isVertexClaude(body.model);
+    /*
+     * express 模式（API key）只有 `publishers/google`。Claude 要的是
+     * `publishers/anthropic`，在 express 下压根不存在 —— 早点说清楚，
+     * 不然用户看到的是一句没头没尾的 404。
+     */
+    if (claude && auth.express) {
+      const err = new Error(
+        "Vertex 的 express 模式（API key）用不了 Claude 模型 —— 要么换成服务账号 JSON 当密钥，要么选一个 Gemini 模型"
+      );
+      err.configFault = true;
+      throw err;
+    }
+    const method = claude
+      ? streaming
+        ? "streamRawPredict"
+        : "rawPredict"
+      : streaming
+        ? "streamGenerateContent?alt=sse"
+        : "generateContent";
+    return {
+      url: vertexModelUrl({
+        root: auth.root,
+        project: auth.project,
+        region: auth.region,
+        model: body.model,
+        method,
+        publisher: claude ? "anthropic" : "google",
+      }),
+      headers: auth.headers,
+      body: claude ? toVertexAnthropicBody(body, streaming) : toGeminiBody(body),
+      decode: claude ? decodeAnthropicChunk : decodeGeminiChunk,
+      native: true,
+      shape: claude ? "anthropic" : "gemini",
     };
   }
   if (type === "anthropic") {
@@ -499,9 +581,17 @@ export function chatRequest(type, base, key, body, streaming) {
       body: toAnthropicBody(body, streaming),
       decode: decodeAnthropicChunk,
       native: true,
+      shape: "anthropic",
     };
   }
-  return { url: `${base}/chat/completions`, headers: null, body, decode: null, native: false };
+  return {
+    url: `${base}/chat/completions`,
+    headers: null,
+    body,
+    decode: null,
+    native: false,
+    shape: null,
+  };
 }
 
 /* ================= 响应翻译 ================= */
@@ -584,10 +674,13 @@ function statusOfError(error, fallback) {
 /**
  * 原生响应翻回 llm.js 认的 `{ok, status, data:{choices:[…]}, text}`。
  *
+ * 第一个参数是**响应的形状**（`chatRequest` 返回的 `shape`），不是服务商类型：
+ * Vertex 一个类型下既有 Gemini 形状也有 Claude 形状，只看类型分不出来。
+ *
  * 已经是 OpenAI 形状的（流式那条路在 requestStream 里就拼好了）原样放过；
  * 翻不出来的也原样放过，让 chatCompletion 照旧报「返回格式看不懂」并带上原文。
  */
-export function nativeResult(type, result) {
+export function nativeResult(shape, result) {
   if (!result?.ok || result.data?.choices) return result;
   const data = result.data;
   if (!data || typeof data !== "object") return result;
@@ -597,7 +690,7 @@ export function nativeResult(type, result) {
     return { ...result, ok: false, status: statusOfError(data.error, result.status) };
   }
 
-  const r = type === "gemini" ? readGemini(data) : readAnthropic(data);
+  const r = shape === "gemini" ? readGemini(data) : readAnthropic(data);
   if (r.blocked) {
     return { ok: false, status: 400, data: { error: { message: r.blocked } }, text: r.blocked };
   }
