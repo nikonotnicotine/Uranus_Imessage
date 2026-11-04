@@ -28,6 +28,7 @@ import {
   anthropicHeaders,
   anthropicRoot,
   apiType,
+  assertKeyIsNotServiceAccount,
   chatRequest,
   geminiHeaders,
   geminiModelUrl,
@@ -36,9 +37,11 @@ import {
   nativeResult,
 } from "./apitype.js";
 import {
-  VERTEX_MODELS,
+  VERTEX_PUBLISHERS,
   isVertexClaude,
+  readVertexModelPage,
   vertexAuth,
+  vertexListUrl,
   vertexModelUrl,
 } from "./vertex.js";
 
@@ -325,6 +328,18 @@ const FAULT_ADVICE = {
 function faultKind(err, kind) {
   err.faultKind = kind;
   return err;
+}
+
+/**
+ * 服务账号 JSON 粘到了别的类型上。实现在 apitype.js（media.js 的生图那条
+ * 也用它），这里只把它抛的错盖上 `config` 归属，好让四个调用点照旧只写一行。
+ */
+function assertKeyShape(type, key, label) {
+  try {
+    assertKeyIsNotServiceAccount(type, key, label);
+  } catch (e) {
+    throw faultKind(e, "config");
+  }
 }
 
 /**
@@ -976,6 +991,8 @@ async function chatRaw(endpoint, messages, opts = {}) {
       "config"
     );
   }
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyShape(type, key, label);
 
   // Gemini 3.7 / 3.8 的两条硬规矩，见 GEMINI_STRICT
   const strict = GEMINI_STRICT.test(model);
@@ -1530,6 +1547,9 @@ export async function testEndpoint(endpoint, label = "API") {
  * Gemini / Claude 类型打各自的原生列表：Gemini 回 `{models:[{name:"models/xxx"}]}`
  * （前缀要剥掉），Claude 回 `{data:[{id}]}`，下面那段解析两种都认得。
  *
+ * Vertex 自己一条（`publishers.models.list`，两家 publisher 合并），在下面那个
+ * 分支里就地返回，不走后面这套解析 —— 它的响应是 `{publisherModels:[…]}`。
+ *
  * @returns {Promise<{ok:boolean, models?:string[], error?:string}>}
  */
 export async function listModels(endpoint, label = "API") {
@@ -1548,9 +1568,89 @@ export async function listModels(endpoint, label = "API") {
    * Vertex 同理。它的 Model Garden 列表要另外的权限和另一条 API，回的还是一大堆
    * 跟生成无关的条目 —— 不如直接给常用的那些，别的用「自定义模型」手填。
    */
+  /*
+   * Vertex：`publishers.models.list`，两家 publisher 各问一遍。
+   *
+   * 以前这儿给的是一份写死的清单，理由写的是「Vertex 没有列模型的接口」——
+   * 那个结论是错的，`v1beta1` 上有 `publishers.models.list`。而写死的清单必然
+   * 过期：它停在 gemini-2.5 那一代，而用户的项目里早就有更新的型号了，照着
+   * 那份清单配等于被按在老模型上。
+   *
+   * google 和 anthropic 分开问，而且**一家失败不算整次失败** —— 绝大多数项目
+   * 压根没在 Model Garden 里开 Claude，那边回 403 是常态，不该因此让用户连
+   * Gemini 的列表也看不到。
+   */
   if (type === "vertex") {
-    logInfo(label, `Vertex 没有通用的模型列表接口，给的是内置清单（${VERTEX_MODELS.length} 个）`);
-    return { ok: true, models: [...VERTEX_MODELS] };
+    let auth;
+    try {
+      auth = await vertexAuth(base, key);
+    } catch (e) {
+      const error = `${label} ${String(e?.message ?? e)}`;
+      logWarn(label, "获取模型列表失败", error);
+      return { ok: false, error };
+    }
+
+    const found = [];
+    const failures = [];
+    for (const publisher of VERTEX_PUBLISHERS) {
+      let pageToken = "";
+      // 翻页有上限：一个 publisher 翻十页还没完，多半是对面在打环
+      for (let page = 0; page < 10; page += 1) {
+        const url = vertexListUrl({
+          root: auth.root,
+          project: auth.project,
+          region: auth.region,
+          publisher,
+          pageToken,
+        });
+        let r;
+        try {
+          r = await requestJson(url, {
+            method: "GET",
+            headers: auth.headers,
+            timeout: TEST_TIMEOUT,
+          });
+        } catch (e) {
+          failures.push(`${publisher}：${describeNetworkError(e, TEST_TIMEOUT)}`);
+          break;
+        }
+        if (!r.ok) {
+          failures.push(`${publisher}：${describeUpstream(r.status, r.text, r.data)}`);
+          break;
+        }
+        const { names, next } = readVertexModelPage(r.data);
+        found.push(...names);
+        if (!next) break;
+        pageToken = next;
+      }
+    }
+
+    if (found.length) {
+      if (failures.length) {
+        logWarn(label, "有一家 publisher 没拉到，已跳过", failures.join("\n"));
+      }
+      const models = Array.from(new Set(found)).sort((a, b) => a.localeCompare(b));
+      logInfo(label, `拉到 ${models.length} 个模型`);
+      return { ok: true, models };
+    }
+
+    const error =
+      `${label} 拉模型失败：${failures.join("；") || "列表是空的"}。` +
+      `这条接口要 aiplatform.models.list 权限（roles/aiplatform.user 就带着）；` +
+      `拉不到也不影响用 —— 用「自定义模型」手填模型名照样能打`;
+    logWarn(label, "获取模型列表失败", error);
+    return { ok: false, error };
+  }
+  /*
+   * 服务账号 JSON 粘到了别的类型上。这个函数不抛错（前端直接渲染返回值），
+   * 所以把那句话转成 error 字段 —— 要紧的是它不带密钥。
+   */
+  try {
+    assertKeyShape(type, key, label);
+  } catch (e) {
+    const error = String(e?.message ?? e);
+    logWarn(label, "获取模型列表失败", error);
+    return { ok: false, error };
   }
   const target =
     type === "gemini"
@@ -1821,6 +1921,8 @@ async function inlineMedia(endpoint, prompt, media, kind) {
 
   const usePrompt = String(prompt ?? "").trim() || kind.defaultPrompt;
   const mimeType = media.mimeType || kind.fallbackMime;
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyShape(type, key, label);
 
   /*
    * 打到哪、带什么头。
@@ -2101,6 +2203,8 @@ export async function embedText(endpoint, text, opts = {}) {
       "config"
     );
   }
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyShape(type, key, label);
   /*
    * 三家三个形状：
    *   OpenAI 兼容  POST {根}/embeddings          `{model, input}`  → data[0].embedding

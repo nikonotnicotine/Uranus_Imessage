@@ -22,16 +22,24 @@
 import { generateKeyPairSync } from "node:crypto";
 
 import {
-  VERTEX_MODELS,
+  VERTEX_PUBLISHERS,
   clearVertexTokenCache,
   isVertexClaude,
   parseVertexKey,
+  readVertexModelPage,
   vertexAccessToken,
+  vertexListUrl,
   vertexModelUrl,
   vertexRegion,
   vertexRoot,
 } from "../server/src/vertex.js";
-import { apiType, chatRequest, isNativeType, nativeResult } from "../server/src/apitype.js";
+import {
+  apiType,
+  assertKeyIsNotServiceAccount,
+  chatRequest,
+  isNativeType,
+  nativeResult,
+} from "../server/src/apitype.js";
 
 let pass = 0;
 let fail = 0;
@@ -55,6 +63,16 @@ function ok(what, cond) {
 async function thrown(fn) {
   try {
     await fn();
+    return "";
+  } catch (e) {
+    return String(e?.message ?? e);
+  }
+}
+
+/** 同上，同步版。 */
+function thrownSync(fn) {
+  try {
+    fn();
     return "";
   } catch (e) {
     return String(e?.message ?? e);
@@ -220,14 +238,93 @@ group("isVertexClaude：按模型名分流");
   }
 }
 
-group("内置模型清单：Gemini 和 Claude 都得有");
+group("vertexListUrl：列模型走 v1beta1，有项目就带 projects/locations");
 {
-  ok("清单不是空的", VERTEX_MODELS.length > 0);
-  ok("有 Gemini 系", VERTEX_MODELS.some((m) => /^gemini/.test(m)));
-  ok("有 Claude 系", VERTEX_MODELS.some(isVertexClaude));
-  ok("有 Imagen（生图）", VERTEX_MODELS.some((m) => /^imagen/.test(m)));
-  ok("有向量模型", VERTEX_MODELS.some((m) => /embedding/.test(m)));
-  check("没有重复的", VERTEX_MODELS.length, new Set(VERTEX_MODELS).size);
+  // 这条接口只在 v1beta1 上，不是生成接口那个 v1
+  check(
+    "服务账号（带项目）",
+    vertexListUrl({ root: "https://aiplatform.googleapis.com", project: "my-proj", region: "us-east5" }),
+    "https://aiplatform.googleapis.com/v1beta1/projects/my-proj/locations/us-east5/publishers/google/models?pageSize=1000"
+  );
+  check(
+    "换 publisher",
+    vertexListUrl({
+      root: "https://aiplatform.googleapis.com",
+      project: "my-proj",
+      region: "global",
+      publisher: "anthropic",
+    }),
+    "https://aiplatform.googleapis.com/v1beta1/projects/my-proj/locations/global/publishers/anthropic/models?pageSize=1000"
+  );
+  // express 模式没有项目，只能走裸路径
+  check(
+    "express（没有项目）",
+    vertexListUrl({ root: "https://aiplatform.googleapis.com", project: "", region: "global" }),
+    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=1000"
+  );
+  ok(
+    "翻页带上 pageToken",
+    vertexListUrl({
+      root: "https://aiplatform.googleapis.com",
+      project: "p",
+      region: "global",
+      pageToken: "tok123",
+    }).includes("pageToken=tok123")
+  );
+}
+
+group("readVertexModelPage：剥掉 publishers/*/models/ 前缀");
+{
+  const r = readVertexModelPage({
+    publisherModels: [
+      { name: "publishers/google/models/gemini-4-argon" },
+      { name: "publishers/google/models/gemini-3.8-flash" },
+      { name: "publishers/anthropic/models/claude-opus-4-5@20251101" },
+      { name: "" },
+      {},
+    ],
+    nextPageToken: "next-page",
+  });
+  check("取出模型名", r.names, [
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "claude-opus-4-5@20251101",
+  ]);
+  // Claude 的 @日期 是正式名字的一部分，剥掉就 404
+  ok("@日期 保住了", r.names.some((n) => n.includes("@20251101")));
+  check("带出 nextPageToken", r.next, "next-page");
+
+  const empty = readVertexModelPage({});
+  check("空响应不炸", empty.names, []);
+  check("没有下一页就是空串", empty.next, "");
+}
+
+group("两家 publisher 的清单");
+{
+  check("google 和 anthropic 都问", VERTEX_PUBLISHERS, ["google", "anthropic"]);
+}
+
+group("assertKeyIsNotServiceAccount：服务账号 JSON 粘错类型时，报错里不能带密钥");
+{
+  // Vertex 本来就收 JSON，不该拦
+  check("vertex 放过", thrownSync(() => assertKeyIsNotServiceAccount("vertex", SA, "源")), "");
+  check("novelai 放过", thrownSync(() => assertKeyIsNotServiceAccount("novelai", SA, "源")), "");
+  // 普通的一行密钥不该被当成 JSON
+  check("普通 key 放过", thrownSync(() => assertKeyIsNotServiceAccount("custom", "sk-abc", "源")), "");
+
+  for (const t of ["custom", "openai", "gemini", "anthropic"]) {
+    const why = thrownSync(() => assertKeyIsNotServiceAccount(t, SA, "源"));
+    ok(`${t} 拦住了`, why.length > 0);
+    /*
+     * 这一条是这个函数存在的全部理由：以前这份 JSON 会被拼进
+     * `Authorization: Bearer …`，fetch 抛的异常 message 里带着完整私钥，
+     * 那句话进日志、上界面、被复制出去问人。
+     */
+    ok(`${t}：报错里没有私钥`, !why.includes("PRIVATE KEY") && !why.includes(PEM.slice(40, 80)));
+    ok(`${t}：报错里没有服务账号邮箱`, !why.includes("robot@"));
+    ok(`${t}：说清了该改成哪种类型`, why.includes("Google Vertex AI"));
+    ok(`${t}：提了「重启后端」这条可能`, why.includes("重启"));
+  }
 }
 
 /* ================= 换 access token ================= */

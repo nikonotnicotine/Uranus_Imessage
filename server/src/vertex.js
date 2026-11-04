@@ -40,32 +40,10 @@ function trimEnd(url) {
   return String(url ?? "").trim().replace(/\/+$/, "");
 }
 
-/**
- * 「获取模型列表」给的清单。
- *
- * Vertex 没有一个「列出我能用哪些模型」的接口 —— Model Garden 那套要另外的
- * 权限和另一条 API，而且回的是一大堆跟生成无关的条目。所以这里和 NovelAI
- * 一样是写死的，用户要别的型号就用「自定义模型」手填（模型名原样进 URL）。
- *
- * 新的在前 —— 弹窗里从上往下挑。Claude 系带 `@日期` 的那几个是 Vertex 自己的
- * 写法（官方 API 用的是 `-日期`），别手改成横杠，那样会 404。
- */
-export const VERTEX_MODELS = [
-  "gemini-2.5-pro",
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.0-flash",
-  "gemini-2.0-flash-lite",
-  "claude-opus-4-5@20251101",
-  "claude-sonnet-4-5@20250929",
-  "claude-haiku-4-5@20251001",
-  "imagen-4.0-generate-001",
-  "imagen-3.0-generate-002",
-  "text-embedding-005",
-  "text-multilingual-embedding-002",
-];
-
 export const VERTEX_DEFAULT_URL = "https://aiplatform.googleapis.com";
+
+/** Vertex 上有模型的两家。拉模型列表时两家都问一遍（见 llm.js:listModels）。 */
+export const VERTEX_PUBLISHERS = ["google", "anthropic"];
 
 /** 换 access token 的端点。Google 的 OAuth2 服务，不随区域变。 */
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -359,4 +337,51 @@ export async function vertexAuth(url, key) {
     root,
     express: false,
   };
+}
+
+/**
+ * 列某一家 publisher 的模型：`publishers.models.list`。
+ *
+ * ── 为什么是 v1beta1，为什么带 projects/locations ──
+ *
+ * 官方参考里 parent 写的是 `publishers/{publisher}`，不带项目。但那条裸路径在
+ * 全局端点上的行为和带项目的不一样（Genkit 的 Vertex 插件、vertex-ai-mcp 都
+ * 换成了带 `projects/{项目}/locations/{区域}/` 的区域形式），所以有项目的时候
+ * 用带项目那条 —— 它回的是「这个项目在这个区域能看到什么」，正是用户想知道的。
+ * express 模式没有项目，只能走裸路径。
+ *
+ * 这条接口只在 `v1beta1` 上，不是生成接口那个 `v1`。
+ *
+ * 要的权限是 `aiplatform.models.list`（`roles/aiplatform.user` 就带着）。
+ * 没有的话回 403，调用方据此提示去用「自定义模型」手填。
+ */
+export function vertexListUrl({ root, project, region, publisher = "google", pageToken = "" }) {
+  const base = vertexRoot(root);
+  const parent = project
+    ? `projects/${encodeURIComponent(project)}/locations/${encodeURIComponent(region || "global")}/publishers/${publisher}`
+    : `publishers/${publisher}`;
+  const q = new URLSearchParams({ pageSize: "1000" });
+  if (pageToken) q.set("pageToken", pageToken);
+  return `${base}/v1beta1/${parent}/models?${q}`;
+}
+
+/**
+ * 列表响应里那一页的模型名。
+ *
+ * 回的是 `{publisherModels:[{name:"publishers/google/models/gemini-x"}], nextPageToken}`。
+ * 名字要剥掉 `publishers/*​/models/` 那一截 —— 拼生成地址时 vertexModelUrl 自己会加。
+ *
+ * @returns {{names:string[], next:string}}
+ */
+export function readVertexModelPage(data) {
+  const list = Array.isArray(data?.publisherModels) ? data.publisherModels : [];
+  const names = [];
+  for (const m of list) {
+    const raw = typeof m?.name === "string" ? m.name : "";
+    const hit = /\/models\/(.+)$/.exec(raw);
+    const name = hit ? hit[1] : "";
+    // 带 `@版本` 的在 Claude 那边就是正式名字的一部分，别剥
+    if (name) names.push(name);
+  }
+  return { names, next: typeof data?.nextPageToken === "string" ? data.nextPageToken : "" };
 }

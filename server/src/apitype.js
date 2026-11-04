@@ -80,6 +80,39 @@ export const API_TYPE_NAMES = {
   novelai: "NovelAI",
 };
 
+/**
+ * 服务账号 JSON 粘到了别的类型上，在拼鉴权头**之前**就拦住。
+ *
+ * ── 为什么要专门拦这一下 ──
+ *
+ * 这件事真实发生过，而且后果比「一次请求失败」严重得多：用户选了 Vertex、
+ * 密钥框里粘了一整份服务账号 JSON，但那个类型没生效（后端还是旧进程，
+ * `normalizeProviderType` 不认 `vertex`，按既有规矩把它存回了 `custom`）。
+ * 于是之后每一次请求都走 OpenAI 兼容那条路，把整份 JSON 拼进
+ * `Authorization: Bearer …` —— fetch 在 `Headers.append` 那一步抛错，
+ * **而那个异常的 message 里带着完整的私钥**。
+ *
+ * 那句话会进日志、显示在界面上，然后被用户复制出去问人 —— 一把 GCP 私钥
+ * 就这么泄了。所以这里在拼头之前判断，而且这句话里**一个字节的密钥都不带**。
+ *
+ * 顺带它也是这类误配最清楚的提示：问题不在上游，是类型选错了或者没生效。
+ *
+ * 抛的错盖 `configFault`（和 vertex.js 一个约定），调用方据此标成配置问题。
+ */
+export function assertKeyIsNotServiceAccount(type, key, label) {
+  // Vertex 本来就收 JSON；NovelAI 的令牌不经过这条路
+  if (type === "vertex" || type === "novelai") return;
+  if (!String(key ?? "").trimStart().startsWith("{")) return;
+  const err = new Error(
+    `${label} 填的密钥是一份服务账号 JSON，但这个源的「API 类型」是` +
+      `「${API_TYPE_NAMES[type] ?? type}」，那种类型只收一行密钥。` +
+      `要用 GCP 就把类型改成 Google Vertex AI；` +
+      `如果你刚改过却被存回了「自定义」，那是后端还在跑旧代码（旧版本不认识这个类型），重启一下后端`
+  );
+  err.configFault = true;
+  throw err;
+}
+
 /* ================= Gemini ================= */
 
 /**

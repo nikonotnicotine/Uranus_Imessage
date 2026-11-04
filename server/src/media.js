@@ -34,7 +34,13 @@ import { IMAGES_DIR, REF_IMAGES_DIR, ensureLayout } from "./datadir.js";
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
 import { netCodes, whyNetwork } from "./net.js";
-import { GEMINI_SAFETY_OFF, apiType, geminiHeaders, geminiModelUrl } from "./apitype.js";
+import {
+  GEMINI_SAFETY_OFF,
+  apiType,
+  assertKeyIsNotServiceAccount,
+  geminiHeaders,
+  geminiModelUrl,
+} from "./apitype.js";
 import { isVertexClaude, vertexAuth, vertexModelUrl } from "./vertex.js";
 import {
   NOVELAI_TRANSLATE_PROMPT,
@@ -2764,6 +2770,8 @@ export async function generateImage(endpoint, req, scope = "生图") {
   if (!base) throw new Error("生图模型没填接口地址");
   if (!model) throw new Error("生图模型没填模型名");
   const type = apiType(endpoint);
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyIsNotServiceAccount(type, key, "生图模型");
   // Claude 只会看图不会画图，打过去只会白花一次钱再 404
   if (type === "anthropic") {
     throw new Error("生图模型选的是 Claude 类型的服务商源，Claude 不会画图，换一个别的服务商源");
