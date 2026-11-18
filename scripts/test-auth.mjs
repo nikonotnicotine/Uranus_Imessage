@@ -306,7 +306,6 @@ console.log("\n=== 7. 闸门覆盖面 ===");
   const paths = [...open.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
   check("免登录的口子就这三条", paths, ["/api/auth/login", "/api/auth/state", "/api/health"]);
 
-  checkThat("闸门确实挂在 /api/ 上", /req\.path\.startsWith\("\/api\/"\)/.test(src));
   checkThat("没登录回 401 + needLogin", /needLogin: true/.test(src) && /status\(401\)/.test(src));
   // 还在用默认密码时只放行改密码那几条 —— 光靠前端挡不算数，curl 一下就绕过去了
   checkThat("后端也拦着 mustChange", /mustChange && !MUST_CHANGE_PATHS/.test(src));

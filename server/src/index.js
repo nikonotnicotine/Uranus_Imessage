@@ -547,8 +547,9 @@ const MUST_CHANGE_PATHS = new Set([
 
 app.use((req, res, next) => {
   // 只管 /api/*。静态文件（登录页自己）必须能拿到，否则连门都画不出来
-  if (!req.path.startsWith("/api/")) return next();
-  if (OPEN_PATHS.has(req.path)) return next();
+  const pathname = req.path.toLowerCase().replace(/\/$/, "");
+  if (pathname !== "/api" && !pathname.startsWith("/api/")) return next();
+  if (OPEN_PATHS.has(pathname)) return next();
 
   const auth = authenticate(req.headers.cookie);
   if (!auth.ok) {
@@ -556,9 +557,9 @@ app.use((req, res, next) => {
     return res.status(401).json({ ok: false, error: auth.why, needLogin: true });
   }
 
-  if (auth.mustChange && !MUST_CHANGE_PATHS.has(req.path)) {
+  if (auth.mustChange && !MUST_CHANGE_PATHS.has(pathname)) {
     // GET /api/config 例外：外壳要靠它才画得出来。写配置照旧挡着
-    if (req.path === "/api/config" && req.method === "GET") return next();
+    if (pathname === "/api/config" && req.method === "GET") return next();
     return res.status(403).json({
       ok: false,
       error: "还在用默认的账号密码，先改一遍再用别的功能。",
