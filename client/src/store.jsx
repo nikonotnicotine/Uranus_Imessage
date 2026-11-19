@@ -974,17 +974,25 @@ export function ConfigProvider({ children }) {
   /**
    * 拿一个完整备份包恢复。
    *
-   * 直接把 `File` 当 body 发，**不包 JSON、不转 base64**：包上百兆，base64
-   * 还要再涨三分之一，而后端那条路由收的就是原始字节（见 index.js 里
-   * /api/backup/full/restore 的注释）。这也是这个文件里唯一一处绕开 `api()`
-   * 的请求 —— 那个函数固定发 JSON。
+   * 发**原始字节**，不包 JSON、不转 base64：包上百兆，base64 还要再涨三分之一，
+   * 而后端那条路由收的就是原始字节（见 index.js 里 /api/backup/full/restore
+   * 的注释）。这也是这个文件里唯一一处绕开 `api()` 的请求 —— 那个函数固定发 JSON。
+   *
+   * 这里**必须先 `arrayBuffer()`，不能直接把 `File` 当 body**。小手机控制台的
+   * /api 请求全都要过自己的 Service Worker（它在那儿补后端地址和密钥，见
+   * Uranus小手机/console/src/sw.js）：body 是 `File`/`Blob` 时，iOS Safari 递给
+   * SW 的那个请求读出来是空的，SW 原样转出去，后端收到 0 字节，回一句
+   * 「没收到文件内容」—— 用户看到的就是「导出的包好好的，一导入就说没收到」。
+   * 换成 ArrayBuffer 就和控制台其它 POST（发的是字符串）走同一条路，那条是好的。
+   * 桌面版没有 SW，发哪种都一样，所以两边共用这一种写法。
    */
   const restoreFullBackup = useCallback(
     async (file) => {
+      const bytes = await file.arrayBuffer();
       const res = await fetch(`${BASE}/api/backup/full/restore`, {
         method: "POST",
         headers: { "Content-Type": "application/gzip" },
-        body: file,
+        body: bytes,
       });
       let data = null;
       try {
