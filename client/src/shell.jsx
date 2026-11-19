@@ -44,6 +44,7 @@ import { WallpaperButton, useWallpaper } from "./panels/wallpaper.jsx";
 import { WorldPanel } from "./panels/world.jsx";
 import { GlobalSaveBar, SaveHintCtx, SectionCtx } from "./section.jsx";
 import { useConfig, useLogs } from "./store.jsx";
+import { LiveLogDrawer } from "./logdrawer.jsx";
 import { GroupLabel, ListItem, Modal, Reveal, UranusBadge, fmtStamp } from "./ui.jsx";
 
 /**
@@ -808,6 +809,9 @@ export function AppShell() {
           都得在，而用户求助的时候恰恰不该被要求先切走到别处去提问。
         */}
         <AssistantBubble />
+
+        {/* 常驻运行日志抽屉：线下等生成时不用切去控制台就能盯着实时日志 */}
+        <LiveLogDrawer />
 
         {/* 快速配置向导。关掉时顺手把「该自动弹」的标记清掉，免得下次 render 又开 */}
         <SetupWizard
