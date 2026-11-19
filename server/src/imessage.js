@@ -1322,6 +1322,40 @@ function chain(runner, spaceId, task, what) {
 }
 
 /**
+ * 把合并窗口里攒下的几条文本拼成这一轮的用户发言。
+ *
+ * 对方连发的几条用 **`chat.separator`**（默认 `$`）连起来，不是换行：模型那边
+ * 的回复早就是 `在家$刚吃完饭$你呢` 这个样子了（见 delay.js 的
+ * `normalizeForHistory`），而你连发三条在上下文里却是三行换行 —— 一来一回摆在
+ * 一起，只有角色一方在用 `$`。你本来也是分段发的，存档和提示词里就该照那个样子
+ * 记（用户要的）。
+ *
+ * 一个例外：`[系统提示:…]`、`[{{user}}撤回了一条消息]` 这类垫进来的提示**另起
+ * 一行**。它们不是你打出来的气泡，用 `$` 接在正文上等于告诉模型「这句也是对方
+ * 发的一条消息」。判据就是「整条都裹在方括号里」—— 所有这类提示都是这个形状
+ * （撤回、位置、转账、瑞幸、贴纸特效、换背景、tapback、提醒）。
+ *
+ * `separator` 被清空时退回换行：那是「这个项目不用分隔符」的意思，拿空串连
+ * 等于把几条粘成一句。
+ *
+ * @param {string[]} texts 这一轮攒下的文本，按到达顺序
+ * @param {string} separator config.chat.separator
+ */
+function joinIncoming(texts, separator) {
+  const sep = String(separator ?? "");
+  if (!sep) return texts.join("\n").trim();
+  const isNote = (t) => /^\s*\[[\s\S]*\]\s*$/.test(String(t ?? ""));
+  const parts = texts.map((t) => String(t ?? "").trim()).filter(Boolean);
+  let out = "";
+  parts.forEach((t, i) => {
+    if (!i) out = t;
+    // 两边但凡有一条是垫进来的提示，中间就换行
+    else out += (isNote(t) || isNote(parts[i - 1]) ? "\n" : sep) + t;
+  });
+  return out.trim();
+}
+
+/**
  * 把一条消息放进这条会话的合并队列。
  * 导出仅为便于单独测试合并逻辑。
  *
@@ -1411,7 +1445,18 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
       for (const v of videos) v.release?.();
       return;
     }
-    const merged = slot.texts.join("\n").trim();
+    /*
+     * 合并窗口里攒下的几条，用**分隔符**连起来，不是换行。
+     *
+     * 模型那边的回复早就是 `在家$刚吃完饭$你呢` 这个样子了（见 delay.js 的
+     * normalizeForHistory），而你连发三条在上下文里却是三行换行 —— 一来一回摆
+     * 在一起，上文里只有角色一方在用 `$`。你本来也是分段发的，存档和提示词
+     * 里就该照着那个样子记（用户要的）。
+     *
+     * `separator` 可以被改成别的字符，也可以被清空；清空时退回换行，那是
+     * 「这个项目不用分隔符」的意思，拿空串连等于把三条粘成一句。
+     */
+    const merged = joinIncoming(slot.texts, getConfig().chat?.separator ?? "$");
     const voices = slot.voices ?? [];
     /*
      * 只发了图片、语音或视频、一个字都没打，也要处理——不能因为 merged 为空就丢掉。

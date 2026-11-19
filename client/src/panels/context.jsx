@@ -108,7 +108,23 @@ export function ContextPanel({ onGoto }) {
     () =>
       [...chats, ...legacy].map((s) => ({
         id: s.id,
-        label: s.id,
+        /*
+         * 列表上写**角色名**，不是会话 ID。
+         *
+         * ID 是「角色名 + 对方号码」拼出来的（`Jack1234658`），在 260px 那栏里
+         * 截断之后常常只剩半截号码；手机上更糟 —— 没有 hover，title 里那行
+         * 「角色 · 号码 · N 条」永远看不到，整栏看着就是一排认不出是谁的字符串
+         * （用户原话：「全部会话那里显示不出来角色信息」）。
+         *
+         * 号码只留后四位：同一个角色可能和好几个号码各有一段存档，光有角色名
+         * 分不出是哪一段，而整条号码在这栏里塞不下。存档里记的 roleName 也没有
+         * （老存档）就退回 ID —— 那至少还认得出来。
+         */
+        label: s.roleName?.trim()
+          ? s.peer
+            ? `${s.roleName.trim()} · ··${String(s.peer).slice(-4)}`
+            : s.roleName.trim()
+          : s.id,
         meta: String(s.count ?? 0),
         title: [s.roleName || "未命名角色", s.peer, `${s.count} 条`, fmtStamp(s.updatedAt)]
           .filter(Boolean)

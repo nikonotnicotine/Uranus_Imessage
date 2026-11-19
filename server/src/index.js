@@ -3522,6 +3522,15 @@ function offlineState(config, role, roleKey) {
     // 朗读「」台词用的音色，直接借线上语音那套，不另存一份
     voiceId: role.voiceSend?.voiceId ?? "",
     autoVoice: Boolean(role.offline?.autoVoice),
+    /*
+     * 这个角色**此刻**还有没有一轮在跑。
+     *
+     * 前端靠它收拾「连接断在半路」那种局面：流断了不等于生成停了（后端照样
+     * 写完落盘），所以断流之后不能立刻说「这轮没了」—— 那正是用户看到的
+     * 「明明已经生成出来了我却没看到，又重 roll 了一次」。断了就等它变回 false
+     * 再拉一次，那时候存档里是全的。
+     */
+    generating: offlineAborts.has(roleKey),
   };
 }
 
@@ -3685,15 +3694,43 @@ app.delete("/api/offline/:roleKey/story/:storyId", (req, res) => {
  */
 const offlineAborts = new Map();
 
-/** 起一轮：登记 controller，回一个 signal 和「跑完撤掉」的收尾函数。 */
-function trackOfflineRun(roleKey) {
+/**
+ * 同一个角色不许两轮一起跑 —— 新的来了，先把旧的掐掉**并等它咽气**。
+ *
+ * 这是「刷新一下出来两条回复」的修法。原来那条路是这样的：手机上发了一句，
+ * 模型写到一半网线断了 / 标签页被切到后台 / 反代 60 秒掐了这个流 —— 后端那轮
+ * **根本没停**，它照样写完、照样 appendTurn 落盘。用户这边屏幕上什么都没有，
+ * 以为这轮废了，按「重 roll」：重 roll 先删掉末尾的助手轮次（那会儿还没有），
+ * 再生成一条。于是两轮前后脚落盘，刷新一看两条回复。
+ *
+ * 所以这儿不是「拒绝」而是「顶掉」：用户按重 roll 的意思就是「我不要刚才那轮
+ * 了」。`await` 那一下是关键 —— 不等的话旧那轮的 appendTurn 可能排在
+ * dropLastAssistant 之后，照样多出一条。旧那轮被 abort 之后会从
+ * `runOfflineTurn` 里抛出去（chatWithFallback 收到 signal 就断），走它自己的
+ * catch，不落盘。
+ *
+ * @returns {Promise<{signal: AbortSignal, settle: (p: Promise<unknown>) => void, done: () => void}>}
+ */
+async function trackOfflineRun(roleKey) {
+  const prev = offlineAborts.get(roleKey);
+  if (prev) {
+    logInfo("线下模式", "这个角色上一轮还在跑，先把它掐掉再开新的");
+    prev.ctrl.abort();
+    // 它自己的 catch 会把这个 promise 收干净，这里只是等它真的结束
+    await prev.ended?.catch(() => {});
+  }
   const ctrl = new AbortController();
-  offlineAborts.set(roleKey, ctrl);
+  const entry = { ctrl, ended: null };
+  offlineAborts.set(roleKey, entry);
   return {
     signal: ctrl.signal,
+    /** 把这一轮的 promise 挂上去，好让下一轮等得到它。 */
+    settle: (p) => {
+      entry.ended = p;
+    },
     // 按引用比对：这轮跑完的时候 map 里可能已经换成别人刚放进去的那个了
     done: () => {
-      if (offlineAborts.get(roleKey) === ctrl) offlineAborts.delete(roleKey);
+      if (offlineAborts.get(roleKey) === entry) offlineAborts.delete(roleKey);
     },
   };
 }
@@ -3775,9 +3812,10 @@ function offlineTurnRoute(reroll) {
 
     // SSE 的头一旦写出去就只能用事件报错了，所以这个判断要在最前面
     const sse = wantsOfflineStream(ctx.config, req) ? offlineSse(res) : null;
-    const run = trackOfflineRun(ctx.roleKey);
+    // 等得到上一轮：同一个角色两轮一起跑正是「刷新出来两条」的来源（见 trackOfflineRun）
+    const run = await trackOfflineRun(ctx.roleKey);
     try {
-      const out = await runOfflineTurn(ctx.config, ctx.role, resolveUser(ctx.config, ctx.role), {
+      const work = runOfflineTurn(ctx.config, ctx.role, resolveUser(ctx.config, ctx.role), {
         ...(reroll
           ? { reroll: true }
           : {
@@ -3789,6 +3827,12 @@ function offlineTurnRoute(reroll) {
         onDelta: sse?.onDelta,
         onRestart: sse?.onRestart,
       });
+      // 挂上去，下一轮（重 roll、或者另一个标签页）要等的就是它
+      run.settle(work);
+      const out = await work;
+      // 撤登记要在拼 state **之前**：那份里带着 `generating`，不撤的话这轮
+      // 自己把自己报成「还在生成」，前端会接着等一个永远不来的结果
+      run.done();
       const payload = {
         ok: true,
         usedFallback: out.usedFallback,
@@ -3799,6 +3843,7 @@ function offlineTurnRoute(reroll) {
       if (sse) sse.finish("done", payload);
       else res.json(payload);
     } catch (e) {
+      run.done();
       const error = String(e?.message ?? e);
       // 按停是用户自己的操作，offline.js 那边已经记过一行了，这里不再报警
       if (!e?.aborted) {
@@ -3829,15 +3874,15 @@ app.post("/api/offline/:roleKey/abort", (req, res) => {
   const ctx = offlineCtx(req, res);
   if (!ctx) return;
 
-  const ctrl = offlineAborts.get(ctx.roleKey);
-  if (!ctrl) {
+  const entry = offlineAborts.get(ctx.roleKey);
+  if (!entry) {
     return res.json({
       ok: false,
       error: "这个角色现在没有在生成",
       ...offlineState(ctx.config, ctx.role, ctx.roleKey),
     });
   }
-  ctrl.abort();
+  entry.ctrl.abort();
   logInfo("线下模式", `「${ctx.role.name}」这轮被按停了`);
   res.json({ ok: true, ...offlineState(ctx.config, ctx.role, ctx.roleKey) });
 });

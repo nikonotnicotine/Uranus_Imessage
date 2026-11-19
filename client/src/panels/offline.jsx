@@ -1392,6 +1392,35 @@ export function OfflinePanel({ onGoto }) {
    * 正式 state 一到就被顶掉，不值得为这个在前端再跑一遍正则。
    */
   const [pending, setPending] = useState(null);
+  /*
+   * 这一轮是什么时候开始打模型的（0 = 没在打）。
+   *
+   * 有它才有「正在生成」这件事本身的证据：非流式那条路（全局开关设成「非流式」、
+   * 或者走小手机那条代理）一个字都不会提前到，流式那条路也可能几十秒吐不出第一个
+   * token（推理模型先想、上游先排队）。两种情况下屏幕上原来都是一片空白，用户
+   * 分不清「在慢慢写」和「API 早断了」，只能切去控制台看日志 —— 用户报的就是这个。
+   *
+   * 配下面那个 `tick` 当秒表：已经等了多少秒、收到多少字，都摆在气泡上。
+   */
+  const [genAt, setGenAt] = useState(0);
+  // 秒表的心跳：生成期间 1 秒走一次，「已等 N 秒」靠它自己往前走
+  const [now, setNow] = useState(0);
+  /*
+   * 「连接断了，但后端还在写」这个局面（`0` = 不在这个局面里）。
+   *
+   * 记的是进入这个局面的时刻，界面上据此说清楚现在在等什么 —— 这时候**千万
+   * 别让人去按重 roll**：后端那轮还会写完落盘，再 roll 一次就是两条。
+   */
+  const [waiting, setWaiting] = useState(0);
+  /*
+   * 当前这份 state 再存一份在 ref 里。
+   *
+   * `run` 要在发请求**之前**记下「末尾那条是哪一轮」，好在事后分清
+   * 「这一轮落盘了」和「请求压根没出去，末尾还是上一轮的那条回复」。
+   * 直接把 `state` 写进 `run` 的依赖的话，每收一份 state 就换一个新的 `run`，
+   * 下面一串 useCallback 跟着全废。
+   */
+  const stateRef = useRef(null);
 
   const [input, setInput] = useState("");
   const [menuKey, setMenuKey] = useState("");
@@ -1593,6 +1622,39 @@ export function OfflinePanel({ onGoto }) {
   }, [refreshRows, resync]);
 
   /**
+   * 没收到后端回话之后，等它把这一轮写完。
+   *
+   * **断流 ≠ 生成停了。** 流断在半路（手机把后台标签页的连接掐了、反代
+   * 60 秒超时、信号抖了一下）之后，后端那轮照样在跑、照样会落盘 —— 原来这儿
+   * 是立刻 resync 一次就收摊，拉回来的那份当然还没有回复，界面上一片空白，
+   * 用户以为这轮废了就去按重 roll，而后端那轮随后写完 —— 刷新一看两条回复。
+   * （后端那边现在也有一道闸：新一轮会先把旧的掐掉再开，见 index.js 的
+   * `trackOfflineRun`。这里是另一半：不让人以为该去按那一下。）
+   *
+   * 判据是后端回的 `generating`：它说还在跑就接着等，2 秒问一次，最多 5 分钟。
+   * 拉不动（真断网了）就按「还在跑」算，接着问 —— 网回来之后这一轮多半还在。
+   *
+   * @returns {Promise<object|null>} 最后拿到的那份 state
+   */
+  const waitForServer = useCallback(async () => {
+    let fresh = await resync();
+    if (!fresh?.generating) return fresh;
+    setWaiting(Date.now());
+    const until = Date.now() + 5 * 60 * 1000;
+    try {
+      while (Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const next = await resync();
+        if (next) fresh = next;
+        if (next && !next.generating) break;
+      }
+      return fresh;
+    } finally {
+      setWaiting(0);
+    }
+  }, [resync]);
+
+  /**
    * 所有写操作的唯一入口。
    *
    * 后端每次都回一整份 state，所以这里统一收下 —— 包括 `ok:false` 那次
@@ -1620,11 +1682,25 @@ export function OfflinePanel({ onGoto }) {
       // 严格等 off 才关掉：认不出的值（老配置、手改坏的）当默认的「跟随模型」
       const wantStream = (config.stream?.mode ?? "auto") !== "off" && generating;
 
+      /*
+       * 发请求之前末尾是哪一轮。事后拿它分清两件长得一样的事：
+       * 「后端其实写完了，只是回话没到」（末尾换成了一条**新的**助手轮次）和
+       * 「请求根本没出去」（末尾还是原来那条）。只看 role 的话，重 roll 失败时
+       * 末尾那条旧回复会被当成这轮的成果。
+       */
+      const beforeLast = stateRef.current?.story?.turns?.at?.(-1)?.id ?? "";
+      const landed = (fresh) => {
+        const last = fresh?.story?.turns?.at?.(-1);
+        return Boolean(last && last.role === "assistant" && last.id !== beforeLast);
+      };
+
       setBusy(true);
       setError("");
       setNote("");
       if (said) setPending(said);
       if (wantStream) setStreaming("");
+      // 秒表：非流式那条路也要有，它正是「空白干等」最严重的那条
+      if (generating) setGenAt(Date.now());
       /*
        * 自己动手添的内容要看得见：把「跟着往下滚」重新打开（翻旧剧情会关掉它）。
        *
@@ -1653,11 +1729,21 @@ export function OfflinePanel({ onGoto }) {
         }
         if (r?.roleKey) setState(r);
         if (r?.ok === false) setError(r.error || "这一步没成");
-        // 流走完了却一条 done/error 都没收到：管子中途断了（网关超时、断网）。
-        // 正式 state 没来，不能默默把那半截留在屏幕上当结果
+        /*
+         * 流走完了却一条 done/error 都没收到：管子中途断了（网关超时、断网、
+         * 手机把后台标签页的连接掐了）。正式 state 没来，不能默默把那半截留在
+         * 屏幕上当结果 —— 但也**不能就此当这轮废了**：后端那边多半还在写。
+         * 先等它写完（`waitForServer`），再按存档实际的样子说话。
+         */
         if (wantStream && !r) {
-          setError("生成中断了 —— 连接断在半路");
-          r = await resync();
+          r = await waitForServer();
+          if (landed(r)) {
+            // `landed` 也是 send() 的判据：这一轮落盘了，别把那句话还回输入框
+            r = { ...r, landed: true };
+            setNote("连接断在半路，不过后端把这一轮写完了 —— 上面那条就是结果。");
+          } else {
+            setError("生成中断了 —— 连接断在半路，这一轮没留下回复");
+          }
         }
         refreshRows();
         return r;
@@ -1676,7 +1762,13 @@ export function OfflinePanel({ onGoto }) {
          * 侧栏那列也要跟着重画 —— 它读的是另一条接口（`/api/offline`），
          * 不刷的话主区说「没开」而左边那列还标着轮数。
          */
-        const fresh = await resync();
+        // 会生成的那两条走和断流同一条路：后端可能还在写，等它（见 waitForServer）
+        let fresh = generating ? await waitForServer() : await resync();
+        if (generating && landed(fresh)) {
+          fresh = { ...fresh, landed: true };
+          setError("");
+          setNote("连接断在半路，不过后端把这一轮写完了 —— 上面那条就是结果。");
+        }
         refreshRows();
         return fresh;
       } finally {
@@ -1689,10 +1781,27 @@ export function OfflinePanel({ onGoto }) {
         setPending(null);
         setBusy(false);
         setStopping(false);
+        setGenAt(0);
       }
     },
-    [itemId, refreshRows, resync, config.stream?.mode]
+    [itemId, refreshRows, resync, waitForServer, config.stream?.mode]
   );
+
+  /* state 的影子，给 `run` 读（见 stateRef 那段注释） */
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  /*
+   * 生成期间的秒表心跳：1 秒一次，纯粹为了让「已等 N 秒」自己往前走。
+   * 不在生成时不挂 —— 这一页平时一秒重渲一次是白烧。
+   */
+  useEffect(() => {
+    if (!genAt) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [genAt]);
 
   /**
    * 按停正在跑的这一轮。
@@ -1945,6 +2054,12 @@ export function OfflinePanel({ onGoto }) {
     setInput("");
     const r = await run("/turn", { method: "POST", body: { text, storyId: sid }, said: text });
     if (r?.ok) return;
+    /*
+     * `landed` = 后端其实把这一轮写完了，只是回话没到（见 run 里那段）。
+     * 那就什么都别做：再把这句还回输入框，用户多半会再发一遍，等于同一句
+     * 话在剧情里出现两次。
+     */
+    if (r?.landed) return;
     const saved = r?.story?.turns ?? [];
     const tail = saved.length ? saved[saved.length - 1] : null;
     if (tail?.role !== "user") setInput((cur) => cur || text);
@@ -2426,13 +2541,36 @@ export function OfflinePanel({ onGoto }) {
                     * 外形（头像 + 名字 + 同一个框），正文是纯文本 `whitespace-pre-wrap`
                     * —— 半截 HTML 和半条正则渲出来的东西比不渲更难看。
                     */}
-                  {streaming !== null && (
+                  {(streaming !== null || genAt > 0) && (
                     <div className="flex items-start gap-3">
                       <Avatar file={state.avatar} name={roleName} />
                       <div className="min-w-0 max-w-[min(52rem,88%)] flex-1">
                         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
                           <span className="text-eyebrow uppercase text-ink-faint">{roleName}</span>
-                          <span className="text-meta text-ink-meta">正在写…</span>
+                          <span className="text-meta text-ink-meta">
+                            {waiting
+                              ? "连接断了，后端还在写…"
+                              : streaming
+                                ? "正在写…"
+                                : "在等模型开口…"}
+                          </span>
+                          {/*
+                            * 秒表 + 字数。这一行是「分不清在生成还是 API 断了」的解药：
+                            * 秒数在走 = 这边还连着；字数在涨 = 模型真的在吐字。
+                            * 非流式那条路（全局开关设成「非流式」）永远没有字数，
+                            * 所以那时候写明「这是非流式，整段写完才回来」——
+                            * 不写的话一分钟不动字的界面和断了没有区别。
+                            */}
+                          {genAt > 0 && (
+                            <span className="text-meta text-ink-faint">
+                              已等 {Math.max(0, Math.round(((now || Date.now()) - genAt) / 1000))} 秒
+                              {streaming
+                                ? ` · 收到 ${streaming.length} 字`
+                                : streaming === null
+                                  ? " · 非流式，整段写完才回来"
+                                  : " · 还没收到第一个字"}
+                            </span>
+                          )}
                         </div>
                         <div className="mt-1.5 w-fit border border-line bg-sunken px-3.5 py-3">
                           <p className="whitespace-pre-wrap text-body leading-relaxed text-ink-soft">
@@ -2440,6 +2578,16 @@ export function OfflinePanel({ onGoto }) {
                             <span className="ml-0.5 animate-pulse text-ink-faint">▍</span>
                           </p>
                         </div>
+                        {/*
+                          * 断流之后那段等待，必须说清楚「别去按重 roll」——
+                          * 那一下正是「刷新出来两条回复」的扳机（后端那轮还在写）。
+                          */}
+                        {waiting > 0 && (
+                          <p className="mt-1.5 max-w-[48ch] text-meta leading-relaxed text-ink-faint">
+                            连接断在半路，但后端那轮还在跑。等它写完就会自己出现在上面 ——
+                            这会儿别按重 roll，不然会多出一条。不想要了就按「停下」。
+                          </p>
+                        )}
                       </div>
                     </div>
                   )}

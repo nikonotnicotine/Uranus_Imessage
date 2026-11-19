@@ -113,7 +113,9 @@ function harness() {
   const fired = [];
 
   const code = `
+    ${extractFn("joinIncoming")}
     return {
+      joinIncoming,
       enqueue: ${extractFn("enqueue")},
       flushPending: ${extractFn("flushPending")},
       holdPending: ${extractFn("holdPending")},
@@ -150,8 +152,24 @@ console.log("\n[1. 每来一条重新倒计时]");
     H.enqueue(cfg(), H.runner, SPACE, "sp", { text: "在吗" }, "peer1");
     await sleep(120);
     assert.equal(H.fired.length, 1);
-    assert.equal(H.fired[0].merged, "你好\n在吗");
+    // 连发的几条用 chat.separator（默认 `$`）连起来，不是换行 —— 上下文里
+    // 你这边也该是「分段发的」那个样子，和角色那边对齐（见 joinIncoming）
+    assert.equal(H.fired[0].merged, "你好$在吗");
     assert.equal(H.fired[0].peer, "peer1");
+  });
+
+  await okAsync("垫进来的系统提示另起一行，不用分隔符接在正文上", () => {
+    const H = harness();
+    assert.equal(
+      H.joinIncoming(["[系统提示:{{user}}更改了当前聊天背景]", "我回来了", "你在干嘛"], "$"),
+      "[系统提示:{{user}}更改了当前聊天背景]\n我回来了$你在干嘛"
+    );
+  });
+
+  await okAsync("分隔符被清空时退回换行（空串连等于把几条粘成一句）", () => {
+    const H = harness();
+    assert.equal(H.joinIncoming(["一", "二"], ""), "一\n二");
+    assert.equal(H.joinIncoming(["一", "二"], "|"), "一|二");
   });
 
   await okAsync("每来一条重新倒计时（停手 queueWait 才结算）", async () => {
@@ -170,7 +188,7 @@ console.log("\n[1. 每来一条重新倒计时]");
     assert.equal(H.fired.length, 0, "离最后一条还不到 150ms 就结算了");
     await sleep(130);
     assert.equal(H.fired.length, 1, "停手 150ms 了还没结算");
-    assert.equal(H.fired[0].merged.split("\n").length, 5, "5 条要在同一轮里");
+    assert.equal(H.fired[0].merged.split("$").length, 5, "5 条要在同一轮里");
   });
 
   await okAsync("窗口关了之后来的消息开新一轮（不是并进上一轮）", async () => {
@@ -249,7 +267,7 @@ console.log("\n[2. 拆附件时到点了要等]");
 
     H.releasePending(H.runner, "sp");
     assert.equal(H.fired.length, 1);
-    assert.equal(H.fired[0].merged, "一\n二");
+    assert.equal(H.fired[0].merged, "一$二");
   });
 
   await okAsync("拆得快、窗口还没到点时，照常按窗口引爆", async () => {
