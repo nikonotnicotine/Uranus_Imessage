@@ -706,6 +706,7 @@ export function AppShell() {
                     </>
                   )}
                   {tab === "imessage" && <ImessagePanel bridge={bridge} />}
+                  {tab === "plugins" && <PluginsPanel />}
                   {tab === "console" && (
                     <>
                       <ConsolePanel />
@@ -718,7 +719,6 @@ export function AppShell() {
                       <BackupPanel />
                       <CloudBackupPanel />
                       <CustomCssPanel />
-                      <PluginsPanel />
                     </>
                   )}
                 </div>

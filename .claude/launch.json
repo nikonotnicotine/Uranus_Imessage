@@ -4,7 +4,10 @@
     {
       "name": "sillytavern",
       "runtimeExecutable": "cmd",
-      "runtimeArgs": ["/c", "cd /d D:\\SillyTavern\\SillyTavern && node server.js --browserLaunchEnabled=false"],
+      "runtimeArgs": [
+        "/c",
+        "cd /d D:\\SillyTavern\\SillyTavern && node server.js --browserLaunchEnabled=false"
+      ],
       "port": 8000
     },
     {
@@ -90,6 +93,18 @@
         "HTTPS_PROXY": "http://127.0.0.1:7892",
         "HTTP_PROXY": "http://127.0.0.1:7892",
         "MSYS_NO_PATHCONV": "1"
+      }
+    },
+    {
+      "name": "sandbox-plugins",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev:sandbox"
+      ],
+      "port": 5174,
+      "env": {
+        "URANUS_PLUGIN_MARKET": "http://127.0.0.1:8899"
       }
     }
   ]

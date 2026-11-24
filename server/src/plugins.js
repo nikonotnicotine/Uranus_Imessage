@@ -56,7 +56,8 @@ import path from "node:path";
 import zlib from "node:zlib";
 
 import { PLUGINS_DIR, readJson, writeJson } from "./datadir.js";
-import { logError, logInfo } from "./logs.js";
+import { makeNet } from "./cloud/net.js";
+import { logError, logInfo, logWarn } from "./logs.js";
 
 export { PLUGINS_DIR };
 const INSTALLED_PATH = path.join(PLUGINS_DIR, "installed.json");
@@ -419,6 +420,143 @@ export function uninstall(id) {
   logInfo("插件", `卸载了插件 ${id}`);
 }
 
+/*
+ * ── 插件市场（一份链接目录）──
+ *
+ * 市场就是 GitHub 上那个仓库里的两份 JSON。控制台把它们渲染成卡片，点一下
+ * **在新标签页打开作者的仓库** —— 下载 zip 这一步永远由用户自己在浏览器里做。
+ *
+ * 为什么由后端代拉而不是浏览器直接 fetch：
+ *
+ *  1. raw.githubusercontent.com 在国内很多网络下连不上，而后端那台机器多半
+ *     已经为了调模型 API 配好了出网（VPS 在墙外、或者本机挂着代理）。浏览器
+ *     直连会让相当一部分用户看到一个空列表，还以为是市场里没东西。
+ *  2. 拉到的内容要缓存 —— 每次打开插件分区都去打一次 GitHub 既慢又没必要。
+ *  3. 浏览器直连会把用户的 IP 暴露给 GitHub。虽然只是拉一份公开 JSON，
+ *     但「打开控制台的某个分区」不该顺带产生一次对第三方的请求。
+ *
+ * 缓存写在内存里不落盘：这份目录是**别人仓库里的内容**，不是用户的数据，
+ * 落到 data/ 里既要进备份又要考虑过期，不值当。进程重启重新拉一次就是。
+ */
+
+/**
+ * 市场索引的地址。
+ *
+ * `URANUS_PLUGIN_MARKET` 能换成别的目录（给自建市场源用，也给开发时指向本地
+ * 文件用）。给的是**目录**的地址，两份 JSON 的文件名固定 —— 这样换源的人只要
+ * 保证自己那份目录的格式和 schema 一致就行，不用配两个地址。
+ */
+const MARKET_BASE = (process.env.URANUS_PLUGIN_MARKET ?? "https://raw.githubusercontent.com/nikonotnicotine/uranus-plugins/main").replace(/\/+$/, "");
+const MARKET_INDEX = `${MARKET_BASE}/plugins.json`;
+const MARKET_DELISTED = `${MARKET_BASE}/delisted.json`;
+
+/** 缓存多久。目录变动不频繁，10 分钟够了；用户点「刷新」能强制重拉。 */
+const MARKET_TTL = 10 * 60 * 1000;
+
+/** 一份索引最多多大。几百个插件也就几十 KB，2MB 是防对面被人塞了个大文件。 */
+const MARKET_MAX_BYTES = 2 * 1024 * 1024;
+
+const net = makeNet({ who: "插件市场", scope: "插件", hint: "拉取插件市场的目录" });
+
+/** @type {{at: number, data: object} | null} */
+let marketCache = null;
+
+/**
+ * 把远端那份条目收干净再交给前端。
+ *
+ * **这是从别人仓库里拉来的数据，当成不可信的输入处理**：每个字段都限类型、
+ * 限长度，链接只放行 https 的 github.com 地址 —— 一条被改坏（或者被人往
+ * 仓库里塞了奇怪东西）的条目不该能在控制台里渲染出一个 `javascript:` 链接，
+ * 或者用一段超长的描述把布局撑爆。
+ */
+function cleanEntry(e) {
+  if (!e || typeof e !== "object") return null;
+  const str = (v, max) => (typeof v === "string" ? v.slice(0, max) : "");
+  const ghUrl = (v) =>
+    typeof v === "string" && /^https:\/\/github\.com\/[A-Za-z0-9._\-/]{1,120}$/.test(v) ? v : "";
+
+  const id = str(e.id, 64);
+  if (!ID_RE.test(id)) return null; // id 不合规的条目直接丢，它和本地装的对不上
+  const repo = ghUrl(e.repo);
+  if (!repo) return null; // 没有仓库地址的条目没有意义 —— 市场就是个跳转目录
+
+  return {
+    id,
+    title: str(e.title, 40) || id,
+    desc: str(e.desc, 200),
+    author: ghUrl(e.author),
+    repo,
+    license: str(e.license, 32),
+    tags: Array.isArray(e.tags) ? e.tags.filter((t) => typeof t === "string").slice(0, 5).map((t) => t.slice(0, 12)) : [],
+    lockedVersion: str(e.lockedVersion, 64),
+    reviewedAt: str(e.reviewedAt, 10),
+    addedAt: str(e.addedAt, 10),
+  };
+}
+
+function cleanDelisted(e) {
+  if (!e || typeof e !== "object") return null;
+  const id = typeof e.id === "string" ? e.id.slice(0, 64) : "";
+  if (!ID_RE.test(id)) return null;
+  return {
+    id,
+    title: typeof e.title === "string" ? e.title.slice(0, 40) : id,
+    delistedAt: typeof e.delistedAt === "string" ? e.delistedAt.slice(0, 10) : "",
+    reason: typeof e.reason === "string" ? e.reason.slice(0, 24) : "other",
+    note: typeof e.note === "string" ? e.note.slice(0, 200) : "",
+  };
+}
+
+async function fetchJson(url, what) {
+  const res = await net.fetch(url, { headers: { accept: "application/json" } }, what);
+  if (!res.ok) throw new Error(`${what}失败：GitHub 返回 ${res.status}`);
+  const len = Number(res.headers.get("content-length") ?? 0);
+  if (len > MARKET_MAX_BYTES) throw new Error(`${what}失败：文件太大（${len} 字节）`);
+  const text = await res.text();
+  if (text.length > MARKET_MAX_BYTES) throw new Error(`${what}失败：文件太大`);
+  return JSON.parse(text);
+}
+
+/**
+ * 拉市场目录（带缓存）。
+ *
+ * 下架名单拉不到**不算失败** —— 在售目录才是主体。但这时候要让前端知道
+ * 「这次没对过下架名单」，否则一个已下架的插件会被显示成正常的。
+ */
+async function loadMarket({ force = false } = {}) {
+  if (!force && marketCache && Date.now() - marketCache.at < MARKET_TTL) {
+    return { ...marketCache.data, cached: true };
+  }
+
+  const index = await fetchJson(MARKET_INDEX, "拉取插件目录");
+  const plugins = Array.isArray(index?.plugins) ? index.plugins.map(cleanEntry).filter(Boolean) : [];
+
+  let delisted = [];
+  let delistedOk = true;
+  try {
+    const d = await fetchJson(MARKET_DELISTED, "拉取下架名单");
+    delisted = Array.isArray(d?.plugins) ? d.plugins.map(cleanDelisted).filter(Boolean) : [];
+  } catch (err) {
+    delistedOk = false;
+    logWarn("插件", "下架名单拉不到，这次不对照（在售目录照常显示）", err);
+  }
+
+  const data = {
+    plugins,
+    delisted,
+    delistedOk,
+    updatedAt: typeof index?.updatedAt === "string" ? index.updatedAt.slice(0, 10) : "",
+    fetchedAt: new Date().toISOString(),
+  };
+  marketCache = { at: Date.now(), data };
+  logInfo(
+    "插件",
+    `插件市场目录已更新：${plugins.length} 个在售${delistedOk ? `，${delisted.length} 个已下架` : "（下架名单没拉到）"}`,
+  );
+  return { ...data, cached: false };
+}
+
+
 // ── 路由 ─────────────────────────────────────────────────────────────
 
 /**
@@ -469,6 +607,28 @@ export function mountPluginInstall(app) {
 export function mountPlugins(app) {
   /** 列表 + 总开关。界面靠这一个接口画插件分区。 */
   app.get("/api/plugins", (_req, res) => res.json(listPlugins()));
+
+  /**
+   * 插件市场的目录（后端代拉 + 缓存，见 loadMarket 上面那段）。
+   *
+   * `?refresh=1` 强制重拉 —— 用户刚上架了自己的插件，不该等十分钟。
+   *
+   * 拉不到的时候回 502 而不是空列表：空列表看起来像「市场里没有插件」，
+   * 而真相是「没连上 GitHub」，这两件事用户要做的处置完全不同。
+   */
+  app.get("/api/plugins/market", async (req, res) => {
+    try {
+      const market = await loadMarket({ force: req.query.refresh === "1" });
+      // 顺带把本地装了什么一起给，省得前端再打一次接口、还要自己对
+      const local = listPlugins();
+      res.json({
+        ...market,
+        installed: Object.fromEntries(local.plugins.map((p) => [p.id, { version: p.version, enabled: p.enabled }])),
+      });
+    } catch (err) {
+      res.status(502).json({ error: String(err?.message ?? err) });
+    }
+  });
 
   /**
    * 前端要加载的那几个（总开关开着、自己开着、没坏）。
