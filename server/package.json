@@ -8,18 +8,18 @@
     "start": "node src/index.js"
   },
   "dependencies": {
-    "@napi-rs/canvas": "0.1.80",
-    "@spectrum-ts/imessage": "12.10.1",
-    "@spectrum-ts/imessage-local": "12.10.1",
-    "chinese-days": "^1.5.9",
+    "@napi-rs/canvas": "0.1.100",
+    "@spectrum-ts/imessage": "12.16.0",
+    "@spectrum-ts/imessage-local": "12.16.0",
+    "chinese-days": "^1.5.10",
     "cors": "^2.8.5",
-    "date-holidays": "^3.36.1",
-    "express": "^4.21.2",
+    "date-holidays": "^3.39.2",
+    "express": "^4.22.3",
     "ffmpeg-static": "^5.3.0",
-    "mammoth": "1.12.3",
-    "nodemailer": "10.0.9",
+    "mammoth": "1.13.0",
+    "nodemailer": "10.6.1",
     "pdf-parse": "2.4.5",
-    "spectrum-ts": "12.10.1",
+    "spectrum-ts": "12.16.0",
     "tar-fs": "^2.1.5"
   }
 }
