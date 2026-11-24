@@ -95,6 +95,7 @@ import { mountCall, sendToNode } from "./callapi.js";
 import { syncCallTunnel } from "./calltunnel.js";
 import { endCall, markConnected } from "./callsession.js";
 import { mountCustomCss } from "./customcss.js";
+import { mountPluginInstall, mountPlugins } from "./plugins.js";
 import {
   assistantGreeting,
   buildAssistantMessages,
@@ -731,6 +732,11 @@ app.use("/api/backup/full/restore", async (req, res, next) => {
   }
   res.json({ ok: true, ...result, config: loadConfig() });
 });
+
+// 装插件收的是 zip 的原始字节，**必须排在 express.json() 之前**（理由和上面
+// 收图、恢复完整备份那两条一样：json 中间件解析不了 application/zip，但它会把
+// 流读掉）。插件的其余路由在下面跟着别的面板一起挂（mountPlugins）
+mountPluginInstall(app);
 
 // 视觉测试会把 base64 图片发上来，2mb 不够用
 app.use(express.json({ limit: "12mb" }));
@@ -1375,6 +1381,9 @@ mountPhone(app, loadConfig);
 mountReminders(app, loadConfig);
 // 控制台 / 查手机的自定义 CSS（data/custom-css.json，不走 /api/config）
 mountCustomCss(app);
+// 插件：列表、开关、卸载、插件自己的入口文件（data/plugins/，不走 /api/config）。
+// 装插件那条在上面，express.json() 之前
+mountPlugins(app);
 /*
  * FaceTime 通话（见 callapi.js）。
  *

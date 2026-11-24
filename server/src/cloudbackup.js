@@ -108,6 +108,16 @@ export const SCOPES = {
       // 定时维护的进度（上次重启 / 清缓存 / 云备份各是什么时候）。带着它搬，
       // 「每 3 天备份一次」在新机器上接着数，不会从零开始
       "maintenance.json",
+      /*
+       * 插件：**只带清单和插件自己存的数据，代码一个字节都不进包**（见
+       * pluginEntryAllowed —— 整张表里唯一一条按内容而不是按目录决定的规则）。
+       *
+       * 整个 plugins/ 只在这一块出现，不在「聊天与记忆」那块再列一次：
+       * collectEntries 不去重，两块都列的话同时勾选会把条目打两遍。
+       * 插件的 storage/ 因此跟着「配置」走 —— 它严格说更像聊天数据，但那几个
+       * 文件通常只有几 KB，和「为了归类准确而冒重复打包的险」比，这边更划算。
+       */
+      "plugins",
     ],
   },
   chats: {
@@ -160,6 +170,35 @@ export const SCOPES = {
  * `instagram/` 顺手把 media 带上（本该归 images），两块都勾还会打两遍。
  */
 const CARVED_OUT = new Set(["instagram/media", "offline/media"]);
+
+/**
+ * `data/plugins/` 里**哪些东西能进包** —— 这是整张表里唯一一条按内容而不是
+ * 按目录决定的规则，因为那个目录里躺着**会被执行的代码**。
+ *
+ * 能进的只有两种：
+ *   - `plugins/installed.json`     装了哪些、哪些开着（恢复后照着这份去重新下载）
+ *   - `plugins/<id>/manifest.json` 那个插件是谁、哪个版本、仓库在哪
+ *   - `plugins/<id>/storage/**`    插件自己写的数据
+ *
+ * 插件的代码（client.js、style.css，以及作者塞进去的任何文件）**一个字节都不进包**。
+ *
+ * 为什么：备份包是用来搬到另一台机器、或者发给别人的。把代码打进去，一次
+ * 「恢复备份」就等于在那台机器上静默落下一批第三方可执行代码 —— 而那个人
+ * 可能压根不知道原机器上装过插件，更没同意过让这些代码在自己机器上跑。
+ * 市场那条路至少有「用户自己下载、自己点导入、看见声明的权限」这几道，
+ * 恢复备份这条路一道都没有。
+ *
+ * 代价是恢复之后插件要重新装一遍。界面上会照着 installed.json 列出
+ * 「原来装过这些」，点一下跳到各自的仓库 —— 这正是想要的：重新装一遍是
+ * 用户的决定，不是备份包替他做的决定。
+ */
+function pluginEntryAllowed(rel) {
+  const parts = rel.split("/"); // 已经是 posix 形式（walk 里用 path.posix.join 拼的）
+  if (parts[0] !== "plugins") return true; // 不是插件目录，这条规则不管
+  if (parts.length === 2) return parts[1] === "installed.json";
+  if (parts.length >= 3 && parts[2] === "storage") return true; // 插件自己的数据
+  return parts.length === 3 && parts[2] === "manifest.json";
+}
 
 /**
  * 勾了密钥才带的那几个文件。
@@ -318,6 +357,8 @@ export function collectEntries(scopes, { includeSecrets = false } = {}) {
     }
     if (st.isFile()) {
       if (skipped(path.basename(rel))) return true;
+      // data/plugins/ 里只带清单和插件自己的数据，代码不进包（见 pluginEntryAllowed）
+      if (!pluginEntryAllowed(rel)) return true;
       entries.push(rel);
       bytes += st.size;
       return true;

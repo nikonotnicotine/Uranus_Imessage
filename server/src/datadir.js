@@ -14,6 +14,7 @@
  *   data/sessions/          对话存档
  *   data/wallpapers/        后台界面的壁纸，外加一份 settings.json
  *   data/transfer-logos/    转账卡片上那张缩略图的素材
+ *   data/plugins/           插件，一个插件一个文件夹（里面是会被执行的代码）
  *
  * 另有一个 assets/ 在**项目根**（不在 data/ 里）：随代码发的内置素材，只读。
  *
@@ -274,6 +275,21 @@ export const TRANSFER_LOGO_DIR = path.join(DATA_DIR, "transfer-logos");
 export const POLLS_DIR = path.join(DATA_DIR, "polls");
 
 /**
+ * 插件（plugins.js）：一个插件一个子文件夹，外加一份 installed.json
+ * （装了哪些、哪些开着）。
+ *
+ * ⚠️ **这里面是会被执行的代码**，和 data/ 下其它目录都不一样。所以它进云备份的
+ * 方式是特例：「配置」那一块**只带 `plugins/installed.json` 和各插件的
+ * `manifest.json`**，插件代码一个字节都不进包（cloudbackup.js:SCOPES）。
+ * 一份备份搬到别人机器上恢复，不该等于在那台机器上自动落下一批可执行代码 ——
+ * 恢复之后用户看到的是「这些插件原来装过」的清单，自己去市场重新下载。
+ *
+ * 插件自己写的东西在 `plugins/<id>/storage/`，归「聊天与记忆」那一块
+ * （那是聊出来/用出来的数据，不是代码）。
+ */
+export const PLUGINS_DIR = path.join(DATA_DIR, "plugins");
+
+/**
  * 小剧场（theater.js）：模板、成品索引在 state.json，每个成品的 HTML 单独一个文件。
  *
  * **不进 config.json**，理由同上：生成一次就要写一次，`PUT /api/config` 会顺带
@@ -463,6 +479,7 @@ export function ensureLayout() {
     LUCKIN_DIR,
     TRANSFER_LOGO_DIR,
     POLLS_DIR,
+    PLUGINS_DIR,
   ]) {
     fs.mkdirSync(dir, { recursive: true });
   }
