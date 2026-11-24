@@ -27,8 +27,10 @@ import {
   Blocks,
   Check,
   ExternalLink,
+  KeyRound,
   Package,
   RefreshCw,
+  Settings2,
   ShieldAlert,
   Trash2,
   Upload,
@@ -68,6 +70,146 @@ async function call(path, options = {}) {
 
 const openRepo = (url) => window.open(url, "_blank", "noopener,noreferrer");
 
+/**
+ * 一个插件的配置表单。
+ *
+ * **界面由这里渲染，不是插件自己画的** —— 作者只在 manifest.json 里声明
+ * 「我要哪些项、什么类型」，表单长什么样由控制台说了算。这样风格统一，
+ * 而且插件拿不到往设置页里塞任意 DOM 的机会。
+ *
+ * 支持五种类型，和后端 plugins.js:CFG_TYPES 对齐：
+ * string / secret / number / boolean / select。
+ *
+ * secret 项的值后端抹成了圆点再发过来，用户不动它就原样发回去，后端认出
+ * 占位 = 「没改」保留原值。所以这里对 secret 不做任何特殊处理，当普通字符串
+ * 走就行 —— 只是输入框用 password 类型。
+ */
+function PluginConfig({ plugin, onClose }) {
+  const [schema, setSchema] = useState(null);
+  const [saved, setSaved] = useState(null);
+  const [draft, setDraft] = useState({});
+  const [note, setNote] = useState({ state: "idle", message: "" });
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    call(`/api/plugins/${plugin.id}/config`)
+      .then((r) => {
+        if (!alive) return;
+        setSchema(r.schema);
+        setSaved(r.values);
+        setDraft(r.values);
+      })
+      .catch((e) => alive && setNote({ state: "fail", message: String(e?.message ?? e) }));
+    return () => {
+      alive = false;
+    };
+  }, [plugin.id]);
+
+  async function save() {
+    setBusy(true);
+    try {
+      const r = await call(`/api/plugins/${plugin.id}/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ values: draft }),
+      });
+      setSaved(r.values);
+      setDraft(r.values);
+      setNote({ state: "ok", message: "已保存。插件要刷新页面才会按新配置跑。" });
+    } catch (e) {
+      setNote({ state: "fail", message: String(e?.message ?? e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!schema) {
+    return <p className="mt-4 border-t border-line pt-4 text-meta text-ink-faint">正在读配置…</p>;
+  }
+
+  const dirty = saved && JSON.stringify(draft) !== JSON.stringify(saved);
+  const hasSecret = schema.some((it) => it.type === "secret");
+  const set = (key, v) => setDraft((d) => ({ ...d, [key]: v }));
+
+  const field =
+    "w-full border border-line bg-transparent px-2.5 py-1.5 text-meta text-ink outline-none focus:border-ink";
+
+  return (
+    <div className="mt-4 border-t border-line pt-4">
+      <div className="grid grid-cols-1 gap-4">
+        {schema.map((it) => (
+          <div key={it.key} className="grid grid-cols-1 gap-1.5">
+            <div className="flex items-baseline gap-2">
+              <span className="text-meta text-ink">{it.title}</span>
+              {it.required && <span className="text-[11px] text-ink-faint">必填</span>}
+            </div>
+            {it.desc && <p className="max-w-[62ch] text-[11px] leading-relaxed text-ink-faint">{it.desc}</p>}
+
+            {it.type === "boolean" ? (
+              <div className="pt-0.5">
+                <Switch checked={Boolean(draft[it.key])} onChange={(v) => set(it.key, v)} label={it.title} />
+              </div>
+            ) : it.type === "select" ? (
+              <select className={field} value={draft[it.key] ?? ""} onChange={(e) => set(it.key, e.target.value)}>
+                {it.options.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            ) : it.type === "number" ? (
+              <input
+                type="number"
+                className={field}
+                value={draft[it.key] ?? ""}
+                min={it.min}
+                max={it.max}
+                onChange={(e) => set(it.key, e.target.value === "" ? "" : Number(e.target.value))}
+              />
+            ) : (
+              <input
+                type={it.type === "secret" ? "password" : "text"}
+                className={field}
+                value={draft[it.key] ?? ""}
+                maxLength={it.maxLength}
+                autoComplete={it.type === "secret" ? "new-password" : "off"}
+                spellCheck={false}
+                onChange={(e) => set(it.key, e.target.value)}
+              />
+            )}
+          </div>
+        ))}
+
+        {/*
+          密钥会跟着备份包走，这件事必须在填的时候说，不能等包发出去了才发现。
+          插件配置是**不勾「含密钥」也带**的那个例外，理由在 cloudbackup.js 里。
+        */}
+        {hasSecret && (
+          <p className="flex items-start gap-2 text-[11px] leading-relaxed text-ink-faint">
+            <KeyRound className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              插件的配置会跟着备份包走，<strong>包括这里填的密钥，而且不勾「含密钥」也会带</strong>
+              —— 不这样的话换台机器恢复完每个插件都要重填。所以这台机器的备份包别随便发人。
+            </span>
+          </p>
+        )}
+
+        {note.message && <ResultNote state={note.state} message={note.message} />}
+
+        <div className="flex items-center gap-1.5">
+          <Button onClick={save} disabled={busy || !dirty}>
+            保存
+          </Button>
+          <Button variant="ghost" onClick={onClose} disabled={busy}>
+            收起
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function PluginsPanel() {
   const [state, setState] = useState(null); // { enabled, plugins: [] }
   const [market, setMarket] = useState(null); // { plugins, delisted, delistedOk, updatedAt }
@@ -77,6 +219,7 @@ export function PluginsPanel() {
   const [busy, setBusy] = useState(false);
   const [needReload, setNeedReload] = useState(false);
   const [confirmDrop, setConfirmDrop] = useState("");
+  const [openConfig, setOpenConfig] = useState("");
   const fileRef = useRef(null);
 
   const refresh = useCallback(
@@ -397,6 +540,7 @@ export function PluginsPanel() {
             <div className="grid grid-cols-1 gap-3">
               {installed.map((p) => {
                 const gone = delistedMap.get(p.id);
+                const hasConfig = p.configSchema?.length > 0;
                 return (
                   <div key={p.id} className={`border p-4 ${gone ? "border-warn" : "border-line"}`}>
                     <div className="flex items-start justify-between gap-4">
@@ -453,13 +597,26 @@ export function PluginsPanel() {
                             </Button>
                           </div>
                         ) : (
-                          <Button variant="ghost" onClick={() => setConfirmDrop(p.id)} disabled={busy}>
-                            <Trash2 className="h-3.5 w-3.5" />
-                            卸载
-                          </Button>
+                          <>
+                            {hasConfig && !p.broken && (
+                              <Button
+                                variant="ghost"
+                                onClick={() => setOpenConfig((x) => (x === p.id ? "" : p.id))}
+                                disabled={busy}
+                              >
+                                <Settings2 className="h-3.5 w-3.5" />
+                                设置
+                              </Button>
+                            )}
+                            <Button variant="ghost" onClick={() => setConfirmDrop(p.id)} disabled={busy}>
+                              <Trash2 className="h-3.5 w-3.5" />
+                              卸载
+                            </Button>
+                          </>
                         )}
                       </div>
                     </div>
+                    {openConfig === p.id && <PluginConfig plugin={p} onClose={() => setOpenConfig("")} />}
                   </div>
                 );
               })}

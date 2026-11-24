@@ -280,7 +280,9 @@ export const POLLS_DIR = path.join(DATA_DIR, "polls");
  *
  * ⚠️ **这里面是会被执行的代码**，和 data/ 下其它目录都不一样。所以它进云备份的
  * 方式是特例：「配置」那一块**只带 `plugins/installed.json` 和各插件的
- * `manifest.json`**，插件代码一个字节都不进包（cloudbackup.js:SCOPES）。
+ * `manifest.json` / `config.json`**，插件代码一个字节都不进包
+ * （cloudbackup.js:pluginEntryAllowed）。`config.json` 里可能有插件要的 API key，
+ * 而它不勾「含密钥」也带 —— 那条例外的理由写在 cloudbackup.js 那段注释里。
  * 一份备份搬到别人机器上恢复，不该等于在那台机器上自动落下一批可执行代码 ——
  * 恢复之后用户看到的是「这些插件原来装过」的清单，自己去市场重新下载。
  *

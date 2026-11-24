@@ -75,6 +75,23 @@ async function load(p) {
   if (p.entry?.css) injectCss(p.id, `/api/plugins/${p.id}/file/${p.entry.css}`);
   if (!p.entry?.client) return;
 
+  /*
+   * 配置是按 id 单独拉的，不跟在 /api/plugins/active 的列表里 —— 那样一次
+   * 请求就会把所有插件的密钥打包送到页面上。只有声明过配置的插件才拉
+   * （hasConfig），没声明的省掉这次请求。
+   *
+   * 拉不到就当没有：配置拿不到不该让插件整个加载不了，插件自己会用默认值兜底。
+   */
+  let config;
+  if (p.hasConfig) {
+    try {
+      const res = await fetch(`/api/plugins/${p.id}/config/runtime`, { credentials: "same-origin" });
+      if (res.ok) config = await res.json();
+    } catch {
+      /* 拿不到就 undefined，插件按默认值跑 */
+    }
+  }
+
   try {
     // Vite 看见带变量的 import() 不会去打包它，正是要的 —— 这个 URL 是运行时
     // 才知道的，插件也不在构建产物里
@@ -84,9 +101,19 @@ async function load(p) {
       console.warn(`[插件] ${p.name}（${p.id}）没有导出默认函数，没东西可跑`);
       return;
     }
-    // 这一版还没有给插件的 API，先传一个最小的 ctx：插件至少该知道自己是谁。
-    // 以后往里加字段是兼容的，插件按需解构
-    fn({ id: p.id, name: p.name, version: p.version });
+    /*
+     * 传给插件的 ctx。以后往里加字段是兼容的，插件按需解构。
+     *
+     * `config` 是用户在控制台里填的那份（manifest.json 的 config 段声明了有
+     * 哪些项，后端按 schema 补齐了默认值）。没声明配置的插件这里是 undefined，
+     * 让插件代码能用 `ctx.config ?? {}` 区分「没有配置这回事」和「有配置但
+     * 都是默认值」。
+     *
+     * 是**加载时的快照**，不是响应式的 —— 用户改了配置要刷新页面才生效。
+     * 这是有意的，和开关一样的道理：插件已经按旧配置画了界面、挂了事件，
+     * 「把旧配置的影响撤干净再按新配置重来」没法做可靠。
+     */
+    fn({ id: p.id, name: p.name, version: p.version, config });
   } catch (err) {
     // 插件自己的错不该看起来像控制台的错，所以前缀写清楚是哪个插件
     console.warn(`[插件] ${p.name}（${p.id}）加载失败：`, err);

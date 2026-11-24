@@ -109,7 +109,7 @@ export const SCOPES = {
       // 「每 3 天备份一次」在新机器上接着数，不会从零开始
       "maintenance.json",
       /*
-       * 插件：**只带清单和插件自己存的数据，代码一个字节都不进包**（见
+       * 插件：**只带清单、配置和插件自己存的数据，代码一个字节都不进包**（见
        * pluginEntryAllowed —— 整张表里唯一一条按内容而不是按目录决定的规则）。
        *
        * 整个 plugins/ 只在这一块出现，不在「聊天与记忆」那块再列一次：
@@ -175,12 +175,20 @@ const CARVED_OUT = new Set(["instagram/media", "offline/media"]);
  * `data/plugins/` 里**哪些东西能进包** —— 这是整张表里唯一一条按内容而不是
  * 按目录决定的规则，因为那个目录里躺着**会被执行的代码**。
  *
- * 能进的只有两种：
+ * 能进的只有这几种：
  *   - `plugins/installed.json`     装了哪些、哪些开着（恢复后照着这份去重新下载）
  *   - `plugins/<id>/manifest.json` 那个插件是谁、哪个版本、仓库在哪
+ *   - `plugins/<id>/config.json`   用户给那个插件填的设置
  *   - `plugins/<id>/storage/**`    插件自己写的数据
  *
  * 插件的代码（client.js、style.css，以及作者塞进去的任何文件）**一个字节都不进包**。
+ *
+ * ⚠️ `config.json` 里可能有插件要的 API key（插件作者可以声明 secret 类型的
+ * 配置项）。它**不跟着「含密钥」那个勾走，不勾也带** —— 这是个有意为之的例外：
+ * 配置不跟着包走的话，换台机器恢复完每个插件都要重填一遍，而大多数插件的配置
+ * 里压根没有密钥。代价是**一份「不含密钥」的备份里仍然可能躺着插件的 key**，
+ * 所以设置界面在 secret 那一项旁边写着这句话，别把包随便发人。
+ * 插件自己的密钥由插件作者和用户负责，Uranus 这边只负责说清楚。
  *
  * 为什么：备份包是用来搬到另一台机器、或者发给别人的。把代码打进去，一次
  * 「恢复备份」就等于在那台机器上静默落下一批第三方可执行代码 —— 而那个人
@@ -197,7 +205,7 @@ function pluginEntryAllowed(rel) {
   if (parts[0] !== "plugins") return true; // 不是插件目录，这条规则不管
   if (parts.length === 2) return parts[1] === "installed.json";
   if (parts.length >= 3 && parts[2] === "storage") return true; // 插件自己的数据
-  return parts.length === 3 && parts[2] === "manifest.json";
+  return parts.length === 3 && (parts[2] === "manifest.json" || parts[2] === "config.json");
 }
 
 /**

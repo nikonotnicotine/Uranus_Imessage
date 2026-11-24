@@ -81,6 +81,33 @@ export const MAX_ZIP = 8 * 1024 * 1024;
 /** 入口能指向的文件类型。插件是前端代码，不该带二进制。 */
 const ENTRY_EXT = { client: [".js", ".mjs"], css: [".css"] };
 
+/**
+ * 插件配置（manifest.json 里的 `config` 段）的限额。
+ *
+ * 那段声明是**作者写的**，和插件代码一样当不可信输入处理 —— 一份声明了
+ * 五千个配置项、或者标题有十万字的 manifest 不该能把设置界面撑爆。
+ */
+const CFG = {
+  /** 最多多少项。真实插件个位数，30 是给「配置很多」的那种留的余量 */
+  maxItems: 30,
+  /** key 的样子：字母开头，字母数字下划线，最长 32 */
+  keyRe: /^[a-zA-Z][a-zA-Z0-9_]{0,31}$/,
+  /** select 最多多少个选项 */
+  maxOptions: 50,
+  /** 标题 / 说明 / 选项 label 的长度上限 */
+  maxTitle: 40,
+  maxDesc: 200,
+  maxLabel: 40,
+  /** string / secret 的值默认最长多少。作者能用 maxLength 往下调，不能往上超 */
+  maxValue: 2000,
+};
+
+/** 配置项支持的五种类型。**不打算再加**（见文件头那段注释）。 */
+const CFG_TYPES = new Set(["string", "secret", "number", "boolean", "select"]);
+
+/** secret 项回给前端时的占位。用户没改的话原样发回来，后端认出它=「没改」。 */
+const SECRET_MASK = "••••••••";
+
 /** 跟着 zip 一起来的系统垃圾，解压时直接丢。 */
 const JUNK = /^(__MACOSX\/|\.DS_Store$|Thumbs\.db$|desktop\.ini$)/i;
 
@@ -114,6 +141,102 @@ function writeInstalled(next) {
 }
 
 // ── 校验 ─────────────────────────────────────────────────────────────
+
+/**
+ * 解析 manifest 里那段 `config` 声明。
+ *
+ * 作者只声明「我要哪些配置项」，表单由 Uranus 渲染（见 client/src/panels/plugins.jsx）——
+ * 作者不写界面代码，也就拿不到往设置页里塞任意 DOM 的机会。他能说的只有
+ * 「我要一个字符串输入框」。
+ *
+ * 五种类型就够了，不打算再加（`CFG_TYPES`）：一旦支持嵌套对象和数组，表单渲染
+ * 的复杂度和校验的攻击面都会涨一个量级，而插件真正要的 99% 是这五种的平铺。
+ *
+ * **永远不抛**：声明坏了返回 `{ error }`，让这个插件进 broken ——
+ * 和 entry 指向的文件不存在一个待遇，不会影响别的插件。
+ *
+ * @returns {{items: object[]} | {error: string}}
+ */
+function parseConfigSchema(raw) {
+  if (raw == null) return { items: [] }; // 没声明配置，正常
+  if (!Array.isArray(raw)) return { error: "manifest.json 里的 config 必须是数组" };
+  if (raw.length > CFG.maxItems) return { error: `config 里有 ${raw.length} 项，上限 ${CFG.maxItems} 项` };
+
+  const items = [];
+  const seen = new Set();
+
+  for (const [i, r] of raw.entries()) {
+    const at = `config[${i}]`;
+    if (!r || typeof r !== "object" || Array.isArray(r)) return { error: `${at} 必须是对象` };
+
+    const key = r.key;
+    if (typeof key !== "string" || !CFG.keyRe.test(key)) {
+      return { error: `${at} 的 key「${key ?? "（没写）"}」不合规：字母开头，只能有字母、数字和下划线，最长 32 字` };
+    }
+    if (seen.has(key)) return { error: `${at} 的 key「${key}」和前面的重复了` };
+    seen.add(key);
+
+    const type = r.type ?? "string";
+    if (!CFG_TYPES.has(type)) {
+      return { error: `${at}（${key}）的 type「${type}」不认识，只能是 ${[...CFG_TYPES].join(" / ")}` };
+    }
+
+    const item = {
+      key,
+      type,
+      title: typeof r.title === "string" && r.title.trim() ? r.title.trim().slice(0, CFG.maxTitle) : key,
+      desc: typeof r.desc === "string" ? r.desc.slice(0, CFG.maxDesc) : "",
+      required: Boolean(r.required),
+    };
+
+    if (type === "select") {
+      if (!Array.isArray(r.options) || r.options.length === 0) {
+        return { error: `${at}（${key}）是 select，但没给 options` };
+      }
+      if (r.options.length > CFG.maxOptions) {
+        return { error: `${at}（${key}）的 options 有 ${r.options.length} 个，上限 ${CFG.maxOptions} 个` };
+      }
+      const opts = [];
+      const seenVal = new Set();
+      for (const o of r.options) {
+        // 允许 "值" 或 { value, label } 两种写法 —— 只有值没有显示名的场合很常见
+        const value = typeof o === "string" ? o : o?.value;
+        if (typeof value !== "string" || !value || value.length > 64) {
+          return { error: `${at}（${key}）的 options 里有一项的 value 不合规` };
+        }
+        if (seenVal.has(value)) return { error: `${at}（${key}）的 options 里 value「${value}」重复了` };
+        seenVal.add(value);
+        const label = typeof o === "string" ? o : o?.label;
+        opts.push({ value, label: typeof label === "string" && label.trim() ? label.trim().slice(0, CFG.maxLabel) : value });
+      }
+      item.options = opts;
+      item.default = typeof r.default === "string" && seenVal.has(r.default) ? r.default : opts[0].value;
+    } else if (type === "number") {
+      const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+      item.min = num(r.min);
+      item.max = num(r.max);
+      if (item.min != null && item.max != null && item.min > item.max) {
+        return { error: `${at}（${key}）的 min 比 max 还大` };
+      }
+      const d = num(r.default);
+      item.default = d ?? item.min ?? 0;
+      if (item.max != null && item.default > item.max) item.default = item.max;
+    } else if (type === "boolean") {
+      item.default = Boolean(r.default);
+    } else {
+      // string / secret
+      const ml = typeof r.maxLength === "number" && Number.isFinite(r.maxLength) ? Math.floor(r.maxLength) : CFG.maxValue;
+      // 作者给的上限只能比全局的小 —— 不然一个插件就能声明「我这项能存 10MB」
+      item.maxLength = Math.max(1, Math.min(ml, CFG.maxValue));
+      // secret 不给默认值：一个「默认密钥」没有任何意义，而且会在界面上显示成已填
+      item.default = type === "secret" ? "" : typeof r.default === "string" ? r.default.slice(0, item.maxLength) : "";
+    }
+
+    items.push(item);
+  }
+
+  return { items };
+}
 
 /**
  * 读一个插件文件夹，返回它在界面上长什么样。
@@ -166,6 +289,10 @@ function readPlugin(id) {
     return { ...base, broken: "manifest.json 里没有 entry.client 也没有 entry.css，这个插件什么都不会做" };
   }
 
+  // 配置项的声明坏了，和 entry 指向的文件不存在一个待遇：这个插件 broken，别的照常
+  const schema = parseConfigSchema(manifest.config);
+  if (schema.error) return { ...base, broken: schema.error };
+
   return {
     id,
     name: typeof manifest.name === "string" && manifest.name.trim() ? manifest.name.trim().slice(0, 40) : id,
@@ -180,7 +307,113 @@ function readPlugin(id) {
     permissions: Array.isArray(manifest.permissions)
       ? manifest.permissions.filter((p) => typeof p === "string").slice(0, 20)
       : [],
+    configSchema: schema.items,
   };
+}
+
+/* ---------- 插件配置的值 ---------- */
+
+/**
+ * 一个插件的配置值落在哪。
+ *
+ * **不放 `storage/` 里面** —— `storage/` 是插件自己写的地方，而这份是
+ * 「用户填、插件只读」。混在一起插件就能改自己的配置了：把 required 的项清空、
+ * 或者偷偷改掉用户设的阈值。分开存，插件对它没有写权限。
+ */
+const configPathFor = (id) => path.join(PLUGINS_DIR, id, "config.json");
+
+/** 读某个插件存着的配置值（原始值，含 secret 的明文）。 */
+function readConfigValues(id) {
+  const raw = readJson(configPathFor(id), {});
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+
+/**
+ * 按 schema 把存着的值补齐成「插件实际会拿到的那份」：没填过的项给 default。
+ *
+ * @param {object[]} schema parseConfigSchema 的结果
+ * @param {object} stored readConfigValues 的结果
+ * @param {{mask?: boolean}} opts mask=true 时把 secret 抹成占位（要发给浏览器时用）
+ */
+function resolveConfig(schema, stored, { mask = false } = {}) {
+  const out = {};
+  for (const item of schema) {
+    const has = Object.prototype.hasOwnProperty.call(stored, item.key);
+    const v = has ? stored[item.key] : item.default;
+    if (item.type === "secret") {
+      // 抹成占位而不是省略：界面要能区分「填过」和「没填过」
+      out[item.key] = mask ? (typeof v === "string" && v ? SECRET_MASK : "") : v ?? "";
+    } else {
+      out[item.key] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * 校验浏览器发来的那份值，返回能落盘的。
+ *
+ * 这是这一块的安全核心 —— `values` 是前端发来的，而前端是可以被插件自己
+ * 用 fetch 调的（插件和控制台同源）。所以不能信 schema 之外的任何东西。
+ *
+ * @returns {{values: object} | {error: string}}
+ */
+function validateConfigValues(schema, incoming, stored) {
+  if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
+    return { error: "values 必须是对象" };
+  }
+  const out = {};
+
+  for (const item of schema) {
+    const { key, type } = item;
+    // 没提到的项保留原值 —— 前端只发改动的那几项也能正常工作
+    if (!Object.prototype.hasOwnProperty.call(incoming, key)) {
+      if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
+      continue;
+    }
+    const v = incoming[key];
+
+    if (type === "boolean") {
+      if (typeof v !== "boolean") return { error: `「${item.title}」要的是开关（true / false）` };
+      out[key] = v;
+    } else if (type === "number") {
+      if (typeof v !== "number" || !Number.isFinite(v)) return { error: `「${item.title}」要的是数字` };
+      if (item.min != null && v < item.min) return { error: `「${item.title}」不能小于 ${item.min}` };
+      if (item.max != null && v > item.max) return { error: `「${item.title}」不能大于 ${item.max}` };
+      out[key] = v;
+    } else if (type === "select") {
+      if (typeof v !== "string" || !item.options.some((o) => o.value === v)) {
+        return { error: `「${item.title}」的值不在可选项里` };
+      }
+      out[key] = v;
+    } else if (type === "secret") {
+      if (typeof v !== "string") return { error: `「${item.title}」要的是文本` };
+      // 原样发回来的占位 = 用户没动这一项，保留原值。
+      // 少了这一条，用户改个别的项就会把密钥冲成一串圆点
+      if (v === SECRET_MASK) {
+        if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
+      } else {
+        if (v.length > item.maxLength) return { error: `「${item.title}」太长了（上限 ${item.maxLength} 字）` };
+        out[key] = v;
+      }
+    } else {
+      if (typeof v !== "string") return { error: `「${item.title}」要的是文本` };
+      if (v.length > item.maxLength) return { error: `「${item.title}」太长了（上限 ${item.maxLength} 字）` };
+      out[key] = v;
+    }
+  }
+
+  // schema 里没有的 key 直接丢，不报错 —— 插件升级删掉了某一项的话，
+  // 浏览器里那份旧表单发上来不该让保存失败
+  return { values: out };
+}
+
+/**
+ * 插件实际拿到的配置（加载时传进 ctx.config）。给 /api/plugins/active 用。
+ */
+function configFor(id, schema) {
+  if (!schema?.length) return undefined;
+  return resolveConfig(schema, readConfigValues(id));
 }
 
 /** 列出装了的插件，带上开关状态。坏掉的也在里面（`broken`）。 */
@@ -643,8 +876,45 @@ export function mountPlugins(app) {
         name: p.name,
         version: p.version,
         entry: p.entry,
+        // 只说「这个插件有没有配置」，**值不在这里**。要值的话前端按 id 逐个去
+        // 拉 /api/plugins/:id/config/runtime —— 理由见那条路由的注释
+        hasConfig: (p.configSchema?.length ?? 0) > 0,
       })),
     );
+  });
+
+  /**
+   * 某个插件运行时拿到的配置（ctx.config），**含 secret 的明文**。
+   *
+   * 明文到浏览器这件事躲不掉：插件跑在浏览器里，它要拿这个 key 去调自己那家
+   * API。所以问题不是「要不要给」，而是「一次给多少」。
+   *
+   * 本来是跟在 /api/plugins/active 的列表里一起发的，那样一次请求就把**所有**
+   * 插件的密钥打包送到页面上 —— 列表被日志打一下、被截个图，全泄。改成按 id
+   * 单独拉之后，加载谁才取谁那份。
+   *
+   * ⚠️ **这不是插件之间的隔离。** 插件和控制台同源，插件 B 完全可以自己
+   * fetch 这条路由去拿插件 A 的密钥，后端分不出调用方是谁（请求都带着用户
+   * 同一个会话 cookie）。真要隔离得把插件塞进 iframe 或 Worker，那样它就改
+   * 不了控制台界面了 —— 而那是插件的主要用途。所以这里只是把暴露面从「一个
+   * 集合」缩小到「一次一个」，没有变成一道墙。别把它当成墙。
+   *
+   * 这也是为什么设置界面在 secret 项旁边写着「只装你信得过的作者」，以及
+   * 插件分区最上面那段警告不折叠。
+   */
+  app.get("/api/plugins/:id/config/runtime", (req, res) => {
+    const { id } = req.params;
+    if (!ID_RE.test(id)) return res.status(400).end();
+
+    // 只给**正在生效**的插件（总开关开着、它自己开着、没坏）—— 关掉的插件
+    // 不该还能被谁顺手把配置读出来
+    const active = activePlugins().find((p) => p.id === id);
+    if (!active) return res.status(404).end();
+
+    const cfg = configFor(id, active.configSchema);
+    if (!cfg) return res.status(404).end();
+    res.set("cache-control", "no-store");
+    res.json(cfg);
   });
 
   /** 总开关。 */
@@ -682,6 +952,46 @@ export function mountPlugins(app) {
    * 装一个插件：见 mountPluginInstall —— 那条必须挂在 express.json() 之前，
    * 所以不在这里。
    */
+
+  /**
+   * 某个插件的配置：schema（作者声明的）+ 当前值。
+   *
+   * secret 类型的值抹成占位再发 —— 浏览器里不该出现插件密钥的明文，
+   * 控制台的网络面板、截图、录屏都会把它带出去。
+   */
+  app.get("/api/plugins/:id/config", (req, res) => {
+    const { id } = req.params;
+    if (!ID_RE.test(id)) return res.status(400).json({ error: "插件 id 不合规" });
+
+    const p = listPlugins().plugins.find((x) => x.id === id);
+    if (!p) return res.status(404).json({ error: "没装这个插件" });
+    if (p.broken) return res.status(400).json({ error: `这个插件有问题：${p.broken}` });
+
+    const schema = p.configSchema ?? [];
+    res.json({ schema, values: resolveConfig(schema, readConfigValues(id), { mask: true }) });
+  });
+
+  /** 保存配置。校验见 validateConfigValues —— body 是浏览器发来的，一个字段都不能信。 */
+  app.put("/api/plugins/:id/config", (req, res) => {
+    const { id } = req.params;
+    if (!ID_RE.test(id)) return res.status(400).json({ error: "插件 id 不合规" });
+
+    const p = listPlugins().plugins.find((x) => x.id === id);
+    if (!p) return res.status(404).json({ error: "没装这个插件" });
+    if (p.broken) return res.status(400).json({ error: `这个插件有问题：${p.broken}` });
+
+    const schema = p.configSchema ?? [];
+    if (schema.length === 0) return res.status(400).json({ error: "这个插件没有可配置的项" });
+
+    const stored = readConfigValues(id);
+    const out = validateConfigValues(schema, req.body?.values, stored);
+    if (out.error) return res.status(400).json({ error: out.error });
+
+    writeJson(configPathFor(id), out.values);
+    logInfo("插件", `${p.name}（${id}）的配置已保存`);
+    // 回的是抹过的那份，前端直接拿去更新界面
+    res.json({ schema, values: resolveConfig(schema, out.values, { mask: true }) });
+  });
 
   /** 卸载。 */
   app.delete("/api/plugins/:id", (req, res) => {
