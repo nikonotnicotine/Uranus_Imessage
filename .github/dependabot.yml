@@ -1,0 +1,47 @@
+# Dependabot：让 GitHub 官方的 bot 帮忙盯依赖更新。
+#
+# 为什么要这个文件：Settings 里开的「Dependabot security updates」只在**有 CVE**
+# 的时候动，日常的版本更新它不管。这个文件管日常那部分。
+#
+# 为什么限制得这么死（见下面每一条）：这是个一个人维护的项目，PR 太多等于没人看，
+# 而「没人看的 PR」比「没有 PR」更糟 —— 它会让人习惯性点合并。
+
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      # 每周一次就够。每天一次的话，一个月攒四十个 PR，最后谁都不看
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+
+    # 同时最多开 3 个 PR。攒成一堆的时候 Dependabot 会自己排队，
+    # 合掉一个它补一个，不会把列表淹掉
+    open-pull-requests-limit: 3
+
+    # npm workspaces：根、server、client 的依赖都在根 lockfile 里，
+    # 所以只配一个 "/" 就够，不用给每个 workspace 各写一段
+    versioning-strategy: auto
+
+    groups:
+      # 补丁和小版本合并成一个 PR —— 这类升级基本不会破坏东西，
+      # 十几个分开提纯属噪音
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+    ignore:
+      # 大版本单独手动来。major 升级多半带破坏性改动，需要读 changelog、
+      # 跑一遍、可能还要改代码 —— 那不是「看一眼就能合」的 PR，
+      # 让它自动提只会堆在那儿
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+    commit-message:
+      prefix: "依赖"
+      include: "scope"
+
+    labels:
+      - "依赖更新"
