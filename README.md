@@ -9,7 +9,7 @@
 
 [仓库](https://github.com/nikonotnicotine/Uranus_Imessage) ·
 [图文教程](https://docs.qq.com/doc/DVnFncG9Tc05kdFZY) ·
-[实现细节](docs/实现细节.md) ·
+[源码导读](#想再深入一点) ·
 [更新日志](CHANGELOG.md) ·
 QQ 群 `1125033956`
 
@@ -96,7 +96,7 @@ npm run build
 npm start
 ```
 
-打开 `http://localhost:8787`。想常驻用 systemd，示例见 [实现细节 · 运行](docs/实现细节.md#运行)。
+打开 `http://localhost:8787`。想常驻用 systemd，参考 `scripts/` 下的启动脚本。
 
 ### 安卓手机
 
@@ -104,7 +104,7 @@ npm start
 之后步骤和 Linux 差不多，但有两个依赖要先删掉（`ffmpeg-static` 和
 `@spectrum-ts/imessage-local` 在安卓上装不上），还要关掉安卓那几层后台杀进程的机制。
 
-完整步骤见 [安卓部署教程](docs/安卓部署教程.md)。
+完整步骤见[图文教程](https://docs.qq.com/doc/DVnFncG9Tc05kdFZY)。
 
 > 聊天用的苹果设备和这台安卓**没有任何直接连接** —— 安卓只是跑服务的那台机器。
 
@@ -166,7 +166,6 @@ Uranus_Imessage/
 ├── scripts/         启动器、图标生成、各模块的离线自检
 ├── assets/          内置壁纸和内置预设（新用户的开箱默认值）
 ├── data/            ← 你的全部数据，不进仓库
-├── docs/实现细节.md  每个模块为什么这么写（很长，遇到具体问题再翻）
 ├── 启动.bat          日常用这个
 └── 更新.bat          升到新版本用这个（自动备份，撞上你的改动会停下来）
 ```
@@ -204,9 +203,10 @@ iMessage 走 Photon / Spectrum。
 
 ## 想再深入一点
 
-[docs/实现细节.md](docs/实现细节.md) 是原来那份长文档：提示词怎么拼、记忆库怎么打分、
-主动消息怎么算时间、线下模式的存档结构、每个决定当时为什么那么定。
-一千八百行，不适合从头读 —— 遇到具体问题时搜关键词。
+**代码里的注释就是文档。** 每个模块的文件头都写着它为什么这么设计、踩过什么坑、
+哪些地方动了会出事 —— 提示词怎么拼看 `server/src/prompt.js`，记忆库怎么打分看
+`memorystore.js`，主动消息怎么算时间看 `proactive.js`，线下模式的存档结构看
+`offline.js`，备份为什么不带密钥看 `backup.js`。遇到具体问题时直接搜关键词。
 
 各模块都有不联网、不碰 `data/` 的离线自检：
 
