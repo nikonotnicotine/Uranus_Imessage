@@ -8,12 +8,14 @@
 
 import { AuthGate } from "./panels/auth.jsx";
 import { AppShell } from "./shell.jsx";
-import { ConfigProvider, LogProvider } from "./store.jsx";
+import { BuildWatcher, ConfigProvider, LogProvider } from "./store.jsx";
 
 export default function App() {
   return (
     <AuthGate>
       <ConfigProvider>
+        {/* 后端换了新产物就自己刷新（见 store.jsx:BuildWatcher） */}
+        <BuildWatcher />
         <LogProvider>
           <AppShell />
         </LogProvider>

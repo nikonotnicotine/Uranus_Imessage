@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import cors from "cors";
@@ -286,6 +287,12 @@ void patchHttp2Window();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_DIST = path.resolve(__dirname, "../../client/dist");
+
+/**
+ * 这个进程的身份，给 /api/version 用（见那条路由的注释）。
+ * 每起一次就换一个 —— 前端靠它认出「后端换人了」。
+ */
+const BOOT_ID = crypto.randomBytes(8).toString("hex");
 
 const app = express();
 app.use(cors());
@@ -1200,6 +1207,34 @@ app.get("/api/status", (_req, res) => {
   // canRestart 不是桥接的事（它说的是这个**进程**能不能重启自己），
   // 所以不塞进 getStatus()，在这儿拼上去。前端靠它决定重启按钮点不点得动
   res.json({ ...getStatus(), canRestart: canRestart() });
+});
+
+/**
+ * 「现在跑的是哪一份」。前端拿它判断自己手里这份页面过没过期。
+ *
+ * 为什么需要：控制台是个单页应用，浏览器里那份代码是打开页面那一刻下载的。
+ * 在 VPS 上 git pull + 重启，进程是新的、client/dist 也是新的，但**已经开着
+ * 的那个标签页不会自己知道** —— 用户看到的还是旧界面，得手动刷新一次。
+ *
+ *  - `build`：client/dist/index.html 的内容哈希。Vite 产物的文件名带哈希，
+ *    前端只要重新构建过，这个值就变。**变了就说明页面旧了，该刷新。**
+ *  - `boot`：进程身份。只有它变 = 后端重启了但前端没变（定时重启、清状态），
+ *    这种不该打扰用户，前端不会刷新。
+ *
+ * 读不到 index.html（开发时没构建产物）就回空 build，前端据此什么都不做。
+ */
+app.get("/api/version", (_req, res) => {
+  let build = "";
+  try {
+    build = crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(CONSOLE_HTML))
+      .digest("hex")
+      .slice(0, 16);
+  } catch {
+    /* 没有产物就不报 build，前端会跳过这次比对 */
+  }
+  res.json({ boot: BOOT_ID, build });
 });
 
 // 手动重启桥接（不需要先改配置）。带 projectId 就只重启那一条，否则全部

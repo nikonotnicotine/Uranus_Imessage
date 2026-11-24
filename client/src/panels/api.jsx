@@ -1183,6 +1183,56 @@ export function ProviderSettings({ provider }) {
 }
 
 /**
+ * 删掉这个服务商源。
+ *
+ * 单独一张卡放在模型列表后面 —— 破坏性操作不和侧栏的「+」挨着，也不和
+ * ID / 密钥那些天天要改的字段混在一个卡里。
+ *
+ * 删完退到剩下的第一个源（没有就回空状态）。指向它的角色引用不动，
+ * 界面会自己标红（见 store.jsx:removeProvider）。
+ * 和其他面板一样，这一步只改草稿，点「保存」之前随时能撤。
+ */
+export function ProviderDangerCard({ provider }) {
+  const { config, removeProvider } = useConfig();
+  const { pick } = useSection();
+  const providers = config.providers ?? [];
+
+  const users = (config.roles ?? []).filter((r) =>
+    [r.chatModel, r.fallbackModel, r.visionModel, r.audioModel, r.videoModel].some(
+      (ref) => ref?.provider === provider.id
+    )
+  );
+
+  function drop() {
+    const rest = providers.filter((p) => p.id !== provider.id);
+    removeProvider(provider.id);
+    pick(rest[0]?.id ?? "");
+  }
+
+  return (
+    <Card
+      title="删除这个服务商源"
+      desc="地址、密钥和它底下的模型一起没了；还没点「保存」之前都能撤"
+    >
+      <div className="grid grid-cols-1 gap-3">
+        {users.length > 0 && (
+          <p className="border-l-2 border-warn py-1.5 pl-3 text-meta leading-relaxed text-ink-soft">
+            {users.map((r) => roleLabel(r)).join("、")} 正在用这个源。删掉之后它们会提示
+            「引用的服务商已删除」，得重新挑一次模型 —— 配置不会被偷偷改。
+          </p>
+        )}
+        <SaveBar hint="只影响这个源" />
+        <div className="flex justify-end">
+          <Button variant="ghost" onClick={drop} className="text-warn hover:bg-warn/[0.08]">
+            <Trash2 size={14} /> 删除服务商源
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+/**
  * 「语音合成（TTS）」那张卡。
  *
  * 放在「连接」面板而不是角色面板，理由是四家 × 各自好几个字段实在太长 ——
@@ -2001,6 +2051,7 @@ export function ProviderPanel() {
         defaultAudio={defaultAudio}
         defaultVideo={defaultVideo}
       />
+      <ProviderDangerCard provider={provider} />
       <TtsSection />
       <SttSection />
       <StreamSection />

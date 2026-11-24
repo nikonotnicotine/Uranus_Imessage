@@ -2368,6 +2368,77 @@ export function useConfig() {
   return ctx;
 }
 
+/* ================= 前端产物过期自动刷新 ================= */
+
+/** 多久问一次后端「现在跑的是哪一份」。本机一条 GET，便宜。 */
+const BUILD_POLL_MS = 20000;
+
+/**
+ * 后端换了新的前端产物就自己刷新页面。
+ *
+ * 要解决的事：控制台是单页应用，浏览器手里那份 JS 是**打开页面那一刻**下载
+ * 的。在 VPS 上 git pull、重启服务之后，进程和 client/dist 都是新的，可那个
+ * 一直开着的标签页毫不知情 —— 用户看到的还是旧界面，只能自己按刷新。
+ *
+ * 判据是 /api/version 里的 `build`（index.html 的内容哈希，见 server 那条
+ * 路由）。**只认 build，不认 boot** —— 后端重启但代码没变（定时重启、清状态）
+ * 不该把人家的页面刷掉。
+ *
+ * 有未保存改动的时候不刷：草稿比「界面新不新」重要，等用户点了保存，
+ * 下一轮轮询再刷。挂在 ConfigProvider 里面就是为了能看到 `dirty`。
+ */
+export function BuildWatcher() {
+  const { dirty } = useConfig();
+  const seenRef = useRef("");
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+
+  useEffect(() => {
+    let stopped = false;
+
+    async function check() {
+      if (stopped) return;
+      let build = "";
+      try {
+        /*
+         * 故意**不走 `api()`**：那个封装撞上 401 会把整个界面切回登录页。
+         * 这是一条用户没按过任何按钮的后台轮询，让它有权把人踢去登录，
+         * 等于挂机久了草稿会被一次轮询刷没。会话过没过期，留给用户下一次
+         * 真的操作去发现。
+         */
+        const res = await fetch("/api/version", { headers: { Accept: "application/json" } });
+        if (!res.ok) return;
+        ({ build } = await res.json());
+      } catch {
+        return; // 后端正在重启，下一轮再问
+      }
+      // 后端没有这条路由（旧版本）或者没构建产物：什么都不做
+      if (!build) return;
+      if (!seenRef.current) {
+        seenRef.current = build;
+        return;
+      }
+      if (build !== seenRef.current && !dirtyRef.current) window.location.reload();
+    }
+
+    const timer = setInterval(check, BUILD_POLL_MS);
+    // 切回这个标签页的时候也问一次：挂机一夜回来，不用等那 20 秒
+    const onVisible = () => {
+      if (document.visibilityState === "visible") check();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    check();
+
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+
+  return null;
+}
+
 /* ================= 运行日志 ================= */
 
 const LOG_MAX = 1000; // 前端只留最近这么多条，再多就吃内存
