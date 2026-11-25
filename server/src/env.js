@@ -1084,6 +1084,48 @@ export async function userTzOf(role) {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
 
+/**
+ * 已经查过的城市 → geo，**同步**拿（查不到就 null，绝不联网）。
+ *
+ * `geocode` 是 async 的（可能要打地理编码接口），而记忆库那条路（`recordTurn`）
+ * 是同步的、每一轮都走。这里只认「内置城市表」和「这一进程已经查过的缓存」。
+ */
+function cachedGeo(city) {
+  const key = String(city ?? "").trim().toLowerCase();
+  if (!key) return null;
+  if (geoCache.has(key)) return geoCache.get(key);
+  return BUILTIN_GEO.get(key) ?? null;
+}
+
+/**
+ * {{char}} 那边的时区：**记忆库三份待总结的行首时间按它算**（用户要的：
+ * 「待总结都根据当前角色的时间来定，不用系统时间」）。
+ *
+ * 取哪个城市和时间前缀一个口径：异地模式看 charCity（角色所在地），同城模式
+ * 两边共用那一个输入框（userCity）。注意这跟定时提醒**不一样** —— 提醒按
+ * {{user}} 那边响（`userTzOf`），因为那是要吵醒用户的；待总结是角色的记忆，
+ * 按角色自己的当地时间记。
+ *
+ * 看 `time.enabled`：时间感知关着的角色压根没有「角色时间」这回事，
+ * 那就还是服务器的系统时间（也就是改这个功能之前的行为）。
+ *
+ * 同步函数，所以城市只能从缓存/内置表里拿（见 `cachedGeo`）。时间感知开着时
+ * 每一轮 `buildEnv` 都会解析这两个城市，缓存一直是热的；冷缓存下的非内置城市
+ * 退回系统时区，最多头一两轮的行首时间按系统时区记。
+ *
+ * @param {object} role 角色（读 role.env.time）
+ * @returns {string} IANA 时区名，拿不到就是服务器时区
+ */
+export function charTzSync(role) {
+  const t = role?.env?.time;
+  if (t?.enabled) {
+    const city = t.mode === "same" ? t.userCity : t.charCity;
+    const geo = cachedGeo(city);
+    if (validTz(geo?.tz)) return geo.tz;
+  }
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
 /** 一边的时间段：`{{user}}发送当地时间 CST : … | 周二, 工作日` */
 function timeSegment(label, who, geo, at, workday, dayMark) {
   const tz = geo?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone;

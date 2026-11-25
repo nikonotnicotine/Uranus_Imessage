@@ -1885,6 +1885,90 @@ export function stripToneTags(text) {
 }
 
 /**
+ * SSML 停顿标记 `<break time="1.5s"/>`，ElevenLabs 的写法（预设里的 `ssml_break`）。
+ *
+ * 只认带 `time` 的那种，秒数允许有小数。写坏的（没有 time、单位不是 s）不认，
+ * 当普通文字交给下面的 `stripBreakTags` 收掉 —— 原样喂进去会被念出来。
+ */
+const BREAK_TAG = /<\s*break\s+time\s*=\s*["']?\s*(\d+(?:\.\d+)?)\s*s\s*["']?\s*\/?\s*>/gi;
+
+/** 任何形状的 break 标记（含写坏的），用于整类收走。 */
+const ANY_BREAK_TAG = /<\s*\/?\s*break\b[^>]*>/gi;
+
+/** 同一个判据，不带 `g` —— 带 `g` 的正则 `.test` 会记住 lastIndex，隔次返回假。 */
+const HAS_BREAK_TAG = /<\s*\/?\s*break\b[^>]*>/i;
+
+/**
+ * 这一家 TTS 认不认 SSML 的 `<break>`。
+ *
+ * **只有 ElevenLabs 的 v2 系认**，而且恰好和 `keepTags` 相反：
+ *  - v2 系（multilingual_v2 / turbo_v2_5 / flash_v2_5）：认 `<break>`，不认方括号标签；
+ *  - v3 / v4：认方括号音效标签，**官方明说不支持 SSML break**。
+ * Fish Audio、MiniMax、GPT-SoVITS 三家都不认，原样喂进去会真的念出一句
+ * 「break time one point five s」，比没有停顿糟得多。
+ */
+function breakOk(source) {
+  return source?.name === "ElevenLabs" && !source.keepTags;
+}
+
+/**
+ * 这一家念不了 `<break>` 时，认不认 `[pause]` 这种方括号替身。
+ * 跟 `keepTags` 同一个判据（ElevenLabs v3/v4、Fish 的 S2 系）。
+ */
+function pauseTagOk(source) {
+  return Boolean(source?.keepTags);
+}
+
+/**
+ * 把 break 标记规范化：秒数夹到 0.3–3.0（官方上限 3 秒，再长会让模型不稳定），
+ * 顺手把写坏的那些整类收走。
+ *
+ * 一条里塞太多 break 官方说会出杂音，这里不替用户做数量限制 —— 那是预设的事，
+ * 我们只保证喂过去的每一个都是合法值。
+ */
+function normalizeBreakTags(text) {
+  /*
+   * **一趟扫完**：合法的重写、写坏的删掉。
+   * 分两趟（先重写再删剩下的）会把刚重写出来的那批自己删光 —— 它们也长得像
+   * `<break …>`，第二趟的正则分不出哪些是刚写的。
+   */
+  return String(text ?? "").replace(ANY_BREAK_TAG, (m) => {
+    BREAK_TAG.lastIndex = 0;
+    const hit = BREAK_TAG.exec(m);
+    if (!hit) return "";
+    const v = Math.min(3, Math.max(0.3, Number(hit[1]) || 0.3));
+    // 去掉 1.0 这种没意义的尾零，和官方示例的写法一致
+    return `<break time="${String(Number(v.toFixed(1)))}s" />`;
+  });
+}
+
+/**
+ * `<break time="1.5s"/>` → `[pause]`，给认方括号标签、却不支持 SSML 的 v3 / v4 用。
+ *
+ * 秒数带不过去（音效标签没有时长这一说），但「这里要静一下」这件事保住了。
+ * 前后多出来的空格压掉 —— 标签两侧本来各有一个。
+ */
+export function breakToPause(text) {
+  return String(text ?? "")
+    .replace(/[ \t]*(?:<\s*\/?\s*break\b[^>]*>[ \t]*)+/gi, " [pause] ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+/**
+ * 两样都不认时整类收走。
+ *
+ * **不换成省略号或破折号**：官方说那两种「不太稳定」，而且会改掉这句话的语气
+ * （省略号念出来是犹豫），不是预设要的那种干净的沉默。宁可少一个停顿。
+ */
+export function stripBreakTags(text) {
+  return String(text ?? "")
+    .replace(ANY_BREAK_TAG, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+/**
  * 合成一条语音。
  *
  * @param {object} api config.ttsApi
@@ -1937,6 +2021,34 @@ export async function synthesizeVoice(
   if (!source.keepTags) {
     const plain = stripToneTags(clean);
     if (plain) clean = plain;
+  }
+
+  /*
+   * SSML 的 `<break time="1.5s"/>`（预设里的 `ssml_break`）同理，只是支持的
+   * 范围**和方括号标签正好相反**：ElevenLabs 的 v2 系认它、v3/v4 官方明说不支持，
+   * 另外三家都不认（见 `breakOk`）。认的那边把秒数夹到合法区间，不认的整类收走。
+   *
+   * 剥完一件不剩（整条就是一个 break）时留着原样，理由和上面那段一样。
+   */
+  if (breakOk(source)) {
+    clean = normalizeBreakTags(clean);
+  } else if (HAS_BREAK_TAG.test(clean)) {
+    /*
+     * 念不了 `<break>`、但认方括号标签的（ElevenLabs v3/v4、Fish 的 S2 系）
+     * 换成 `[pause]` —— 秒数带不过去，但「这里要静一下」保住了。预设自己也是
+     * 这么配对的（「严禁在同一位置同时叠加 `<break>` 和 `[pause]`」），
+     * 所以这个替换说的就是预设作者的话。
+     * 两样都不认的（Fish s1、MiniMax、GPT-SoVITS）只能整类收走。
+     */
+    const before = clean;
+    clean = pauseTagOk(source) ? breakToPause(clean) : stripBreakTags(clean);
+    if (!clean.trim()) clean = before; // 整条就是一个 break：留原样给合成那边对付
+    logInfo(
+      scope,
+      pauseTagOk(source)
+        ? `这句里的 <break> 换成了 [pause]：这个模型不支持 SSML break，但认方括号标签（${source.name}）`
+        : `这句里的 <break> 停顿标记已去掉：${source.name} 念不了它，留着会被当正文念出来`
+    );
   }
 
   /*

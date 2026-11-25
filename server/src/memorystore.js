@@ -292,7 +292,11 @@ export function localDate(d = new Date()) {
  * 星期用**中文**：用户的示例是「星期二」，不是 `Tuesday`。这一行是要喂给模型
  * 读的，通篇中文里夹一个英文星期也没道理。
  *
- * 行首那个时间是**系统时间**，所以正文里再剥一次环境前缀 —— 不剥的话同一个
+ * 行首那个时间按 **{{char}} 那边的当地时区**算（`tz`，由 env.js 的 `charTzSync`
+ * 给；角色没开时间感知就还是服务器系统时间）—— 用户要的是「待总结都根据当前
+ * 角色的时间来定」。注意只换了时区，格式一个字没动。
+ *
+ * 正文里再剥一次环境前缀 —— 不剥的话同一个
  * 时刻会用两种格式写两遍（`22:12:07 | [小明] [{{user}}发送当地时间 CST : … ]我刚睡醒`），
  * 而且流水按规范是**不带天气**的，前缀里却可能夹着天气段。
  *
@@ -302,11 +306,48 @@ export function localDate(d = new Date()) {
  * 因为流水是一条一行的。
  */
 const WEEKDAYS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
-export function diaryLogLine(who, text, now = new Date()) {
+const EN_DOW = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+/**
+ * `2026-09-08 星期二 09:45:18`，按给定时区算；不给时区（或者这个时区名无效）
+ * 就按服务器的系统时区 —— 和改成角色时间之前的行为一字不差。
+ */
+function stampAt(now, tz) {
   const p = (n) => String(n).padStart(2, "0");
-  const time =
+  if (tz) {
+    try {
+      const parts = {};
+      const fmt = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+        weekday: "short",
+      });
+      for (const { type, value } of fmt.formatToParts(now)) parts[type] = value;
+      const dow = EN_DOW[parts.weekday];
+      if (parts.year && dow !== undefined) {
+        return (
+          `${parts.year}-${parts.month}-${parts.day} ${WEEKDAYS[dow]} ` +
+          `${parts.hour}:${parts.minute}:${parts.second}`
+        );
+      }
+    } catch {
+      /* 时区名不认识：落到系统时区，流水照记不少一行 */
+    }
+  }
+  return (
     `${localDate(now)} ${WEEKDAYS[now.getDay()]} ` +
-    `${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`;
+    `${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`
+  );
+}
+
+export function diaryLogLine(who, text, now = new Date(), tz = "") {
+  const time = stampAt(now, tz);
   return `${time} | [${who}] ${stripEnvPrefix(text).replace(/\r?\n/g, " ").trim()}`;
 }
 
@@ -577,6 +618,8 @@ export function readPending(kind, key) {
 /**
  * 追加一轮：对方一行、角色一行，格式和日记流水一致。
  *
+ * `turn.tz` 是行首时间按哪个时区算（角色那边；不给就系统时区）。
+ *
  * 返回追加之后的状态，调用方拿 `rounds` 判够不够触发。
  * 两边都空的一轮不记 —— 那样只会让轮数虚高。
  */
@@ -591,8 +634,10 @@ export function appendPending(kind, key, turn) {
   if (!file) return readPending(kind, key);
 
   // 发送人用真名，和日记流水一致（模型要能看出谁是谁）
-  if (user) appendLine(file, diaryLogLine(turn?.userName || "对方", user, now));
-  if (assistant) appendLine(file, diaryLogLine(turn?.charName || "角色", assistant, now));
+  // tz 是角色那边的时区（调用方给，见 memoryhooks.recordTurn），不给就按系统时区
+  const tz = String(turn?.tz ?? "");
+  if (user) appendLine(file, diaryLogLine(turn?.userName || "对方", user, now, tz));
+  if (assistant) appendLine(file, diaryLogLine(turn?.charName || "角色", assistant, now, tz));
 
   const state = readPendingState(kind, key);
   state.rounds = (Number(state.rounds) || 0) + 1;

@@ -601,6 +601,30 @@ function Avatar({ file, name }) {
 const VOICE_SEGMENT = /「([^「」]+)」/g;
 
 /**
+ * 台词里的 `<break time="0.8s"/>`：**念的时候要，看的时候不要**。
+ *
+ * 那是 SSML 的停顿标记（ElevenLabs 认），模型写在台词中间。原样显示出来就是
+ * 一句话里插了段代码，所以界面上抹掉；发给 TTS 的仍然是**没抹过的原文**，
+ * 那个停顿照常生效。两边用的是同一个 `text`，只在画的时候过一道。
+ */
+const BREAK_TAG = /<\/?break\b[^>]*>/gi;
+
+/**
+ * 去掉语音停顿标记。没有标记的就**原样返回**（不动空格、不动缩进）——
+ * 正文是 `pre-wrap` 画的，顺手「整理」空白会把模型排的版改掉。
+ */
+function forDisplay(text) {
+  const src = String(text ?? "");
+  if (!BREAK_TAG.test(src)) {
+    BREAK_TAG.lastIndex = 0;
+    return src;
+  }
+  BREAK_TAG.lastIndex = 0;
+  // 标记两侧本来各有一个空格，抹掉之后别留下两个
+  return src.replace(/[ \t]*(?:<\/?break\b[^>]*>[ \t]*)+/gi, " ");
+}
+
+/**
  * 把一段正文切成「念的」和「不念的」两种片段。
  *
  * @returns {{spoken: boolean, text: string}[]} 按出现顺序排好，空片段已经滤掉
@@ -731,7 +755,8 @@ function VoiceLine({ roleKey, text, auto, onError }) {
 
   return (
     <span className="inline-flex max-w-full items-baseline gap-1 align-baseline">
-      <span className="border-b border-line text-ink">{text}</span>
+      {/* 画的是抹掉停顿标记的那一份，念的仍然是原文（见 forDisplay） */}
+      <span className="border-b border-line text-ink">{forDisplay(text)}</span>
       <button
         type="button"
         onClick={play}
@@ -774,7 +799,7 @@ function VoiceText({ roleKey, turnId, text, auto, onError }) {
             onError={onError}
           />
         ) : (
-          <span key={`${turnId}-${i}`}>{p.text}</span>
+          <span key={`${turnId}-${i}`}>{forDisplay(p.text)}</span>
         )
       )}
     </>

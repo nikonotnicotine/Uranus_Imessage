@@ -31,7 +31,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { applyVars, resolveEndpoint, resolveRoleEndpoints, resolveUser } from "./config.js";
 import { DATA_DIR, readJson, writeJson } from "./datadir.js";
-import { stripEnvPrefix } from "./env.js";
+import { charTzSync, stripEnvPrefix } from "./env.js";
 import { chatCompletion } from "./llm.js";
 import { logError, logInfo, logWarn } from "./logs.js";
 import {
@@ -710,7 +710,11 @@ export async function runGenerate(config, role, appIds, opts = {}) {
       // 字数跟着「每轮最多带」走，和同步到私聊一个口径（见 injectWidth）
       const w = injectWidth(role);
       const text = summarize(config, batch, w.chars, w.detail).replace(/\n/g, "；");
-      appendDiaryLine(memoryKeyFor(role), diaryLogLine(`${role.name}的手机`, text));
+      // 行首时间和别的待总结一个口径：角色那边的当地时区（见 env.js:charTzSync）
+      appendDiaryLine(
+        memoryKeyFor(role),
+        diaryLogLine(`${role.name}的手机`, text, new Date(), charTzSync(role))
+      );
     } catch (e) {
       logWarn(SCOPE, "没记进日记待总结（不影响查手机本身）", e);
     }

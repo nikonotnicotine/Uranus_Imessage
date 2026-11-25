@@ -46,6 +46,27 @@ export const HTML_TAG =
  */
 const STRAY = /<(snow|Drama)\b[^>]*>[\s\S]*?<\/\1\s*>|\[\[[^\]\n]+\]\][\s\S]*?\[\[\/\]\]/gi;
 
+/**
+ * 语音合成用的**伪标签**：`<break time="0.8s"/>`（SSML 的停顿，ElevenLabs 认）。
+ *
+ * 它长得像 HTML，其实不是 —— 而 HTML 的解析器里只有那张固定的空元素表能自闭合，
+ * `<break …/>` 这种**不认识的标签**末尾那个 `/` 会被直接忽略，于是它当场
+ * 开了一个没人关的元素，**把它后面的所有同级节点全吃进去当自己的孩子**。
+ * 结果就是 `splitNodes` 只看到一个顶层元素，整段散文被当成「HTML 块」塞进
+ * iframe（那里面 `white-space` 是 normal），段落之间的空行全没了，台词和旁白
+ * 粘成一大坨 —— 用户报的就是这个。
+ *
+ * 所以解析之前先把这种标签的尖括号转义掉：它就成了普通文字，不再吃掉后面的
+ * 内容，正文照旧按段落走 React 那条路。转义只影响解析，`nodeValue` 读回来
+ * 还是原来那串字 —— 台词一个字不少，念的时候那个停顿也还在。
+ */
+const VOICE_TAG = /<\/?break\b[^>]*>/gi;
+
+/** 把语音伪标签变成普通文字（只在 DOM 解析前用，见 `VOICE_TAG`）。 */
+function escapeVoiceTags(chunk) {
+  return String(chunk ?? "").replace(VOICE_TAG, (m) => m.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+}
+
 /** 纯控制标记整段收走。其余一个字不动。 */
 export function dropStray(text) {
   return String(text ?? "").replace(STRAY, "");
@@ -101,7 +122,8 @@ export function splitDocs(text) {
  */
 function splitNodes(chunk, out) {
   const tpl = document.createElement("template");
-  tpl.innerHTML = chunk;
+  // 语音伪标签先转义，否则 `<break …/>` 会把它后面的正文全吃进去（见 VOICE_TAG）
+  tpl.innerHTML = escapeVoiceTags(chunk);
   if (!tpl.content.childNodes.length) {
     // 解析不出东西（比如孤立的 <td>，那在任何上下文里都会被剥掉）→ 原样交出去
     out.push({ kind: "html", text: chunk });

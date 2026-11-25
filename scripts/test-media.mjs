@@ -1236,6 +1236,97 @@ console.log("\n[TTS：语气标签剥不剥]");
   }
 }
 
+console.log("\n[TTS：SSML 的 <break> 停顿]");
+{
+  const realFetch = globalThis.fetch;
+  try {
+    const bodies = [];
+    globalThis.fetch = async (url, init) => {
+      bodies.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) });
+      if (String(url).includes("elevenlabs")) return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      if (String(url).includes("fish")) return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      return new Response(
+        JSON.stringify({ data: { audio: "494433" }, base_resp: { status_code: 0 } }),
+        { status: 200 }
+      );
+    };
+    const LINE = 'So sweet... <break time="1.0s"/> good girl';
+
+    // v2 系是**唯一**支持 SSML break 的：原样带过去，秒数规范化掉尾零
+    await synthesizeVoice(
+      { elevenlabs: { enabled: true, key: "k", model: "eleven_multilingual_v2" } },
+      "v",
+      LINE,
+      "测试"
+    );
+    assert.equal(bodies[0].body.text, 'So sweet... <break time="1s" /> good girl');
+    ok("ElevenLabs v2：<break> 带过去，秒数规范化");
+
+    // 超范围的夹到 0.3–3.0（官方上限 3 秒），写坏的那种整个收掉
+    await synthesizeVoice(
+      { elevenlabs: { enabled: true, key: "k", model: "eleven_turbo_v2_5" } },
+      "v",
+      'A <break time="9s"/> B <break time="0.05s"/> C <break/> D',
+      "测试"
+    );
+    assert.equal(
+      bodies[1].body.text,
+      'A <break time="3s" /> B <break time="0.3s" /> C  D'
+    );
+    ok("ElevenLabs v2：秒数夹到 0.3–3.0，没写 time 的收掉");
+
+    // v3 不支持 SSML break，但认方括号标签 → 换成 [pause]
+    await synthesizeVoice(
+      { elevenlabs: { enabled: true, key: "k", model: "eleven_v3" } },
+      "v",
+      LINE,
+      "测试"
+    );
+    assert.equal(bodies[2].body.text, "So sweet... [pause] good girl");
+    ok("ElevenLabs v3：<break> 换成 [pause]");
+
+    // 两样都不认的整类收走，别让语音里念出一句 "break time"
+    await synthesizeVoice(
+      { minimax: { enabled: true, key: "k", groupId: "G" } },
+      "v",
+      LINE,
+      "测试"
+    );
+    assert.equal(bodies[3].body.text, "So sweet... good girl");
+    ok("MiniMax：<break> 整类收走");
+
+    // Fish 的 S2 认方括号 → 也走 [pause] 那条
+    await synthesizeVoice({ fish: { enabled: true, key: "k", model: "s2" } }, "v", LINE, "测试");
+    assert.equal(bodies[4].body.text, "So sweet... [pause] good girl");
+    ok("Fish S2：<break> 换成 [pause]");
+
+    // 整条就是一个 break：留原样交给合成那边，别走「内容是空的」报错
+    await synthesizeVoice(
+      { minimax: { enabled: true, key: "k", groupId: "G" } },
+      "v",
+      '<break time="1s"/>',
+      "测试"
+    );
+    assert.equal(bodies[5].body.text, '<break time="1s"/>');
+    ok("整条就是一个 <break> 时留原样，不报空内容");
+
+    // 没有 break 的那条一个字都不动（HAS_BREAK_TAG 是不带 g 的，不会隔次失灵）
+    for (let i = 0; i < 2; i += 1) {
+      await synthesizeVoice(
+        { elevenlabs: { enabled: true, key: "k", model: "eleven_v3" } },
+        "v",
+        "[whispers] 过来",
+        "测试"
+      );
+    }
+    assert.equal(bodies[6].body.text, "[whispers] 过来");
+    assert.equal(bodies[7].body.text, "[whispers] 过来");
+    ok("没有 <break> 的两条连着合成都原样（正则不带 g，不记 lastIndex）");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 console.log("\n[TTS：三家的响应形状]");
 
 console.log("\n[TTS：三家的响应形状]");

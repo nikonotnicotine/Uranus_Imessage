@@ -21,7 +21,7 @@
  *     不挡的话同一批待总结会被总结两遍、还可能互相覆盖。
  */
 
-import { stripEnvPrefix } from "./env.js";
+import { charTzSync, stripEnvPrefix } from "./env.js";
 import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import {
   diaryLogLine,
@@ -82,8 +82,9 @@ function gatesOf(role) {
  *    共用的话先到的那个一清空，另一个的进度就没了。
  *  - 日记直接往它自己的流水里追加两行。
  *
- * 三份的格式**完全一样**（`系统时间 | [发送人] 内容`，用户钉死的），
- * 时间由下面那个 `now` 统一提供，拼行的 `diaryLogLine` 也是同一个。
+ * 三份的格式**完全一样**（`时间 | [发送人] 内容`，用户钉死的），时刻由下面那个
+ * `now` 统一提供、时区由 `tz`（角色那边）统一提供，拼行的 `diaryLogLine`
+ * 也是同一个。
  * **都不写天气** —— 天气是生成那一刻才注入的瞬时值。
  *
  * 关着的那一样一个字都不写：没开日记的角色不该在磁盘上攒一个越来越大的流水。
@@ -110,8 +111,8 @@ export function recordTurn(config, role, turn) {
    * 调用方传进来的是**进存档那一份**原文，开头带着那对方括号 —— 对聊天模型
    * 来说那是有用的时间脉络（见 env.js 文件头），对记忆库却是纯噪音：
    *  - 待总结里存着它，总结出来的记忆会带上一串时区和节假日；
-   *  - 日记流水的**行首本来就是系统时间**，再带一遍等于同一个时刻写两种格式。
-   * 用户要的只是系统时间 + 发送人 + 内容，所以在入口这一步就剥掉。
+   *  - 日记流水的**行首本来就是时间**，再带一遍等于同一个时刻写两种格式。
+   * 用户要的只是时间 + 发送人 + 内容，所以在入口这一步就剥掉。
    *
    * 剥在这里而不是在两个挂点：`recordTurn` 是记忆库唯一的入口，
    * 放在这儿就不会有第三个挂点忘了剥。
@@ -148,15 +149,25 @@ export function recordTurn(config, role, turn) {
   const userName = config?.users?.find?.((u) => u.enabled)?.name || "对方";
   const charName = role?.name || "我";
 
+  /*
+   * 行首时间按**角色那边的当地时区**算（用户要的：「待总结都根据当前角色的
+   * 时间来定，就不用系统时间了」）。异地模式取 charCity、同城模式取那一个
+   * 城市；角色没开时间感知就还是服务器系统时间。见 env.js:charTzSync。
+   *
+   * 和 `now` 一样**整轮只取一次**：三份文件、两行用的是同一个时区，
+   * 不会出现同一轮里一行按角色时间、另一行按系统时间。
+   */
+  const tz = charTzSync(role);
+
   try {
     // 三份都是同一种流水（`时间 | [发送人] 内容`），只是分开存
-    const line = { at: now, userName, charName };
+    const line = { at: now, tz, userName, charName };
     if (gates.memory) appendPending("memory", key, { ...line, user, assistant });
     if (gates.memo) appendPending("memo", key, { ...line, user, assistant });
     if (gates.diary) {
       // 顺序是对方先、角色后，和实际发生的顺序一致
-      if (user) appendDiaryLine(key, diaryLogLine(userName, user, now));
-      if (assistant) appendDiaryLine(key, diaryLogLine(charName, assistant, now));
+      if (user) appendDiaryLine(key, diaryLogLine(userName, user, now, tz));
+      if (assistant) appendDiaryLine(key, diaryLogLine(charName, assistant, now, tz));
     }
   } catch (e) {
     // 记不进去不该影响这一轮回复 —— 对方已经收到消息了
