@@ -163,6 +163,17 @@ try {
   await assert.rejects(() => synthesizeVoice(config.ttsApi, "", "private", "测试"), (error) => !error.message.includes(channel.key));
   assert.equal(requests, 1);
   ok("原生合成入口和转码复用，新渠道网络失败不重复计费");
+
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    assert.equal(body.input, "你好 再见");
+    assert.equal(body.voice, "role-voice");
+    assert.equal(body.language_code, undefined);
+    return new Response(audio, { headers: { "content-type": "audio/wav" } });
+  };
+  const sameName = { ...config.ttsApi, customChannels: [{ ...channel, name: "ElevenLabs" }] };
+  await synthesizeVoice(sameName, "role-voice", '[whispers] 你好 <break time="1s"/> 再见', "测试", { language: "en", accent: "British" });
+  ok("第三方渠道同名不会获得内置 SSML、语气标签或口音行为");
   console.log(`\n第三方 TTS 全部通过：${checks} 组`);
 } finally {
   globalThis.fetch = realFetch;

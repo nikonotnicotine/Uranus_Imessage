@@ -15,6 +15,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // 改这些东西就得重新构建
 const INPUTS = [
   "client/src",
+  "shared",
   "client/index.html",
   "client/instagram.html",
   "client/public",

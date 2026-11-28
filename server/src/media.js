@@ -1892,7 +1892,7 @@ const HAS_BREAK_TAG = /<\s*\/?\s*break\b[^>]*>/i;
  * 「break time one point five s」，比没有停顿糟得多。
  */
 function breakOk(source) {
-  return source?.name === "ElevenLabs" && !source.keepTags;
+  return source?.type === "elevenlabs" && !source.keepTags;
 }
 
 /**

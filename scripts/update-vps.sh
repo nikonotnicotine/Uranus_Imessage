@@ -107,7 +107,7 @@ else
     say "前端还没构建过"
   else
     # 源码里有谁比构建产物新
-    NEWER="$(find "$REPO/client/src" "$REPO/client/index.html" -newer "$DIST" -print -quit 2>/dev/null || true)"
+    NEWER="$(find "$REPO/client/src" "$REPO/client/index.html" "$REPO/shared" -newer "$DIST" -print -quit 2>/dev/null || true)"
     if [ -n "$NEWER" ]; then
       NEED_BUILD=1
       say "前端源码比构建产物新（上次只拉了代码、没构建？）"
