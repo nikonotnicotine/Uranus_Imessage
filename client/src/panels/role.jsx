@@ -31,6 +31,8 @@ import { WORKER, backendHas } from "../edition.js";
 import { offlineMediaUrl, uploadOfflineAvatar } from "../offlinemedia.js";
 import { SaveBar, useSection } from "../section.jsx";
 import { RoleMcpFields } from "./mcp.jsx";
+import { resolveTtsChannel } from "../../../shared/tts.mjs";
+import { TtsChannelSelect } from "./tts.jsx";
 import { RoleOrderFields } from "./order.jsx";
 import { api, apiDownload, useConfig } from "../store.jsx";
 import {
@@ -1107,20 +1109,9 @@ function RoleVoiceFields({ role, onGoto }) {
   const tts = config.ttsApi ?? {};
 
   const blank = (v) => !String(v ?? "").trim();
-  // 和 server/src/media.js:pickTtsSource 同一个顺序和判据，三处一起改
-  // （另一处在 api.jsx:TtsSection，那边是「连接」面板上填密钥的地方）
-  const source = !blank(tts.minimax?.key) && tts.minimax?.enabled
-    ? "MiniMax"
-    : !blank(tts.elevenlabs?.key) && tts.elevenlabs?.enabled
-    ? "ElevenLabs"
-    : !blank(tts.fish?.key) && tts.fish?.enabled
-    ? "Fish Audio"
-    : !blank(tts.sovits?.url) && tts.sovits?.enabled
-    ? "GPT-SoVITS"
-    : "";
-  // 和 media.js:elevenTagsOk 同一个判据：模型 ID 里版本号 ≥ 3（eleven_v3、eleven_v4……）
-  const elevenVer = /(?:^|[^a-z0-9])v(\d+)/i.exec(String(tts.elevenlabs?.model ?? ""));
-  const elevenTags = Boolean(elevenVer) && Number(elevenVer[1]) >= 3;
+  const selected = resolveTtsChannel(tts, { channelId: vs.channelId });
+  const source = selected.channel?.name || "";
+  const elevenTags = selected.channel?.type === "elevenlabs" && selected.channel.keepTags;
 
   return (
     <div className="grid grid-cols-1 gap-6">
@@ -1144,6 +1135,9 @@ function RoleVoiceFields({ role, onGoto }) {
         />
       </label>
 
+      <TtsChannelSelect tts={tts} value={vs.channelId} onChange={(channelId) => updateRole(role.id, { voiceSend: { ...vs, channelId } })} label="角色 TTS 渠道" emptyLabel="跟随全局默认（也用于线下朗读和通话）" />
+      {selected.error && <p className="text-meta text-warn">{selected.error}</p>}
+
       {vs.enabled && (
         <div className="grid grid-cols-1 gap-6">
           <p className="text-meta leading-relaxed text-ink-faint">
@@ -1153,8 +1147,7 @@ function RoleVoiceFields({ role, onGoto }) {
               </>
             ) : (
               <strong className="text-warn">
-                四家 TTS 一家都没开，这个开关现在不起作用 ——
-                模型写的语音标记会退化成普通文字发出去。
+                {selected.error}。语音标记会退化成普通文字，不会自动切到别家渠道。
               </strong>
             )}
             密钥
@@ -1181,8 +1174,10 @@ function RoleVoiceFields({ role, onGoto }) {
           <Field
             label="音色 ID"
             hint={
-              source === "GPT-SoVITS"
+              selected.channel?.type === "sovits"
                 ? "SoVITS 这一家填的是参考音频的路径（服务器上的绝对路径）"
+                : selected.channel?.type === "openai"
+                ? `留空使用渠道默认音色：${selected.channel.config.voice}`
                 : "留空就用那家的默认音色"
             }
           >
@@ -1193,11 +1188,13 @@ function RoleVoiceFields({ role, onGoto }) {
                 updateRole(role.id, { voiceSend: { ...vs, voiceId: e.target.value } })
               }
               placeholder={
-                source === "ElevenLabs"
+                selected.channel?.type === "openai"
+                  ? selected.channel.config.voice
+                  : selected.channel?.type === "elevenlabs"
                   ? "21m00Tcm4TlvDq8ikWAM"
-                  : source === "Fish Audio"
+                  : selected.channel?.type === "fish"
                   ? "音色页地址里那串 32 位 ID"
-                  : source === "GPT-SoVITS"
+                  : selected.channel?.type === "sovits"
                   ? "/path/to/ref.wav"
                   : "male-qn-qingse"
               }
@@ -1239,10 +1236,10 @@ function RoleVoiceFields({ role, onGoto }) {
               }
               placeholder="strong British accent"
             />
-            {!blank(vs.accent) && !(source === "ElevenLabs" && elevenTags) && (
+            {!blank(vs.accent) && !(selected.channel?.type === "elevenlabs" && elevenTags) && (
               <p className="mt-2 text-meta leading-relaxed text-warn">
                 口音标签只有 ElevenLabs 的 v3 及以后的模型（eleven_v3、eleven_v4……）认，
-                {source === "ElevenLabs"
+                {selected.channel?.type === "elevenlabs"
                   ? `现在的模型 ${tts.elevenlabs?.model || "eleven_multilingual_v2"} 不认方括号标签`
                   : `现在用的是 ${source || "（没开 TTS）"}`}
                 ，这一项暂时不起作用。

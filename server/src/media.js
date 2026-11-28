@@ -24,6 +24,9 @@
  * 用户必须在控制台里看得见。调用方接住之后决定是退化成文字还是只记一条日志。
  */
 
+import { resolveTtsChannel } from "../../shared/tts.mjs";
+import { ttsOpenAi } from "./tts-openai.js";
+export { elevenTagsOk } from "../../shared/tts.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { cafFormat, oggOpusToCaf, remuxCaf } from "./caf.js";
@@ -1807,7 +1810,8 @@ async function ttsSovits(cfg, text, voiceId) {
 }
 
 /**
- * 挑一家 TTS。顺序：minimax → elevenlabs → fish → sovits，取第一个**开着且凭据齐**的。
+ * 挑一家 TTS。角色显式选择 → 全局默认；都没选时保持原四家自动顺序。
+ * 显式渠道失效不换源。共享选路在 shared/tts.mjs，这里只绑定具体合成实现。
  *
  * 和 websearch.js:pickSource 一个写法，区别是这里没有「不要密钥的兜底源」——
  * 四家都没配就返回 null，调用方据此退化成文字。
@@ -1824,44 +1828,24 @@ async function ttsSovits(cfg, text, voiceId) {
  * @returns {{name: string, keepTags?: boolean, opus?: boolean,
  *            run: (text: string, voiceId: string, opts?: {opus?: boolean}) => Promise<object>}|null}
  */
-/**
- * ElevenLabs 这个模型认不认方括号标签：模型 ID 里的版本号 ≥ 3 就认
- * （eleven_v3、eleven_v4……）。v2 系（multilingual_v2 / turbo_v2_5 / flash_v2_5）不认。
- * 前端 role.jsx 里有一份同样的判据，两处一起改。
- */
-export function elevenTagsOk(model) {
-  const m = /(?:^|[^a-z0-9])v(\d+)/i.exec(String(model ?? ""));
-  return Boolean(m) && Number(m[1]) >= 3;
-}
-
-export function pickTtsSource(api, { needOpus = false } = {}) {
-  const mm = api?.minimax;
-  if (!needOpus && mm?.enabled && String(mm.key ?? "").trim()) {
-    return { name: "MiniMax", run: (t, v) => ttsMinimax(mm, t, v) };
-  }
-  const el = api?.elevenlabs;
-  if (el?.enabled && String(el.key ?? "").trim()) {
-    return {
-      name: "ElevenLabs",
-      keepTags: elevenTagsOk(el?.model),
-      opus: true,
-      run: (t, v, o) => ttsElevenLabs(el, t, v, o),
-    };
-  }
-  const fa = api?.fish;
-  if (fa?.enabled && String(fa.key ?? "").trim()) {
-    return {
-      name: "Fish Audio",
-      keepTags: !/^s1\b/i.test(String(fa?.model ?? "").trim()),
-      opus: true,
-      run: (t, v, o) => ttsFish(fa, t, v, o),
-    };
-  }
-  const sv = api?.sovits;
-  if (!needOpus && sv?.enabled && String(sv.url ?? "").trim()) {
-    return { name: "GPT-SoVITS", run: (t, v) => ttsSovits(sv, t, v) };
-  }
-  return null;
+export function pickTtsSource(api, options = {}) {
+  const { channel } = resolveTtsChannel(api, options);
+  if (!channel) return null;
+  const runners = {
+    minimax: ttsMinimax,
+    elevenlabs: ttsElevenLabs,
+    fish: ttsFish,
+    sovits: ttsSovits,
+    openai: ttsOpenAi,
+  };
+  return {
+    name: channel.name,
+    type: channel.type,
+    keepTags: ["minimax", "sovits"].includes(channel.type) ? undefined : channel.keepTags,
+    opus: channel.opus,
+    retry: channel.type !== "openai",
+    run: (text, voiceId, opts) => runners[channel.type](channel.config, text, voiceId, opts),
+  };
 }
 
 /**
@@ -1908,7 +1892,7 @@ const HAS_BREAK_TAG = /<\s*\/?\s*break\b[^>]*>/i;
  * 「break time one point five s」，比没有停顿糟得多。
  */
 function breakOk(source) {
-  return source?.name === "ElevenLabs" && !source.keepTags;
+  return source?.type === "elevenlabs" && !source.keepTags;
 }
 
 /**
@@ -1975,7 +1959,7 @@ export function stripBreakTags(text) {
  * @param {string} voiceId 角色上填的音色 ID（SoVITS 那家是参考音频路径），可空
  * @param {string} text 要念的内容
  * @param {string} [scope] 日志作用域
- * @param {{bubble?: boolean, language?: string, accent?: string}} [opts]
+ * @param {{bubble?: boolean, language?: string, accent?: string, channelId?: string}} [opts]
  *   `bubble`：要发成 iMessage 语音条（不是给浏览器试听）。
  *   `language` / `accent`：角色 voiceSend 上的语言和口音，目前只有 ElevenLabs 用
  * @returns {Promise<{buffer: Buffer, mimeType: string, ext: string, duration: number|undefined, source: string, ms: number}>}
@@ -1989,7 +1973,7 @@ export async function synthesizeVoice(
   voiceId,
   text,
   scope = "语音",
-  { bubble = false, language = "", accent = "" } = {}
+  { bubble = false, language = "", accent = "", channelId = "" } = {}
 ) {
   /*
    * 语音条要 m4a 或 caf。有 ffmpeg 就合成 mp3 再转 m4a（老路）；没有 ffmpeg
@@ -1997,16 +1981,9 @@ export async function synthesizeVoice(
    * 出不了 Opus 的几家（MiniMax、GPT-SoVITS）这时候跳过 —— 合成出来也发不成语音条。
    */
   const caf = bubble && !(await ffmpegPath());
-  const source = pickTtsSource(api, { needOpus: caf });
-  if (!source) {
-    if (caf && pickTtsSource(api)) {
-      throw new Error(
-        "小手机上发语音条要用 Fish Audio 或 ElevenLabs：MiniMax / GPT-SoVITS 只出 mp3 / wav，" +
-          "转成语音条要 ffmpeg，Worker 里没有。到「连接」面板开一家 Fish Audio 或 ElevenLabs"
-      );
-    }
-    throw new Error("没有可用的语音合成服务（「连接」面板里四家 TTS 都没开，或者凭据没填全）");
-  }
+  const selection = { needOpus: caf, channelId };
+  const source = pickTtsSource(api, selection);
+  if (!source) throw new Error(resolveTtsChannel(api, selection).error);
 
   let clean = String(text ?? "").trim();
   if (!clean) throw new Error("语音内容是空的");
@@ -2057,7 +2034,7 @@ export async function synthesizeVoice(
    * 拼在截断之前，超长时截的是尾巴，标签保得住。
    */
   const accentTag = String(accent ?? "").replace(/[[\]［］]/g, "").trim();
-  if (accentTag && source.name === "ElevenLabs" && source.keepTags) {
+  if (accentTag && source.type === "elevenlabs" && source.keepTags) {
     clean = `[${accentTag}]${clean}`;
   }
 
@@ -2087,7 +2064,7 @@ export async function synthesizeVoice(
       out = await source.run(clean, id, { opus: caf, language: String(language ?? "").trim() });
       break;
     } catch (e) {
-      if (attempt <= TTS_RETRIES && worthRetry(e)) {
+      if (source.retry !== false && attempt <= TTS_RETRIES && worthRetry(e)) {
         logWarn(scope, `${source.name} 没连上（${whyFetch(e, TTS_TIMEOUT)}），重试一次`);
         continue;
       }

@@ -6024,7 +6024,7 @@ async function sendVoicePart(runner, space, part, ctx) {
       role.voiceSend.voiceId,
       part.text,
       scope,
-      { bubble: true, language: role.voiceSend.language, accent: role.voiceSend.accent }
+      { bubble: true, language: role.voiceSend.language, accent: role.voiceSend.accent, channelId: role.voiceSend.channelId }
     );
     // name 只有 .m4a / .caf 两种 —— 理由见上面的注释（写 .mp3 会让语音条显示 0 秒）。
     // .caf 是没 ffmpeg 时 Opus 换壳出来的，iPhone 自己录的语音条就是这个格式。

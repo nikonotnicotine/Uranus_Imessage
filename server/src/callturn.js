@@ -658,6 +658,7 @@ async function* sayOne(raw, { config, voiceId, sep, seq, voice }) {
     const out = await synthesizeVoice(config.ttsApi, voiceId, speakable, SCOPE, {
       language: voice?.language ?? "",
       accent: voice?.accent ?? "",
+      channelId: voice?.channelId ?? "",
     });
     audio = out?.buffer ?? null;
   } catch (e) {
@@ -726,9 +727,10 @@ export async function synthesizeSay({ config, role, text }) {
 export function callVoice(config, role) {
   return {
     voiceId: role?.voiceSend?.voiceId ?? "",
+    channelId: role?.voiceSend?.channelId ?? "",
     language: role?.voiceSend?.language ?? "",
     accent: role?.voiceSend?.accent ?? "",
-    keepTone: Boolean(pickTtsSource(config?.ttsApi)?.keepTags),
+    keepTone: Boolean(pickTtsSource(config?.ttsApi, { channelId: role?.voiceSend?.channelId })?.keepTags),
   };
 }
 

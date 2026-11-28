@@ -853,7 +853,7 @@ console.log("\n[配置：默认值]");
 {
   const c = normalizeConfig({});
 
-  assert.deepEqual(Object.keys(c.ttsApi).sort(), ["elevenlabs", "fish", "minimax", "sovits"]);
+  assert.deepEqual(Object.keys(c.ttsApi).sort(), ["customChannels", "defaultChannelId", "elevenlabs", "fish", "minimax", "sovits"]);
   assert.equal(c.ttsApi.minimax.enabled, false);
   assert.equal(c.ttsApi.minimax.model, "speech-02-hd");
   assert.equal(c.ttsApi.minimax.region, "domestic");
@@ -915,7 +915,7 @@ console.log("\n[配置：默认值]");
    * 仍然用 deepEqual 而不是逐项 equal：这条断言的价值正在于「字段清单变了
    * 要有人知道」，换成松一点的判断就等于把它废了。
    */
-  assert.deepEqual(role.voiceSend, { enabled: false, voiceId: "", language: "", accent: "" });
+  assert.deepEqual(role.voiceSend, { enabled: false, channelId: "", voiceId: "", language: "", accent: "" });
   assert.deepEqual(role.imageGen, { enabled: false, img2img: false, refs: [] });
   assert.deepEqual(role.stickerSend, { enabled: false, blacklist: [], noRepeat: 5 });
   ok("角色上三块默认值（三个功能默认关、连着 5 次不重样；language 已整个删掉）");
@@ -1021,7 +1021,7 @@ console.log("\n[配置：密钥不落进能分享的那份]");
    * normalizeConfig，所以磁盘上是一份「字段齐全但凭据为空」的壳子。
    * 前端因此不用到处判 undefined，而真凭据一个字符都不在这份文件里。
    */
-  assert.deepEqual(Object.keys(shared.ttsApi).sort(), ["elevenlabs", "fish", "minimax", "sovits"]);
+  assert.deepEqual(Object.keys(shared.ttsApi).sort(), ["customChannels", "defaultChannelId", "elevenlabs", "fish", "minimax", "sovits"]);
   assert.equal(shared.ttsApi.fish.key, "");
   assert.equal(JSON.stringify(shared).includes("SECRET-FA"), false);
   assert.equal(shared.ttsApi.minimax.key, "");
