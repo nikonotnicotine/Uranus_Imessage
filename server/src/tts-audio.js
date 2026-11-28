@@ -26,7 +26,8 @@ function hasWaveData(buf) {
     const tag = buf.toString("ascii", offset, offset + 4);
     const size = buf.readUInt32LE(offset + 4);
     const start = offset + 8;
-    const length = tag === "data" && size === 0xffffffff ? end - start : size;
+    const toEnd = tag === "data" && size === 0xffffffff;
+    const length = toEnd ? end - start : size;
     if (start + length > end) return false;
     if (tag === "fmt ") {
       if (length < 16 || !buf.readUInt16LE(start) || !buf.readUInt16LE(start + 2) || !buf.readUInt32LE(start + 4)) return false;
@@ -34,7 +35,8 @@ function hasWaveData(buf) {
       if (!block) return false;
     }
     if (tag === "data") dataSize += length;
-    offset = start + length + (length & 1);
+    // 未知长度的 data 已读至 EOF，不再额外要求一个对齐字节。
+    offset = toEnd ? end : start + length + (length & 1);
   }
   return offset === end && block > 0 && dataSize >= block;
 }

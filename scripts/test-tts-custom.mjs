@@ -101,11 +101,19 @@ try {
   const junk = Buffer.from([0x4a, 0x55, 0x4e, 0x4b, 1, 0, 0, 0, 42, 0]);
   const withJunk = Buffer.concat([audio.subarray(0, 12), junk, audio.subarray(12)]);
   withJunk.writeUInt32LE(withJunk.length - 8, 4);
-  for (const bytes of [streamedWav, withJunk]) {
+  const streamedOddWav = Buffer.concat([streamedWav.subarray(0, 44), Buffer.from([128, 129, 128])]);
+  streamedOddWav.writeUInt32LE(8000, 28); streamedOddWav.writeUInt16LE(1, 32); streamedOddWav.writeUInt16LE(8, 34);
+  const paddedOddWav = Buffer.concat([streamedOddWav, Buffer.from([0])]);
+  paddedOddWav.writeUInt32LE(paddedOddWav.length - 8, 4); paddedOddWav.writeUInt32LE(3, 40);
+  for (const bytes of [streamedWav, withJunk, streamedOddWav, paddedOddWav]) {
     globalThis.fetch = async () => new Response(bytes, { headers: { "content-type": "audio/wav" } });
     assert.deepEqual((await ttsOpenAi(channel, "x", "")).buffer, bytes);
   }
-  ok("文件头、无数据和截断容器拒绝；管道 WAV 和奇数元数据块仍兼容");
+  const missingPadWav = Buffer.from(paddedOddWav.subarray(0, paddedOddWav.length - 1));
+  missingPadWav.writeUInt32LE(missingPadWav.length - 8, 4);
+  globalThis.fetch = async () => new Response(missingPadWav);
+  await assert.rejects(() => ttsOpenAi(channel, "x", ""), /音频/);
+  ok("文件头、无数据和截断容器拒绝；奇数数据的管道 WAV 及定长块对齐仍兼容");
 
   globalThis.fetch = async () => new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "audio/wav" } });
   // AbortSignal.timeout 的计时器不维持 Node 进程；这条测试保留一个短暂句柄。
@@ -139,6 +147,22 @@ try {
   const { oggOpusToCaf } = await import("../server/src/caf.js");
   const ffmpeg = await ffmpegPath();
   if (ffmpeg) {
+    for (const [codec, bytesPerSample] of [["pcm_u8", 1], ["pcm_s24le", 3]]) {
+      const streamed = spawnSync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=24000", "-t", "1.000125", "-c:a", codec, "-f", "wav", "pipe:1"]);
+      assert.equal(streamed.status, 0);
+      const data = streamed.stdout.indexOf(Buffer.from("data"));
+      assert.ok(data >= 12);
+      assert.equal(streamed.stdout.readUInt32LE(4), 0xffffffff);
+      assert.equal(streamed.stdout.readUInt32LE(data + 4), 0xffffffff);
+      assert.equal(streamed.stdout.length - data - 8, 24003 * bytesPerSample);
+      const decoded = spawnSync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-f", "null", "-"], { input: streamed.stdout });
+      assert.equal(decoded.status, 0);
+      globalThis.fetch = async () => new Response(streamed.stdout, { headers: { "content-type": "audio/wav" } });
+      assert.deepEqual((await ttsOpenAi(channel, "x", "")).buffer, streamed.stdout);
+    }
+    globalThis.fetch = realFetch;
+    ok("真实 8/24 位奇数长度流式 WAV 可解码且通过适配器");
+
     const encoded = spawnSync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-f", "wav", "-i", "pipe:0", "-c:a", "libopus", "-f", "ogg", "pipe:1"], { input: audio });
     assert.equal(encoded.status, 0);
     globalThis.fetch = async () => new Response(encoded.stdout, { headers: { "content-type": "audio/ogg" } });
@@ -168,7 +192,7 @@ try {
     globalThis.fetch = realFetch;
     ok("真实 MPEG1/2/2.5 MP3、VBR 和无 ID3 响应通过，截断帧拒绝");
   } else {
-    console.log("  - 跳过真实 MP3/Opus 编码样本：环境没有 ffmpeg");
+    console.log("  - 跳过真实 WAV/MP3/Opus 编码样本：环境没有 ffmpeg");
   }
   const config = normalizeConfig({ ttsApi: { ...api, defaultChannelId: "custom:relay" }, roles: [{ id: "r-tts", name: "测试角色", voiceSend: { enabled: true, channelId: "custom:relay", voiceId: "role-voice", key: "MUST-DROP" } }] });
   assert.equal(config.roles[0].voiceSend.channelId, "custom:relay");
