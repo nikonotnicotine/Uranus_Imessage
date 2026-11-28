@@ -1963,16 +1963,11 @@ app.post("/api/tts/test", async (req, res) => {
   const voiceId = String(req.body?.voiceId ?? "");
   const text = String(req.body?.text ?? "").trim() || "你好，这是一条测试语音。";
 
-  const source = pickTtsSource(config.ttsApi);
-  if (!source) {
-    return res.status(400).json({
-      ok: false,
-      error: "四家 TTS 都没开，或者凭据没填全（填完记得先保存）。",
-    });
-  }
+  const channelId = String(req.body?.channelId ?? "").trim();
+  const source = pickTtsSource(config.ttsApi, { channelId });
 
   try {
-    const out = await synthesizeVoice(config.ttsApi, voiceId, text, "语音");
+    const out = await synthesizeVoice(config.ttsApi, voiceId, text, "语音", { channelId });
     logInfo("语音", `测试合成成功（${out.source}）`);
     res.json({
       ok: true,
@@ -1984,7 +1979,7 @@ app.post("/api/tts/test", async (req, res) => {
   } catch (e) {
     const error = String(e?.message ?? e);
     logWarn("语音", "测试合成失败", error);
-    res.status(400).json({ ok: false, error, source: source.name });
+    res.status(400).json({ ok: false, error, source: source?.name ?? "" });
   }
 });
 
@@ -4081,6 +4076,7 @@ app.post("/api/offline/:roleKey/voice", async (req, res) => {
     const out = await synthesizeVoice(ctx.config.ttsApi, voiceId, text, "线下语音", {
       language: ctx.role.voiceSend?.language,
       accent: ctx.role.voiceSend?.accent,
+      channelId: ctx.role.voiceSend?.channelId,
     });
     res.json({
       ok: true,

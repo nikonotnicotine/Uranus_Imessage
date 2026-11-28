@@ -17,6 +17,8 @@ import { api, useConfig } from "../store.jsx";
 import { BackendTooOld, Button, Card, Field, Fold, Modal, ResultNote, Switch, inputCls } from "../ui.jsx";
 import { backendHas } from "../edition.js";
 import { ParamSlider } from "./preset.jsx";
+import { resolveTtsChannel } from "../../../shared/tts.mjs";
+import { CustomTtsChannels, TtsChannelSelect } from "./tts.jsx";
 import {
   Brain,
   Check,
@@ -1259,25 +1261,23 @@ export function TtsSection() {
 
   const blank = (v) => !String(v ?? "").trim();
 
-  // 和 server/src/media.js:pickTtsSource 同一个顺序和判据，三处一起改
-  // （另一处在 role.jsx:RoleVoiceFields，那边只是显示当前生效的是哪家）
-  const source = !blank(mm.key) && mm.enabled
-    ? "MiniMax"
-    : !blank(el.key) && el.enabled
-    ? "ElevenLabs"
-    : !blank(fa.key) && fa.enabled
-    ? "Fish Audio"
-    : !blank(sv.url) && sv.enabled
-    ? "GPT-SoVITS"
-    : "";
-
+  const [testChannelId, setTestChannelId] = useState("");
+  const revision = useRef(0);
+  const testPending = useRef(false);
+  const selected = resolveTtsChannel(tts);
+  const source = selected.channel?.name || "";
+  const testSelection = resolveTtsChannel(tts, { channelId: testChannelId });
   const saved = savedConfig?.ttsApi ?? {};
-  const dirty =
-    String(mm.key ?? "") !== String(saved.minimax?.key ?? "") ||
-    String(mm.groupId ?? "") !== String(saved.minimax?.groupId ?? "") ||
-    String(el.key ?? "") !== String(saved.elevenlabs?.key ?? "") ||
-    String(fa.key ?? "") !== String(saved.fish?.key ?? "") ||
-    String(sv.url ?? "") !== String(saved.sovits?.url ?? "");
+  const dirty = JSON.stringify(tts) !== JSON.stringify(saved);
+
+  useEffect(() => {
+    revision.current += 1;
+    setAudioData(null);
+    setTestMsg("");
+    if (!testPending.current) setTestState("idle");
+  }, [tts, testChannelId, voiceId]);
+
+  useEffect(() => () => { revision.current += 1; }, []);
 
   /**
    * 试合成一条。
@@ -1286,36 +1286,44 @@ export function TtsSection() {
    * 一律从已保存的配置读。所以刚填完还没点保存的话，测的是旧的那份。
    */
   async function runTtsTest() {
+    if (dirty || testPending.current) return;
+    testPending.current = true;
+    const currentRevision = revision.current;
     setTestState("loading");
     setTestMsg("正在合成…");
     setAudioData(null);
     try {
-      const r = await api("/api/tts/test", { method: "POST", body: { voiceId } });
+      const r = await api("/api/tts/test", { method: "POST", body: { voiceId, channelId: testChannelId } });
+      if (currentRevision !== revision.current) return;
       setTestState("ok");
       setTestMsg(`${r.source} 合成成功（${r.ms}ms）。听一下音色对不对。`);
       setAudioData({ base64: r.base64, mimeType: r.mimeType });
     } catch (e) {
+      if (currentRevision !== revision.current) return;
       setTestState("fail");
       setTestMsg(String(e?.message ?? e));
+    } finally {
+      testPending.current = false;
+      if (currentRevision !== revision.current) setTestState("idle");
     }
   }
 
   return (
     <Card title="语音合成（TTS）" desc="角色发语音条用的。全局一份，所有角色共用">
       <Fold
-        title="四家 TTS"
+        title="TTS 渠道"
         badge={source || "未启用"}
         desc={
           source
-            ? `现在用的是 ${source}。密钥只写入本地 data.config.json，不进备份文件。`
-            : "一家都没开。角色那边的「发语音」开关现在不起作用 —— 模型写的语音标记会退化成普通文字发出去。"
+            ? `全局默认：${source}。密钥只保存在本机，不进无密钥配置备份；完整数据备份请妥善保管。`
+            : selected.error
         }
       >
         <div className="grid grid-cols-1 gap-6">
           <p className="max-w-[62ch] text-meta leading-relaxed text-ink-faint">
-            几家都开着时按
+            全局选“自动（原有四家）”时按
             <strong className="text-ink-soft"> MiniMax → ElevenLabs → Fish Audio → GPT-SoVITS </strong>
-            挑第一个凭据填齐的。角色那边只填
+            挑第一个凭据填齐的。第三方渠道需要明确选择，角色也可以单独指定渠道和
             <strong className="text-ink-soft">音色 ID</strong>
             （不是密钥，跟着角色文件分享出去也没关系），提示词的措辞在「预设 →
             消息格式与功能」里改。
@@ -1323,6 +1331,9 @@ export function TtsSection() {
             iMessage 的语音条只吃 m4a，而这几家出的是 mp3 / wav —— 转码走项目自带的
             ffmpeg-static，<strong className="text-ink-soft">你不用自己装 ffmpeg</strong>。
           </p>
+
+          <TtsChannelSelect tts={tts} value={tts.defaultChannelId} onChange={(defaultChannelId) => updateTtsApi({ defaultChannelId })} label="全局默认 TTS 渠道" emptyLabel="自动（原有四家，保持旧行为）" />
+          <CustomTtsChannels tts={tts} roles={config.roles ?? []} updateTtsApi={updateTtsApi} />
 
           {/* ---------- MiniMax ---------- */}
           <label className="flex items-start justify-between gap-4 border-t border-line pt-5">
@@ -1602,6 +1613,8 @@ export function TtsSection() {
 
           {/* ---------- 试听 ---------- */}
           <div className="grid grid-cols-1 gap-4 border-t border-line pt-5">
+            <TtsChannelSelect tts={tts} value={testChannelId} onChange={setTestChannelId} label="试听渠道" emptyLabel="跟随全局默认" />
+            {testSelection.error && <p className="text-meta text-warn">{testSelection.error}</p>}
             <Field
               label="试听用的音色 ID（可留空）"
               hint="留空就用那家的默认音色。这里填什么不影响角色的配置，只影响这一次试听"
@@ -1611,11 +1624,13 @@ export function TtsSection() {
                 value={voiceId}
                 onChange={(e) => setVoiceId(e.target.value)}
                 placeholder={
-                  source === "GPT-SoVITS"
+                  testSelection.channel?.type === "openai"
+                    ? testSelection.channel.config.voice
+                    : testSelection.channel?.type === "sovits"
                     ? "/path/to/ref.wav"
-                    : source === "ElevenLabs"
+                    : testSelection.channel?.type === "elevenlabs"
                     ? "21m00Tcm4TlvDq8ikWAM"
-                    : source === "Fish Audio"
+                    : testSelection.channel?.type === "fish"
                     ? "reference_id"
                     : "male-qn-qingse"
                 }
@@ -1626,13 +1641,13 @@ export function TtsSection() {
               <p className="max-w-[52ch] text-meta leading-relaxed text-ink-faint">
                 {dirty ? (
                   <strong className="text-warn">
-                    有凭据还没保存 —— 测试读的是已保存的那份，先点保存再测。
+                    TTS 配置尚未保存 —— 请先保存，再测试当前渠道。
                   </strong>
                 ) : (
                   "测试会真发一次请求（按字数计费，这句话很短）。合成出来直接在下面试听。"
                 )}
               </p>
-              <Button variant="outline" onClick={runTtsTest} disabled={testState === "loading" || !source}>
+              <Button variant="outline" onClick={runTtsTest} disabled={testState === "loading" || dirty || !testSelection.channel}>
                 {testState === "loading" ? (
                   <RefreshCw size={14} className="animate-spin" />
                 ) : (

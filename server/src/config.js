@@ -605,7 +605,7 @@ export const DEFAULT_CONFIG = {
         bothFailedTemplate: "",
       },
       // 发语音，默认关。TTS 密钥是全局的（ttsApi），这里只有开关和音色 ID
-      voiceSend: { enabled: false, voiceId: "", language: "", accent: "" },
+      voiceSend: { enabled: false, channelId: "", voiceId: "", language: "", accent: "" },
       // 生图，默认关。生图模型是全局的（挑一个标了 image 分类的模型），
       // 这里只有开关 + 图生图开关 + 这个角色能用哪几张参考图
       imageGen: { enabled: false, img2img: false, refs: [] },
@@ -792,6 +792,8 @@ export const DEFAULT_CONFIG = {
   // 语音合成（TTS）的凭据，同样全局一份（只写 data.config.json）。
   // 四家都没开 = 角色就算打开了「发语音」也发不出来，退化成文字，见 media.js
   ttsApi: {
+    defaultChannelId: "",
+    customChannels: [],
     // speed 语速 0.5–2，1 = 原速
     minimax: { enabled: false, key: "", groupId: "", model: "speech-02-hd", host: "", speed: 1 },
     // style（风格夸张度）默认 0 = 关：大于 0 才会发给上游，见 media.js:ttsElevenLabs
@@ -2165,6 +2167,7 @@ function normalizeHandwriting(input) {
 function normalizeVoiceSend(input) {
   return {
     enabled: Boolean(input?.enabled),
+    channelId: str(input?.channelId).trim(),
     voiceId: str(input?.voiceId).trim(),
     // ElevenLabs 的 language_code（ISO 639-1，如 en / ja）。空 = 自动，不发这个字段
     language: str(input?.language).trim().toLowerCase(),
@@ -3197,7 +3200,23 @@ function normalizeTtsApi(input) {
   const eleven = input?.elevenlabs ?? {};
   const fish = input?.fish ?? {};
   const sovits = input?.sovits ?? {};
+  const used = new Set();
+  const customChannels = (Array.isArray(input?.customChannels) ? input.customChannels : [])
+    .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    .map((item, index) => ({
+      id: pickId(str(item.id).replace(/[^a-zA-Z0-9_-]/g, ""), used, "tts", index),
+      name: str(item.name).trim().slice(0, 80),
+      enabled: Boolean(item.enabled),
+      url: str(item.url).trim(),
+      key: str(item.key).trim(),
+      model: str(item.model).trim(),
+      voice: str(item.voice).trim(),
+      format: ["mp3", "wav", "opus"].includes(item.format) ? item.format : "mp3",
+      speed: item.speed === "" || item.speed == null ? null : clampNum(item.speed, 1, 0.25, 4),
+    }));
   return {
+    defaultChannelId: str(input?.defaultChannelId).trim(),
+    customChannels,
     minimax: {
       enabled: Boolean(minimax.enabled),
       key: str(minimax.key).trim(),
