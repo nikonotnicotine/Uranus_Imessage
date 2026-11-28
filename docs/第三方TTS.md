@@ -24,7 +24,7 @@
 - `ttsApi.customChannels[]`：`id/name/enabled/url/key/model/voice/format/speed`。
 - `ttsApi.defaultChannelId`、`voiceSend.channelId`：引用 `builtin:<type>` 或 `custom:<id>`。
 - `shared/tts.mjs`：前后端共用的地址和选路规则。
-- `server/src/tts-openai.js`：单次 HTTP 请求、响应读取和格式检查。
+- `server/src/tts-openai.js`：单次 HTTP 请求和有界响应读取；`tts-audio.js` 校验 WAV 块、MP3 帧和 Ogg Opus 页/包，拒绝只有文件头、无音频数据或明显截断的响应。该检查不等于完整解码验证。
 - `media.js:synthesizeVoice`：文本清理和现有音频处理；iMessage、线下、通话传入角色引用。
 - `/api/tts/test`：接收渠道 ID、音色覆盖和文本，仅从已保存配置读取地址与密钥。
 
@@ -45,7 +45,7 @@
 | TTS-05 | 失败有界、避免重复计费；保留原有文字回退 | HTTP/响应体/超时/大小/重定向/不重试断言；完全无 ffmpeg 宿主及真实投递失败未端到端模拟 | partial / backfilled |
 | TTS-06 | 保存后试听和移动操作；复用 audio 播放 | 浏览器保存门禁、试听、角色覆盖和 390px 表单布局；延迟响应验证请求锁定、改音色后旧结果不显示 | covered / backfilled |
 
-2026-11-28 在上游 `3092e03`（v1.23.5）基线上验证：TTS 11 组、媒体 268 项、通话听音 97 项、构建新鲜度测试及生产构建通过；全量 35/36 个文件通过。Instagram 的 11 个失败在未修改的同一上游提交也复现（521 通过、11 失败）。构建仍有大于 500 kB 的分块警告。本轮还验证同名第三方渠道不会获得内置 SSML/口音行为，以及共享模块变化能触发前端重建。模拟服务成功不代表真实中转站、iMessage 投递或通话已验证。
+2026-11-28 在上游 `3092e03`（v1.23.5）基线上验证：TTS 14 组（包含只有文件头/截断音频拒绝、真实 MP3/Opus 样本）、媒体 268 项、通话听音 97 项、构建新鲜度测试及生产构建通过；全量 35/36 个文件通过。Instagram 的 11 个失败在未修改的同一上游提交也复现（521 通过、11 失败）。构建仍有大于 500 kB 的分块警告。本轮还验证同名第三方渠道不会获得内置 SSML/口音行为，以及共享模块变化能触发前端重建。模拟服务成功不代表真实中转站、iMessage 投递或通话已验证。
 
 ## 实现方式的依据
 

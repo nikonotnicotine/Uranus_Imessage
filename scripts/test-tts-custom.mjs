@@ -82,6 +82,31 @@ try {
   await assert.rejects(() => ttsOpenAi(channel, "x", ""), /20 MB/);
   ok("空音频、伪成功、格式不符、超大响应均拒绝");
 
+  const emptyWav = Buffer.from(audio.subarray(0, 44));
+  emptyWav.writeUInt32LE(36, 4); emptyWav.writeUInt32LE(0, 40);
+  for (const [format, bytes] of [
+    ["mp3", Buffer.from("ID3")],
+    ["mp3", Buffer.from([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 0])],
+    ["mp3", Buffer.from([0xff, 0xfb, 0x90, 0])],
+    ["wav", Buffer.from("524946460400000057415645", "hex")],
+    ["wav", emptyWav],
+    ["wav", audio.subarray(0, audio.length - 1)],
+    ["opus", Buffer.from("OggSOpusHead")],
+  ]) {
+    globalThis.fetch = async () => new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
+    await assert.rejects(() => ttsOpenAi({ ...channel, format }, "x", ""), /音频/);
+  }
+  const streamedWav = Buffer.from(audio);
+  streamedWav.writeUInt32LE(0xffffffff, 4); streamedWav.writeUInt32LE(0xffffffff, 40);
+  const junk = Buffer.from([0x4a, 0x55, 0x4e, 0x4b, 1, 0, 0, 0, 42, 0]);
+  const withJunk = Buffer.concat([audio.subarray(0, 12), junk, audio.subarray(12)]);
+  withJunk.writeUInt32LE(withJunk.length - 8, 4);
+  for (const bytes of [streamedWav, withJunk]) {
+    globalThis.fetch = async () => new Response(bytes, { headers: { "content-type": "audio/wav" } });
+    assert.deepEqual((await ttsOpenAi(channel, "x", "")).buffer, bytes);
+  }
+  ok("文件头、无数据和截断容器拒绝；管道 WAV 和奇数元数据块仍兼容");
+
   globalThis.fetch = async () => new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "audio/wav" } });
   // AbortSignal.timeout 的计时器不维持 Node 进程；这条测试保留一个短暂句柄。
   const alive = setInterval(() => {}, 100);
@@ -120,8 +145,30 @@ try {
     const opus = await ttsOpenAi({ ...channel, format: "opus" }, "x", "");
     const caf = oggOpusToCaf(opus.buffer, { padMs: 600 });
     assert.ok(caf?.buffer.length); assert.ok(caf.duration > 0);
+    const firstPageEnd = (buf, start) => {
+      const n = buf[start + 26];
+      return start + 27 + n + buf.subarray(start + 27, start + 27 + n).reduce((sum, size) => sum + size, 0);
+    };
+    const headersEnd = firstPageEnd(encoded.stdout, firstPageEnd(encoded.stdout, 0));
+    for (const bytes of [encoded.stdout.subarray(0, headersEnd), encoded.stdout.subarray(0, encoded.stdout.length - 1)]) {
+      globalThis.fetch = async () => new Response(bytes, { headers: { "content-type": "audio/ogg" } });
+      await assert.rejects(() => ttsOpenAi({ ...channel, format: "opus" }, "x", ""), /音频/);
+    }
     globalThis.fetch = realFetch;
-    ok("真实 Ogg Opus 响应可由已有逻辑封装 CAF 语音条");
+    ok("真实 Ogg Opus 可封装 CAF，只有头包或截断末页时拒绝");
+
+    for (const args of [["-ar", "44100", "-b:a", "128k"], ["-ar", "22050", "-q:a", "4"], ["-ar", "8000", "-b:a", "32k", "-id3v2_version", "0"]]) {
+      const mp3 = spawnSync(ffmpeg, ["-hide_banner", "-loglevel", "error", "-f", "wav", "-i", "pipe:0", "-c:a", "libmp3lame", ...args, "-f", "mp3", "pipe:1"], { input: audio });
+      assert.equal(mp3.status, 0);
+      globalThis.fetch = async () => new Response(mp3.stdout, { headers: { "content-type": "audio/mpeg" } });
+      assert.deepEqual((await ttsOpenAi({ ...channel, format: "mp3" }, "x", "")).buffer, mp3.stdout);
+      globalThis.fetch = async () => new Response(mp3.stdout.subarray(0, mp3.stdout.length - 1), { headers: { "content-type": "audio/mpeg" } });
+      await assert.rejects(() => ttsOpenAi({ ...channel, format: "mp3" }, "x", ""), /音频/);
+    }
+    globalThis.fetch = realFetch;
+    ok("真实 MPEG1/2/2.5 MP3、VBR 和无 ID3 响应通过，截断帧拒绝");
+  } else {
+    console.log("  - 跳过真实 MP3/Opus 编码样本：环境没有 ffmpeg");
   }
   const config = normalizeConfig({ ttsApi: { ...api, defaultChannelId: "custom:relay" }, roles: [{ id: "r-tts", name: "测试角色", voiceSend: { enabled: true, channelId: "custom:relay", voiceId: "role-voice", key: "MUST-DROP" } }] });
   assert.equal(config.roles[0].voiceSend.channelId, "custom:relay");
@@ -163,6 +210,15 @@ try {
   await assert.rejects(() => synthesizeVoice(config.ttsApi, "", "private", "测试"), (error) => !error.message.includes(channel.key));
   assert.equal(requests, 1);
   ok("原生合成入口和转码复用，新渠道网络失败不重复计费");
+
+  for (const [format, bytes] of [["mp3", Buffer.from("ID3")], ["wav", emptyWav], ["opus", Buffer.from("OggSOpusHead")]]) {
+    requests = 0;
+    globalThis.fetch = async () => { requests += 1; return new Response(bytes); };
+    const invalid = { ...config.ttsApi, customChannels: [{ ...channel, format }] };
+    await assert.rejects(() => synthesizeVoice(invalid, "", "x", "测试"), /音频/);
+    assert.equal(requests, 1);
+  }
+  ok("真实合成入口拒绝文件头响应，不进入转码失败原样返回的旧逻辑");
 
   globalThis.fetch = async (_url, init) => {
     const body = JSON.parse(init.body);

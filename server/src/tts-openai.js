@@ -1,4 +1,5 @@
 import { speechUrl, TTS_FORMATS } from "../../shared/tts.mjs";
+import { hasTtsAudio } from "./tts-audio.js";
 
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const MIME = { mp3: "audio/mpeg", wav: "audio/wav", opus: "audio/ogg" };
@@ -31,12 +32,6 @@ async function readAudio(response, signal) {
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
-}
-
-function matchesFormat(buffer, format) {
-  if (format === "wav") return buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WAVE";
-  if (format === "opus") return buffer.toString("ascii", 0, 4) === "OggS" && buffer.subarray(0, 512).includes(Buffer.from("OpusHead"));
-  return buffer.length >= 3 && (buffer.toString("ascii", 0, 3) === "ID3" || (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0));
 }
 
 /** 单次合成，不重试计费请求。错误不包含上游原文、地址、密钥或待朗读文本。 */
@@ -87,6 +82,6 @@ export async function ttsOpenAi(config, text, voiceId, { timeout = 30000, signal
     if (["音频超过 20 MB 上限", "上游返回了空音频"].includes(error.message)) throw error;
     throw new Error("读取音频失败，请检查 TTS 服务连接");
   }
-  if (!matchesFormat(buffer, format)) throw new Error(`上游返回的不是所选 ${format} 音频，请检查渠道支持的格式`);
+  if (!hasTtsAudio(buffer, format)) throw new Error(`上游返回的 ${format} 音频无效、为空或已截断，请检查渠道支持的格式`);
   return { buffer, mimeType: MIME[format], ext: format === "opus" ? "ogg" : format };
 }
